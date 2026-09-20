@@ -676,9 +676,7 @@ function run(): void {
       // Production entry point: formatReceipt('compact') is document-driven
       // since #443, so this compares the migrated pipeline against the oracle.
       const migratedBuf = formatReceipt(order, bill, business, 'compact', cols, false, isReprint, 'full', [], false, 'en');
-      const legacyText = escPosToText(legacyBuf);
-      const migratedText = escPosToText(migratedBuf);
-      warn(migratedText.split('\n').length < legacyText.split('\n').length, `${label}: simplified output uses fewer lines than legacy compact`);
+      warn(escPosToText(legacyBuf) === escPosToText(migratedBuf), `${label}: content-identical output to legacy compact`);
       expectContent(label, escPosToText(migratedBuf), {
         ...baseExpect,
         absentItems: [PERSIAN_ITEM],
