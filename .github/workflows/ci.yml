@@ -1,14 +1,14 @@
 # ---------------------------------------------------------------
-# FloCafe — CI Validation
+# FactorPOS — CI Validation
 # ---------------------------------------------------------------
 
 name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, develop]
   pull_request:
-    branches: [main]
+    branches: [main, develop]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}

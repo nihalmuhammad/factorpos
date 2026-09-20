@@ -293,6 +293,13 @@
       "node_modules/**/*",
       "!**/better-sqlite3/build/Release/test_extension.node"
     ],
+    "publish": {
+      "provider": "github",
+      "owner": "nihalmuhammad",
+      "repo": "factorpos",
+      "releaseType": "release",
+      "channel": "latest"
+    },
     "detectUpdateChannel": false,
     "generateUpdatesFilesForAllChannels": true,
     "extraResources": [
@@ -311,6 +318,13 @@
           "target": "nsis",
           "arch": [
             "x64"
+          ]
+        },
+        {
+          "target": "appx",
+          "arch": [
+            "x64",
+            "arm64"
           ]
         }
       ],

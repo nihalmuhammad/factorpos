@@ -865,6 +865,9 @@ exit 1
   assert.equal(matrixUpload.with.name, 'factorpos-build-${{ matrix.name }}');
 
   const ciWorkflow = loadWorkflow('ci.yml');
+  const ciTriggers = ciWorkflow.on || ciWorkflow['true'];
+  assert.deepEqual(ciTriggers.push.branches, ['main', 'develop'], 'CI must validate both production and development pushes');
+  assert.deepEqual(ciTriggers.pull_request.branches, ['main', 'develop'], 'CI must validate pull requests into both long-lived branches');
   const requiredGateJob = ciWorkflow.jobs['required-checks-gate'];
   assert.deepEqual(requiredGateJob.needs, ['changes', 'linux-baseline', 'e2e-playwright', 'windows-uninstaller']);
   assert.equal(requiredGateJob.if, 'always()', 'the gate must still report a conclusion when a path-filtered dependency is skipped');
@@ -897,6 +900,20 @@ exit 1
   const evidenceUpload = (e2eJob.steps || []).find((step: any) => step.with?.name === 'release-regression-evidence');
   assert.ok(evidenceUpload, 'CI must upload release regression evidence');
   assert.equal(evidenceUpload.with.path, '${{ runner.temp }}/factorpos-release-regressions/');
+
+  const developmentWorkflow = loadWorkflow('development-windows.yml');
+  const developmentTriggers = developmentWorkflow.on || developmentWorkflow['true'];
+  assert.deepEqual(developmentTriggers.push.branches, ['develop'], 'test installers must only build automatically from develop');
+  assert.ok(developmentTriggers.workflow_dispatch !== undefined, 'test installer builds must support manual dispatch');
+  assert.equal(developmentWorkflow.permissions.contents, 'read', 'development builds must not publish releases');
+  const developmentJob = developmentWorkflow.jobs['build-windows-test-installer'];
+  assert.equal(developmentJob['runs-on'], 'windows-latest');
+  const developmentPackageStep = findStep(developmentJob, 'Build unsigned NSIS installer');
+  assert.match(developmentPackageStep.run, /--win nsis --x64 --publish never/, 'development build must create only an unsigned NSIS installer');
+  assert.equal(developmentPackageStep.env.CSC_IDENTITY_AUTO_DISCOVERY, false);
+  const developmentUpload = findStep(developmentJob, 'Upload development installer');
+  assert.equal(developmentUpload.with.name, 'factorpos-windows-test-${{ github.sha }}');
+  assert.equal(developmentUpload.with['retention-days'], 14);
 
   const metaFilePath = path.join(__dirname, '../assets/com.factorpos.desktop.metainfo.xml');
   const originalMetaContent = fs.readFileSync(metaFilePath, 'utf8');
