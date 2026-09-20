@@ -4108,6 +4108,19 @@ export const MIGRATIONS: { version: number; name: string; up: () => void }[] = [
       addColumn('cash_movements_json', "cash_movements_json TEXT NOT NULL DEFAULT '[]'");
     },
   },
+  {
+    version: 85,
+    name: 'add_daily_close_token_number',
+    up: () => {
+      const columns = new Set(
+        (db.prepare(`PRAGMA table_info(orders)`).all() as { name: string }[]).map((column) => column.name),
+      );
+      if (!columns.has('token_number')) {
+        db.exec('ALTER TABLE orders ADD COLUMN token_number INTEGER');
+      }
+      db.exec('CREATE INDEX IF NOT EXISTS idx_orders_token_number ON orders(token_number)');
+    },
+  },
 ];
 
 function syncBackupBeforeMigration(fromVersion: number, toVersion: number): void {
@@ -4383,6 +4396,7 @@ function createSchema(): void {
     CREATE TABLE IF NOT EXISTS orders (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       order_number TEXT UNIQUE NOT NULL,
+      token_number INTEGER,
       table_id TEXT,
       customer_id TEXT,
       user_id TEXT,
@@ -5026,6 +5040,16 @@ export function generateOrderNumber(): string {
 
   const dateSegment = includeDate ? dateStampInTimezone(timezone) : '';
   return [prefix, dateSegment, String(next).padStart(4, '0')].filter(Boolean).join('-');
+}
+
+/** Customer-facing token counter. Day close removes this bucket so the next token is 1. */
+export function generateTokenNumber(): number {
+  return getNextSequence('order_tokens', 'CURRENT');
+}
+
+/** Reset the customer-facing token counter inside the caller's transaction. */
+export function resetTokenNumber(): void {
+  db.prepare(`DELETE FROM sequences WHERE name = 'order_tokens' AND date = 'CURRENT'`).run();
 }
 
 export function generateBillNumber(): string {

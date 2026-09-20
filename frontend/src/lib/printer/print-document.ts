@@ -138,6 +138,7 @@ export function buildBillPrintData(bill: Bill, opts: BillBusinessOptions = {}): 
     isReprint: opts.isReprint === true,
     order: {
       orderNumber: String(order?.order_number ?? ''),
+      tokenNumber: Number.isInteger(Number(order?.token_number)) && Number(order?.token_number) > 0 ? Number(order?.token_number) : null,
       createdAt: String(order?.created_at ?? ''),
       tableName: String(order?.table?.name ?? ''),
       onlinePlatform: String(order?.online_platform ?? ''),

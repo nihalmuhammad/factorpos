@@ -214,6 +214,7 @@ function visibleRawPrinterLines(data: Uint8Array): string[] {
 
 const fixtureOrder = {
   order_number: 'ORD-20260421-0001',
+  token_number: 42,
   type: 'dine_in',
   created_at: new Date('2026-04-21T10:30:00Z').toISOString(),
   table: { name: 'T3' },
@@ -716,6 +717,7 @@ console.log('\n✅ Test 2: Compact receipt (80mm, 48 cols)');
 
   assert('renders business name', text.includes('Flo Test Cafe'));
   assert('renders bill number', text.includes('INV-20260421-0001'));
+  assert('highlights the customer token', text.includes('TOKEN #42'));
   assert('renders Cheeseburger row', text.includes('Cheeseburger'));
   assert('renders addon "Extra Cheese"', text.includes('Extra Cheese'));
   assert('renders addon "Bacon"', text.includes('Bacon'));
@@ -726,6 +728,11 @@ console.log('\n✅ Test 2: Compact receipt (80mm, 48 cols)');
   assert('renders discount line with negative sign', /-\s*₹15\.00/.test(text));
   assert('renders tax total ₹40.00', text.includes('₹40.00'));
   assert('renders TOTAL with grand amount', text.includes('TOTAL') && text.includes('₹950.00'));
+  const doubleHeightBold = Buffer.from([ESC, 0x21, 0x18]);
+  const tokenOffset = buf.indexOf(Buffer.from('TOKEN #42'));
+  const totalOffset = buf.indexOf(Buffer.from('TOTAL'));
+  assert('prints token in double-height bold mode', tokenOffset > buf.indexOf(doubleHeightBold) && tokenOffset - buf.lastIndexOf(doubleHeightBold, tokenOffset) < 16);
+  assert('prints grand total in double-height bold mode', totalOffset > buf.indexOf(doubleHeightBold) && totalOffset - buf.lastIndexOf(doubleHeightBold, totalOffset) < 16);
   assert('renders Cash payment', text.includes('Cash') && text.includes('₹500.00'));
   assert('renders UPI payment', text.includes('UPI') && text.includes('₹450.00'));
   assert('renders tax registration number', text.includes('TAXID-0001'));

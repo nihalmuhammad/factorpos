@@ -26,7 +26,7 @@ const {
   assert, assertEqual,
 } = require('./helpers/test-setup');
 
-const { generateOrderNumber, generateBillNumber, dateStampInTimezone } = require('../main/db');
+const { generateOrderNumber, generateBillNumber, generateTokenNumber, resetTokenNumber, dateStampInTimezone } = require('../main/db');
 
 async function main() {
   console.log('Test: Sequence Number Generation');
@@ -140,6 +140,12 @@ async function main() {
     db.prepare('DELETE FROM sequences WHERE name = ?').run('bills');
     const facDash = generateBillNumber();
     assertEqual(facDash, `FAC-${orderToday}-0001`, 'Trailing dash in stored prefix is stripped, not doubled');
+
+    console.log('\n14. Customer token sequence resets independently of permanent order numbers');
+    assertEqual(generateTokenNumber(), 1, 'First customer token is 1');
+    assertEqual(generateTokenNumber(), 2, 'Second customer token is 2');
+    resetTokenNumber();
+    assertEqual(generateTokenNumber(), 1, 'First token after reset is 1');
 
     // ── Summary ───────────────────────────────────────────────────────
     console.log('\n' + '='.repeat(50));

@@ -115,6 +115,7 @@ export interface OrderItemSnapshot {
 /** The order behind the bill, as printed truth. */
 export interface OrderSnapshot {
   readonly orderNumber: string;
+  readonly tokenNumber: number | null;
   /** Canonical stored timestamp; renderers localize for presentation. */
   readonly createdAt: string;
   readonly tableName: string;
@@ -264,6 +265,7 @@ export interface DocumentMetaBlock {
   /** Date label for layouts that print a labeled date line (e.g. compact). */
   readonly dateLabel: SemanticLabel;
   readonly invoiceNumber: DirectionalText;
+  readonly tokenNumber: number | null;
   /** Canonical stored timestamp; presentation formatting is a renderer duty. */
   readonly timestamp: DirectionalText;
   /** Table reference with its (uninterpolated) label concept. */
@@ -536,6 +538,7 @@ export function buildBillDocument(printData: PrintData, printContext: PrintConte
       bill.billNumber.length > 0 ? bill.billNumber : order.orderNumber,
       base,
     ),
+    tokenNumber: order.tokenNumber,
     timestamp: directionalText(order.createdAt, base),
     table: business.showTableNumber && order.tableName.length > 0
       ? Object.freeze({
@@ -847,6 +850,7 @@ function isPrintDocumentBlock(value: unknown): value is PrintDocumentBlock {
         && isSemanticLabel(value.billNumberLabel)
         && isSemanticLabel(value.dateLabel)
         && isDirectionalText(value.invoiceNumber)
+        && (value.tokenNumber === null || (typeof value.tokenNumber === 'number' && Number.isInteger(value.tokenNumber) && value.tokenNumber > 0))
         && isDirectionalText(value.timestamp)
         && (value.table === null || (isRecord(value.table) && isSemanticLabel(value.table.label) && isDirectionalText(value.table.name)));
     case 'customer':

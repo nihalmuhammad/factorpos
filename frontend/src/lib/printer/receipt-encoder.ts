@@ -666,6 +666,11 @@ export function buildCompactReceiptBytes(
 
   // Invoice number and timestamp on one line (document-meta block)
   if (meta) {
+    if (meta.tokenNumber !== null) {
+      enc.align('center').bold(true).height(2);
+      safePrinterText(enc, `TOKEN #${meta.tokenNumber}`, warnings, false, arabicShaping, undefined, cols);
+      enc.height(1).bold(false).newline().align('left');
+    }
     safePrinterText(
       enc,
       padRow(
@@ -757,9 +762,10 @@ export function buildCompactReceiptBytes(
 
   enc.rule({ style: 'double' });
   if (totals) {
-    enc.bold(true);
+    enc.bold(true).height(2);
     safePrinterText(enc, padRow(labelOf(totals.grandTotal.label), formatAmount(totals.grandTotal.amount, currency, locale, trim, fractionDigits), cols), warnings, false, arabicShaping, undefined, undefined, true);
     enc
+      .height(1)
       .bold(false)
       .newline();
   }

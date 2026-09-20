@@ -158,6 +158,7 @@
     "test:migration-v71-repair": "node tests/run-electron-node-test.cjs tests/migration-v71-revoked-tokens-repair.test.ts",
     "test:migration-v80-cash-drawer-pulse": "node tests/run-electron-node-test.cjs tests/migration-v80-cash-drawer-pulse.test.ts",
     "test:migration-v81-cash-closures": "node tests/run-electron-node-test.cjs tests/migration-v81-cash-closures.test.ts",
+    "test:migration-v85-token-number": "node tests/run-electron-node-test.cjs tests/migration-v85-token-number.test.ts",
     "test:master-pin": "node tests/run-electron-node-test.cjs tests/master-pin.test.ts",
     "test:google-drive": "node tests/run-electron-node-test.cjs tests/google-drive.test.ts",
     "test:database-tools-api": "node tests/run-electron-node-test.cjs tests/database-tools-api.test.ts && node tests/run-electron-node-test.cjs tests/database-maintenance-lock.test.ts",

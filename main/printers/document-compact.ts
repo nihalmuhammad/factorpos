@@ -193,6 +193,11 @@ export function renderBillDocumentToCompactLines(
   const metaStart = lines.length;
   const metaSourceLines: string[] = [];
   if (meta) {
+    if (meta.tokenNumber !== null) {
+      const tokenText = `TOKEN #${meta.tokenNumber}`;
+      lines.push(`{CENTER}{BOLD}{DOUBLE_HEIGHT}${normalize(tokenText)}{/DOUBLE_HEIGHT}{/BOLD}{/CENTER}`);
+      metaSourceLines.push(tokenText);
+    }
     lines.push(normalize(labelOf(meta.billNumberLabel) + ': ' + meta.invoiceNumber.text));
     metaSourceLines.push(labelOf(meta.billNumberLabel) + ': ' + meta.invoiceNumber.text);
     const date = parseDbTimestamp(meta.timestamp.text);
@@ -305,9 +310,12 @@ export function renderBillDocumentToCompactLines(
   const totalsSourceLines: string[] = [];
   const totalsSourceControlLines: string[] = [];
   const totalsSourceLayouts: Array<RasterTextLayout | undefined> = [];
-  const pushTotalRow = (rendered: string[], bold = false, sourceLabel?: string, sourceValue?: string): void => {
+  const pushTotalRow = (rendered: string[], bold = false, sourceLabel?: string, sourceValue?: string, enlarged = false): void => {
     const start = lines.length;
-    const tokenLines = bold ? rendered.map((line) => `{BOLD}${line}{/BOLD}`) : rendered;
+    const tokenLines = rendered.map((line) => {
+      const boldLine = bold ? `{BOLD}${line}{/BOLD}` : line;
+      return enlarged ? `{DOUBLE_HEIGHT}${boldLine}{/DOUBLE_HEIGHT}` : boldLine;
+    });
     lines.push(...tokenLines);
     recordFinancialLines(start, tokenLines);
     totalsSourceLines.push(sourceLabel !== undefined && sourceValue !== undefined ? `${sourceLabel} ${sourceValue.trimStart()}` : rendered.join(' '));
@@ -352,7 +360,7 @@ export function renderBillDocumentToCompactLines(
       pushTotalRow(financialRows(labelOf(totals.packagingCharge.label), value, cols, options.language, options.capabilities), false, labelOf(totals.packagingCharge.label), value);
     }
     const grandTotalValue = formatCurrency(totals.grandTotal.amount, prefix, options.locale, trimDecimals, fractionDigits);
-    pushTotalRow(financialRows(labelOf(totals.grandTotal.label), grandTotalValue, cols, options.language, options.capabilities), true, labelOf(totals.grandTotal.label), grandTotalValue);
+    pushTotalRow(financialRows(labelOf(totals.grandTotal.label), grandTotalValue, cols, options.language, options.capabilities), true, labelOf(totals.grandTotal.label), grandTotalValue, true);
   }
   markGroup('totals', totalsStart, totalsSourceLines, totalsSourceControlLines, true, totalsSourceLayouts);
 

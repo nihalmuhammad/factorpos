@@ -69,6 +69,7 @@ async function main() {
     assertEqual(createRes.status, 201, 'order created');
     const orderId = createRes.data.order.id;
     assertEqual(createRes.data.order.status, 'pending', 'initial status = pending');
+    assertEqual(createRes.data.order.token_number, 1, 'first order receives customer token 1');
 
     // Move to preparing
     const prepRes = await api(baseUrl, `/api/orders/${orderId}/status`, {

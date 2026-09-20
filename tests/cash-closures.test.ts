@@ -229,8 +229,11 @@ async function main() {
       // Seed zero-value bills + refunds on today so the close actually stores
       // a snapshot (otherwise 409 from the prior section would fire).
       seedPaidBill({ billNumber: 'B-TODAY-CASH', method: 'cash', amount: 100, businessDate: todayLocal });
+      db.prepare("INSERT OR REPLACE INTO sequences (name, date, current_value) VALUES ('order_tokens', 'CURRENT', 7)").run();
       const today = await request(app).post('/api/cash-closures').set('Authorization', `Bearer ${ownerToken}`).send({ business_date: todayLocal, opening_float_cents: 0, counted_cash_cents: 10000 });
       assertEqual(today.status, 201, `tenant-local today is accepted regardless of host clock (got ${today.status}, body=${JSON.stringify(today.body)})`);
+      const tokenSequence = db.prepare("SELECT current_value FROM sequences WHERE name = 'order_tokens' AND date = 'CURRENT'").get();
+      assertEqual(tokenSequence, undefined, 'successful day close resets the customer token sequence');
     }
 
     console.log('\n3. Snapshot math: 1 cash bill + 1 card bill, no refunds');

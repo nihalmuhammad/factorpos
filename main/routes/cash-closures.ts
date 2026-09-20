@@ -33,7 +33,7 @@
  */
 import { Router, Request, Response } from 'express';
 import {
-  dayBoundsInTimezone, getDatabase, getSettingValue, localDateInTimezone, now, withTxn,
+  dayBoundsInTimezone, getDatabase, getSettingValue, localDateInTimezone, now, resetTokenNumber, withTxn,
   tenantBusinessDayStartTime,
 } from '../db';
 import { requireRole } from '../middleware/security';
@@ -671,6 +671,8 @@ router.post('/', requireRole(...ROLE_ACCESS.owner), (req: Request, res: Response
       const id = Number((db.prepare(
         `SELECT id FROM cash_closures WHERE business_date = ? AND scope = 'day'`
       ).get(businessDate) as { id: number }).id);
+
+      resetTokenNumber();
 
       return {
         id,
