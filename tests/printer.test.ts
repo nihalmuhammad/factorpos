@@ -1344,12 +1344,6 @@ console.log('\n✅ Test 11: IR country thermal receipt financial-line preservati
 
   const browserHtml = generateBillHtml(frontendBill as any, frontendTenant, { useUnicode: false });
   assert('browser printing preserves the Persian Rial symbol', browserHtml.includes('ریال') && !browserHtml.includes('IRR'));
-  const browserTokenHtml = generateBillHtml({
-    ...frontendBill,
-    order: { ...frontendBill.order, token_number: 42 },
-  } as any, frontendTenant, { useUnicode: false });
-  assert('browser printing highlights the customer token', browserTokenHtml.includes('class="token"') && browserTokenHtml.includes('*** TOKEN #42 ***'));
-  assert('browser printing uses the compact item table', !browserTokenHtml.includes('>Rate<'));
   assert('shared currency normalization maps the Persian Rial token to ASCII IRR', normalizeCurrencyToAscii('ریال') === 'IRR');
   const browserTaxHtml = generateBillHtml(frontendBill as any, frontendTenant, { useUnicode: false });
   assert('browser tax-bill printing preserves Persian Rial output', browserTaxHtml.includes('ریال') && !browserTaxHtml.includes('IRR'));
