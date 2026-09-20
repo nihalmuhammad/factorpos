@@ -4831,10 +4831,10 @@ function seedInstallDefaults(): void {
 
   insert('business_name', '');
   insert('business_type', 'restaurant');
-  insert('country', 'SA');
-  insert('currency', 'SAR');
-  insert('currency_symbol', 'SAR');
-  insert('timezone', 'Asia/Riyadh');
+  insert('country', 'IN');
+  insert('currency', 'INR');
+  insert('currency_symbol', '₹');
+  insert('timezone', 'Asia/Kolkata');
   insert('business_day_start_time', '00:00');
   insert('address', '');
   insert('phone', '');
@@ -4867,7 +4867,6 @@ function seedInstallDefaults(): void {
   insert('kot_printing_enabled', 'true');
   insert('server_app_bill_printing_enabled', 'false');
   insert('printer_trim_decimals', 'false');
-  insert('number_digits', 'latin');
   insert('bill_template', 'classic');
   insert('bill_footer_message', '');
   insert('bill_show_name', 'true');

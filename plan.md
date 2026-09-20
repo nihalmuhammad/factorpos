@@ -40,13 +40,18 @@ Before the first installer is produced:
 3. Record the exact FloCafe release used as the starting point.
 4. Confirm the project builds and runs on the Mac before making changes.
 5. Run the existing automated tests and save a baseline result.
-6. Create separate development, test, and production release channels.
+6. Use one main development line until production rollout makes separate
+   development and production channels necessary.
 
 ### Branch approach
 
-- `main`: shop-ready production releases
-- `develop`: integrated changes being tested
-- Short-lived branches such as `fix/receipt-total` or `feature/english-digits`
+- `main`: the current FactorPOS development line
+- Optional short-lived branches such as `fix/receipt-total` or
+  `feature/english-digits`
+
+Once FactorPOS is operating in production and production stability is
+critical, add a separate development branch and promote tested revisions into
+the protected production branch.
 
 Every change should have a short description and, where practical, an automated test. Avoid editing production builds directly on shop computers.
 

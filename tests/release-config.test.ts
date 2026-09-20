@@ -866,8 +866,8 @@ exit 1
 
   const ciWorkflow = loadWorkflow('ci.yml');
   const ciTriggers = ciWorkflow.on || ciWorkflow['true'];
-  assert.deepEqual(ciTriggers.push.branches, ['main', 'develop'], 'CI must validate both production and development pushes');
-  assert.deepEqual(ciTriggers.pull_request.branches, ['main', 'develop'], 'CI must validate pull requests into both long-lived branches');
+  assert.deepEqual(ciTriggers.push.branches, ['main'], 'CI must validate main pushes');
+  assert.deepEqual(ciTriggers.pull_request.branches, ['main'], 'CI must validate pull requests into main');
   const requiredGateJob = ciWorkflow.jobs['required-checks-gate'];
   assert.deepEqual(requiredGateJob.needs, ['changes', 'linux-baseline', 'e2e-playwright', 'windows-uninstaller']);
   assert.equal(requiredGateJob.if, 'always()', 'the gate must still report a conclusion when a path-filtered dependency is skipped');
@@ -903,7 +903,7 @@ exit 1
 
   const developmentWorkflow = loadWorkflow('development-windows.yml');
   const developmentTriggers = developmentWorkflow.on || developmentWorkflow['true'];
-  assert.deepEqual(developmentTriggers.push.branches, ['develop'], 'test installers must only build automatically from develop');
+  assert.deepEqual(developmentTriggers.push.branches, ['main'], 'test installers must build automatically from main');
   assert.ok(developmentTriggers.workflow_dispatch !== undefined, 'test installer builds must support manual dispatch');
   assert.equal(developmentWorkflow.permissions.contents, 'read', 'development builds must not publish releases');
   const developmentJob = developmentWorkflow.jobs['build-windows-test-installer'];
@@ -911,7 +911,7 @@ exit 1
   const developmentPackageStep = findStep(developmentJob, 'Build unsigned NSIS installer');
   assert.match(developmentPackageStep.run, /--win nsis --x64 --publish never/, 'development build must create only an unsigned NSIS installer');
   assert.equal(developmentPackageStep.env.CSC_IDENTITY_AUTO_DISCOVERY, false);
-  const developmentUpload = findStep(developmentJob, 'Upload development installer');
+  const developmentUpload = findStep(developmentJob, 'Upload test installer');
   assert.equal(developmentUpload.with.name, 'factorpos-windows-test-${{ github.sha }}');
   assert.equal(developmentUpload.with['retention-days'], 14);
 

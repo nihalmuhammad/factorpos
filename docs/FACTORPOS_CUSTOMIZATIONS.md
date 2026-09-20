@@ -8,7 +8,7 @@ upstream merges do not silently remove FactorPOS behavior.
 - Repository: `https://github.com/FreeOpenSourcePOS/FloCafe.git`
 - Release: `3.9.0`
 - Local upstream remote: `upstream`
-- Integration branch: `develop`
+- Long-lived branch: `main`
 - Private source repository: `https://github.com/nihalmuhammad/factorpos`
 
 The upstream MIT license and copyright notice remain in `LICENSE`.
