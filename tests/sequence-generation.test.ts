@@ -147,6 +147,17 @@ async function main() {
     resetTokenNumber();
     assertEqual(generateTokenNumber(), 1, 'First token after reset is 1');
 
+    db.prepare("UPDATE settings SET value = 'Asia/Riyadh' WHERE key = 'timezone'").run();
+    db.prepare("UPDATE settings SET value = '04:00' WHERE key = 'business_day_start_time'").run();
+    db.prepare("DELETE FROM sequences WHERE name = 'order_tokens'").run();
+    assertEqual(generateTokenNumber(new Date('2026-09-21T00:30:00Z')), 1, 'Token starts at 1 before the Riyadh 04:00 business-day boundary');
+    assertEqual(generateTokenNumber(new Date('2026-09-21T00:45:00Z')), 2, 'Token increments within the same configured business day');
+    assertEqual(generateTokenNumber(new Date('2026-09-21T01:00:00Z')), 1, 'Token resets automatically at the configured business-day start');
+    resetTokenNumber('2026-09-20');
+    assertEqual(generateTokenNumber(new Date('2026-09-21T01:15:00Z')), 2, 'Closing the prior day does not reset the current business-day token');
+    resetTokenNumber('2026-09-21');
+    assertEqual(generateTokenNumber(new Date('2026-09-21T01:30:00Z')), 1, 'Closing the current business day resets its token to 1');
+
     // ── Summary ───────────────────────────────────────────────────────
     console.log('\n' + '='.repeat(50));
     const results = getResults();

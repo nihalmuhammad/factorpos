@@ -672,7 +672,7 @@ router.post('/', requireRole(...ROLE_ACCESS.owner), (req: Request, res: Response
         `SELECT id FROM cash_closures WHERE business_date = ? AND scope = 'day'`
       ).get(businessDate) as { id: number }).id);
 
-      resetTokenNumber();
+      resetTokenNumber(businessDate);
 
       return {
         id,

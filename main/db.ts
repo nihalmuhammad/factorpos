@@ -5042,14 +5042,19 @@ export function generateOrderNumber(): string {
   return [prefix, dateSegment, String(next).padStart(4, '0')].filter(Boolean).join('-');
 }
 
-/** Customer-facing token counter. Day close removes this bucket so the next token is 1. */
-export function generateTokenNumber(): number {
-  return getNextSequence('order_tokens', 'CURRENT');
+function tokenBusinessDate(instant: Date = new Date()): string {
+  const timezone = getSettingValue('timezone') || 'Asia/Kolkata';
+  return localDateInTimezone(instant, timezone, tenantBusinessDayStartTime());
 }
 
-/** Reset the customer-facing token counter inside the caller's transaction. */
-export function resetTokenNumber(): void {
-  db.prepare(`DELETE FROM sequences WHERE name = 'order_tokens' AND date = 'CURRENT'`).run();
+/** Customer-facing token counter, reset automatically at each business-day boundary. */
+export function generateTokenNumber(instant: Date = new Date()): number {
+  return getNextSequence('order_tokens', tokenBusinessDate(instant));
+}
+
+/** Reset one business day's customer-facing token counter inside the caller's transaction. */
+export function resetTokenNumber(businessDate: string = tokenBusinessDate()): void {
+  db.prepare(`DELETE FROM sequences WHERE name = 'order_tokens' AND date = ?`).run(businessDate);
 }
 
 export function generateBillNumber(): string {
