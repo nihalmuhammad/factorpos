@@ -40,10 +40,14 @@ export function LocalePreferencesPanel({ options, currencyDisplay, digits, calen
     options?.currencyDisplay?.length || options?.digits?.length || options?.calendar?.length,
   );
   if (!hasAny) return null;
+  const hasIranPreferences = Boolean(
+    options?.currencyDisplay?.some((mode) => mode === 'toman' || mode === 'toman_short')
+      || options?.calendar?.includes('persian'),
+  );
 
   return (
     <div className="md:col-span-2 space-y-4 rounded-lg border border-border bg-muted/60 p-4">
-      <p className="text-sm font-medium text-foreground">{t('iranLocaleTitle')}</p>
+      {hasIranPreferences ? <p className="text-sm font-medium text-foreground">{t('iranLocaleTitle')}</p> : null}
       <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
         {options?.currencyDisplay?.length ? (
           <div>
@@ -102,7 +106,7 @@ export function LocalePreferencesPanel({ options, currencyDisplay, digits, calen
           </div>
         ) : null}
       </div>
-      <p className="text-xs text-gray-400">{t('iranLocaleHint')}</p>
+      {hasIranPreferences ? <p className="text-xs text-gray-400">{t('iranLocaleHint')}</p> : null}
     </div>
   );
 }
