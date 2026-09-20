@@ -45,7 +45,6 @@ numbers, and dates do not emit Arabic-Indic digits.
 
 ## Still pending
 
-- Reviewed Arabic translation bundle and Arabic language selector entry
 - FactorPOS logo, icons, and final color palette
 - Private source/release host and updater feed
 - Windows publisher identity and code-signing certificate

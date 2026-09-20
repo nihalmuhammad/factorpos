@@ -12,8 +12,7 @@ The application will be developed and tested from a Mac, installed on Windows sh
 - Initial deployment: **4 shops**
 - Development computer: **macOS**
 - Shop computers: **Windows**
-- Primary interface language: **English**
-- Optional interface language: **Arabic**
+- FactorPOS interface language: **English**
 - Saudi Arabia country and currency settings: **SAR**
 - Saudi displays must use Western/English digits: **0–9**
 - Receipt-printer and kitchen-order-ticket (KOT) behavior: retain the current FloCafe implementation
@@ -67,9 +66,9 @@ Every change should have a short description and, where practical, an automated 
 ### Languages
 
 - Make English the default language for a new installation.
-- Keep Arabic available in Settings.
-- Preserve correct right-to-left layout when Arabic is selected.
-- Confirm that switching languages does not change stored sales data.
+- Do not add or modify application languages for the FactorPOS customization.
+- Preserve the upstream language system without expanding its selectable
+  languages.
 
 ### Saudi digits
 
@@ -83,9 +82,11 @@ Use Western digits (`0–9`) throughout the Saudi/SAR configuration, including:
 - Printed receipts and kitchen tickets
 - Exported files where formatting applies
 
-Currency and tax formatting should remain appropriate for Saudi Arabia. Digit display must be treated separately from the selected interface language: Arabic text may still use Western digits.
+Currency and tax formatting should remain appropriate for Saudi Arabia. Saudi
+digit display must use Western digits regardless of the Saudi locale.
 
-Add tests covering English and Arabic interfaces with SAR values, dates, order numbers, receipts, and KOT output.
+Add tests covering SAR values, dates, order numbers, receipts, and KOT output
+using Western digits.
 
 ## 6. Phase 3 — Windows build and installation
 
@@ -173,7 +174,7 @@ For each upstream release:
 2. Merge it into a separate update branch.
 3. Resolve conflicts without removing FactorPOS branding or digit rules.
 4. Run the full test suite.
-5. Test database migration, receipts, KOT, English, Arabic, and SAR formatting.
+5. Test database migration, receipts, KOT, English, and SAR formatting.
 6. Release to the pilot PC before the other shops.
 
 Maintain a small customization log so upstream merges remain understandable.
@@ -214,7 +215,7 @@ These are intentionally outside the first release unless requested later:
 The first milestone is complete when:
 
 - FactorPOS runs from source on the Mac.
-- English is the default and Arabic can be selected.
+- English is the FactorPOS default interface language.
 - Saudi/SAR screens and print output use `0–9` digits.
 - Existing receipt and KOT behavior passes regression tests.
 - A signed or clearly marked test Windows installer is produced.
