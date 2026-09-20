@@ -14,6 +14,7 @@ import { COUNTRIES, getCountryByCode, getLocalizedCountryName, countryMatchesQue
 import { TimeZoneSelect } from '@/components/TimeZoneSelect';
 import { useLocale, useTranslations, type AppConfig } from 'use-intl';
 import { LANGUAGES, getBrowserLanguage, type Language } from '@/lib/i18n';
+import { FACTORPOS_DEFAULTS } from '@shared/factorpos-defaults';
 
 type SetupProfile = 'empty' | 'express' | 'demo';
 type ServiceModel = 'qsr' | 'finedine';
@@ -82,11 +83,13 @@ export default function SetupPage() {
   const language = usePosSettingsStore((s) => s.language);
   const setStoreLanguage = usePosSettingsStore((s) => s.setLanguage);
   const [browserLanguage] = useState<Language>(() => getBrowserLanguage());
-  const [country, setCountry] = useState<string>('SA');
+  const [country, setCountry] = useState<string>(FACTORPOS_DEFAULTS.country);
   const [countryQuery, setCountryQuery] = useState<string>('');
   // The country profile timezone is only a suggested default; the owner can
   // override it here for multi-timezone countries before completing setup.
-  const [timezone, setTimezone] = useState<string>(() => getCountryByCode('SA')?.timezone || 'Asia/Riyadh');
+  const [timezone, setTimezone] = useState<string>(() => (
+    getCountryByCode(FACTORPOS_DEFAULTS.country)?.timezone || FACTORPOS_DEFAULTS.timezone
+  ));
   const [form, setForm] = useState({
     name: '',
     email: '',

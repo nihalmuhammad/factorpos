@@ -38,6 +38,11 @@ New installations default to:
 The Saudi country profile only exposes the Latin digit preference. UI language,
 regional settings, and tax behavior remain separate domains.
 
+The shared source of truth for first-run defaults is
+`shared/factorpos-defaults.ts`. Both the setup interface and backend setup API
+consume it, and `tests/country-profile.test.ts` verifies Saudi currency,
+numbers, and dates do not emit Arabic-Indic digits.
+
 ## Still pending
 
 - Reviewed Arabic translation bundle and Arabic language selector entry

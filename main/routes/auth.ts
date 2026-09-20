@@ -12,6 +12,7 @@ import { cloudSync, DEFAULT_CLOUD_SERVER_URL, normalizeCloudServerUrl } from '..
 import { asyncHandler } from '../middleware/async-handler';
 import { normalizeOptionalPhone } from '../lib/phone';
 import { isSyntacticallyValidCurrencyCode } from '../../shared/print/currency';
+import { FACTORPOS_DEFAULTS } from '../../shared/factorpos-defaults';
 
 const router = Router();
 
@@ -85,18 +86,21 @@ function buildLocalTenant(db: ReturnType<typeof getDatabase>, userRole: string) 
     slug: 'local',
     database_name: 'local',
     business_type: s.business_type || 'restaurant',
-    country: s.country || 'SA',
-    currency: s.currency || 'SAR',
-    currency_symbol: getCurrencySymbol(s.currency || 'SAR', getCountryByCode(s.country || 'SA')?.locale) || 'SAR',
-    timezone: s.timezone || 'Asia/Riyadh',
+    country: s.country || FACTORPOS_DEFAULTS.country,
+    currency: s.currency || FACTORPOS_DEFAULTS.currency,
+    currency_symbol: getCurrencySymbol(
+      s.currency || FACTORPOS_DEFAULTS.currency,
+      getCountryByCode(s.country || FACTORPOS_DEFAULTS.country)?.locale,
+    ) || FACTORPOS_DEFAULTS.currency,
+    timezone: s.timezone || FACTORPOS_DEFAULTS.timezone,
     business_day_start_time: s.business_day_start_time || '00:00',
-    language: s.language || 'en',
+    language: s.language || FACTORPOS_DEFAULTS.language,
     // Include print policies in tenant snapshot so renderer bootstraps them before first print.
     bill_language_policy: s.bill_language_policy || null,
     kot_language_policy: s.kot_language_policy || null,
     service_model: s.service_model || 'finedine',
     currency_display: s.currency_display || 'rial',
-    number_digits: s.number_digits || 'latin',
+    number_digits: s.number_digits || FACTORPOS_DEFAULTS.numberDigits,
     calendar: s.calendar || 'locale',
     plan: 'desktop',
     status: 'active',
@@ -882,10 +886,10 @@ router.post('/setup/initialize', (req: Request, res: Response) => {
       language,
       business_name,
       store_name,
-      country = 'SA',
-      currency = 'SAR',
+      country = FACTORPOS_DEFAULTS.country,
+      currency = FACTORPOS_DEFAULTS.currency,
       currency_symbol,
-      timezone = 'Asia/Riyadh',
+      timezone = FACTORPOS_DEFAULTS.timezone,
       business_address,
       address,
       business_phone,
@@ -1011,7 +1015,7 @@ router.post('/setup/initialize', (req: Request, res: Response) => {
         currency_symbol: currency_symbol || getCurrencySymbol(normalizedCurrency, getCountryByCode(country)?.locale),
         timezone,
         language,
-        number_digits: country === 'SA' ? 'latin' : undefined,
+        number_digits: country === FACTORPOS_DEFAULTS.country ? FACTORPOS_DEFAULTS.numberDigits : undefined,
         business_address: outletAddress,
         business_phone: outletPhone,
         address: outletAddress,
