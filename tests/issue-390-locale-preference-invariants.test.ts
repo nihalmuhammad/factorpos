@@ -100,6 +100,22 @@ async function main() {
     assert.equal(usLatin.status, 400, 'US + number_digits "latin" returns HTTP 400');
     assert.equal(usLatin.data.error, 'Invalid number_digits for country US', 'number_digits rejection message is country-scoped');
 
+    const saArabic = await api(baseUrl, '/api/settings/business', {
+      method: 'PUT',
+      body: { business_name: 'Riyadh Cafe', country: 'SA', currency: 'SAR', number_digits: 'locale' },
+      headers: owner.authHeader,
+    });
+    assert.equal(saArabic.status, 200, 'SA + locale Arabic digits returns 200');
+    assert.equal(saArabic.data.number_digits, 'locale', 'SA locale Arabic digits persist');
+
+    const saLatin = await api(baseUrl, '/api/settings/business', {
+      method: 'PUT',
+      body: { business_name: 'Riyadh Cafe', country: 'SA', currency: 'SAR', number_digits: 'latin' },
+      headers: owner.authHeader,
+    });
+    assert.equal(saLatin.status, 200, 'SA + Latin digits returns 200');
+    assert.equal(saLatin.data.number_digits, 'latin', 'SA Latin digits persist');
+
     // ── 2. Valid IR preferences save and keep canonical IRR storage ──
     const irSave = await api(baseUrl, '/api/settings/business', {
       method: 'PUT',

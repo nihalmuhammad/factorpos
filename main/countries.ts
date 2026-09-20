@@ -61,7 +61,7 @@ const SUPPORTED: Record<string, Row> = {
   NZ: { locale: 'en-NZ', currency: 'NZD', tz: 'Pacific/Auckland',                taxIdLabel: 'IRD',   taxName: 'GST' },
   AE: { locale: 'ar-AE', currency: 'AED', tz: 'Asia/Dubai',                      taxIdLabel: 'TRN',   taxName: 'VAT' },
   SA: { locale: 'ar-SA', currency: 'SAR', tz: 'Asia/Riyadh',                     taxIdLabel: 'VAT',   taxName: 'VAT',
-    localeOptions: { digits: ['latin'] } },
+    localeOptions: { digits: ['locale', 'latin'] } },
   ZA: { locale: 'en-ZA', currency: 'ZAR', tz: 'Africa/Johannesburg',             taxIdLabel: 'VAT',   taxName: 'VAT' },
   MA: { locale: 'fr-MA', currency: 'MAD', tz: 'Africa/Casablanca',               taxIdLabel: 'Tax ID',taxName: 'VAT' },
   KE: { locale: 'en-KE', currency: 'KES', tz: 'Africa/Nairobi',                  taxIdLabel: 'PIN',   taxName: 'VAT' },

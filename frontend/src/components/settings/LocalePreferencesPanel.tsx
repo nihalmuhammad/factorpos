@@ -78,11 +78,15 @@ export function LocalePreferencesPanel({ options, currencyDisplay, digits, calen
                 className="w-full px-3 py-2 text-sm border border-border rounded-lg outline-none focus:ring-2 focus:ring-brand bg-card"
               >
                 {options!.digits!.map((mode) => (
-                  <option key={mode} value={mode}>{t(DIGIT_LABELS[mode])}</option>
+                  <option key={mode} value={mode}>
+                    {mode === 'locale' && !hasIranPreferences ? 'Arabic (٠-٩)' : t(DIGIT_LABELS[mode])}
+                  </option>
                 ))}
               </select>
             ) : (
-              <p className="font-medium text-foreground">{t(DIGIT_LABELS[digits])}</p>
+              <p className="font-medium text-foreground">
+                {digits === 'locale' && !hasIranPreferences ? 'Arabic (٠-٩)' : t(DIGIT_LABELS[digits])}
+              </p>
             )}
           </div>
         ) : null}
