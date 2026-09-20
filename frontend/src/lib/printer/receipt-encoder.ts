@@ -667,9 +667,9 @@ export function buildCompactReceiptBytes(
   // Invoice number and timestamp on one line (document-meta block)
   if (meta) {
     if (meta.tokenNumber !== null) {
-      enc.align('center').bold(true).height(2);
-      safePrinterText(enc, `TOKEN #${meta.tokenNumber}`, warnings, false, arabicShaping, undefined, cols);
-      enc.height(1).bold(false).newline().align('left');
+      enc.align('center').bold(true).width(2).height(2);
+      safePrinterText(enc, `*** TOKEN #${meta.tokenNumber} ***`, warnings, false, arabicShaping, undefined, Math.floor(cols / 2));
+      enc.width(1).height(1).bold(false).newline().align('left');
     }
     safePrinterText(
       enc,
@@ -693,8 +693,6 @@ export function buildCompactReceiptBytes(
   if (customer?.phone) {
     safePrinterText(enc, `${printLabelResolver('print.numberShort', primaryLang)}: ${maskPhoneOnReceipt(customer.phone.text)}`, warnings, false, arabicShaping).newline();
   }
-
-  enc.rule({ style: 'single' });
 
   // Items — compact: one line per item with total, qty x rate below if qty > 1
   for (const row of items?.rows ?? []) {
@@ -736,8 +734,6 @@ export function buildCompactReceiptBytes(
     }
   }
 
-  enc.rule({ style: 'single' });
-
   if (totals?.discount) {
     safePrinterText(enc, padRow(labelOf(totals.discount.label), `-${formatAmount(totals.discount.amount, currency, locale, trim, fractionDigits)}`, cols), warnings, false, arabicShaping, undefined, undefined, true).newline();
   }
@@ -760,7 +756,6 @@ export function buildCompactReceiptBytes(
     }
   }
 
-  enc.rule({ style: 'double' });
   if (totals) {
     enc.bold(true).height(2);
     safePrinterText(enc, padRow(labelOf(totals.grandTotal.label), formatAmount(totals.grandTotal.amount, currency, locale, trim, fractionDigits), cols), warnings, false, arabicShaping, undefined, undefined, true);
@@ -774,15 +769,14 @@ export function buildCompactReceiptBytes(
     safePrinterText(enc, padRow(paymentLabel(line.label), formatAmount(line.amount, currency, locale, trim, fractionDigits), cols), warnings, false, arabicShaping, undefined, undefined, true).newline();
   }
 
-  enc.newline().align('center');
+  enc.align('center');
   if (header?.taxId) {
     safePrinterText(enc, `${labelOf(header.taxId.label)}: ${header.taxId.value.text}`, warnings, false, arabicShaping, cols).newline();
   }
-  if (header?.address) safePrinterText(enc, truncate(header.address.text, cols), warnings, false, arabicShaping, cols).newline();
-  if (header?.phone) safePrinterText(enc, `${printLabelResolver('receipt.phone', primaryLang)}: ${header.phone.text}`, warnings, false, arabicShaping, cols).newline();
-  safePrinterText(enc, printLabelResolver('print.thankYouShort', primaryLang), warnings, false, arabicShaping, cols).newline();
   if (messages?.footerNote) {
     safePrinterText(enc, truncate(messages.footerNote.text, cols), warnings, false, arabicShaping, cols).newline();
+  } else {
+    safePrinterText(enc, printLabelResolver('print.thankYouShort', primaryLang), warnings, false, arabicShaping, cols).newline();
   }
   printPoweredByFooter(enc, cols);
 

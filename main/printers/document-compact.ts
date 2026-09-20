@@ -3,7 +3,7 @@
 import { parseDbTimestamp } from '../db';
 import { getCurrencyFractionDigits } from '../countries';
 import type { PrinterCutMode } from './profiles';
-import { isThermalTextRepresentable, type ThermalPrinterCapabilities } from '../../shared/print/thermal-capabilities';
+import type { ThermalPrinterCapabilities } from '../../shared/print/thermal-capabilities';
 import type { RasterSemanticLineGroup, RasterTextLayout } from '../../shared/print/raster';
 import {
   addonRows,
@@ -90,21 +90,6 @@ function compactBannerLines(label: SemanticLabel, context: ThermalLayoutContext)
   return layout.lines.map((line) => `{CENTER}{BOLD}{DOUBLE_HEIGHT}${widthToken}${normalizeThermalText(line, context.capabilities)}${closeWidthToken}{/DOUBLE_HEIGHT}{/BOLD}{/CENTER}`);
 }
 
-/** Column header row, composed from the document's own header labels. */
-function compactItemHeader(block: ItemTableBlock, nameLen: number, amtLen: number, language: string, capabilities?: ThermalPrinterCapabilities): string {
-  const qtyW = 4;
-  const itemLabel = normalizeThermalText(labelOf(block.header.item), capabilities);
-  const qtyLabel = normalizeThermalText(labelOf(block.header.quantity), capabilities);
-  const amountLabel = normalizeThermalText(labelOf(block.header.amount), capabilities);
-  const fit = (value: string, length: number): string => capabilities?.raster.enabled === true && !isThermalTextRepresentable(value, capabilities)
-    ? value
-    : value.slice(0, length);
-  const item = fit(itemLabel, nameLen).padEnd(nameLen);
-  const qty = fit(qtyLabel, qtyW).padEnd(qtyW);
-  const amount = fit(amountLabel, Math.max(1, amtLen - 1));
-  return item + qty + ' '.repeat(Math.max(0, amtLen - amount.length)) + amount;
-}
-
 /** Map a PrintDocument onto compact token-line layout. */
 export function renderBillDocumentToCompactLines(
   document: PrintDocument,
@@ -127,7 +112,6 @@ export function renderBillDocumentToCompactLines(
   const trimDecimals = options.trimDecimals === true;
   const tzOptions = options.timezone ? { timeZone: options.timezone } : undefined;
   const bar = '='.repeat(cols);
-  const dash = '-'.repeat(cols);
   const normalize = (text: string): string => normalizeThermalText(text, options.capabilities);
   const markGroup = (groupId: string, start: number, sourceLines?: readonly string[], sourceControlLines?: readonly string[], financial = false, sourceLayouts?: readonly (RasterTextLayout | undefined)[]): void => {
     if (options.rasterGroups && lines.length > start) options.rasterGroups.push({ groupId, lineIndex: start, lineCount: lines.length - start, ...(sourceLines ? { sourceLines } : {}), ...(sourceControlLines ? { sourceControlLines } : {}), ...(sourceLayouts ? { sourceLayouts } : {}), ...(financial ? { financial: true } : {}) });
@@ -194,8 +178,8 @@ export function renderBillDocumentToCompactLines(
   const metaSourceLines: string[] = [];
   if (meta) {
     if (meta.tokenNumber !== null) {
-      const tokenText = `TOKEN #${meta.tokenNumber}`;
-      lines.push(`{CENTER}{BOLD}{DOUBLE_HEIGHT}${normalize(tokenText)}{/DOUBLE_HEIGHT}{/BOLD}{/CENTER}`);
+      const tokenText = `*** TOKEN #${meta.tokenNumber} ***`;
+      lines.push(`{CENTER}{BOLD}{DOUBLE_HEIGHT}{DOUBLE_WIDTH}${normalize(tokenText)}{/DOUBLE_WIDTH}{/DOUBLE_HEIGHT}{/BOLD}{/CENTER}`);
       metaSourceLines.push(tokenText);
     }
     lines.push(normalize(labelOf(meta.billNumberLabel) + ': ' + meta.invoiceNumber.text));
@@ -225,8 +209,6 @@ export function renderBillDocumentToCompactLines(
     customerSourceControlLines.push(lines.at(-1) ?? '');
   }
   if (options.rasterGroups && lines.length > customerStart) options.rasterGroups.push({ groupId: 'customer', lineIndex: customerStart, lineCount: lines.length - customerStart, sourceLines: customerSourceLines, sourceControlLines: customerSourceControlLines });
-  lines.push(dash);
-
   // Item table.
   if (items) {
     const amtLen = itemAmountWidth(
@@ -238,9 +220,6 @@ export function renderBillDocumentToCompactLines(
       fractionDigits,
     );
     const nameLen = itemNameWidth(cols, amtLen);
-    lines.push(compactItemHeader(items, nameLen, amtLen, options.language, options.capabilities));
-    lines.push(dash);
-
     for (const [rowIndex, row] of items.rows.entries()) {
       const rowStart = lines.length;
       const rowLines = itemRows(
@@ -303,8 +282,6 @@ export function renderBillDocumentToCompactLines(
     }
   }
 
-  lines.push(dash);
-
   // Totals (compact has no loyalty points section).
   const totalsStart = lines.length;
   const totalsSourceLines: string[] = [];
@@ -329,8 +306,11 @@ export function renderBillDocumentToCompactLines(
     } : undefined);
   };
   if (totals) {
-    const subtotalValue = formatCurrency(totals.subtotal.amount, prefix, options.locale, trimDecimals, fractionDigits);
-    pushTotalRow(financialRows(labelOf(totals.subtotal.label), subtotalValue, cols, options.language, options.capabilities), false, labelOf(totals.subtotal.label), subtotalValue);
+    const hasAdjustments = Boolean(totals.discount || totals.tax || totals.serviceCharge || totals.deliveryCharge || totals.packagingCharge || (breakdown && breakdown.lines.length > 0));
+    if (hasAdjustments) {
+      const subtotalValue = formatCurrency(totals.subtotal.amount, prefix, options.locale, trimDecimals, fractionDigits);
+      pushTotalRow(financialRows(labelOf(totals.subtotal.label), subtotalValue, cols, options.language, options.capabilities), false, labelOf(totals.subtotal.label), subtotalValue);
+    }
     if (totals.discount) {
       const discountValue = '-' + formatCurrency(totals.discount.amount, prefix, options.locale, trimDecimals, fractionDigits);
       pushTotalRow(financialRows(labelOf(totals.discount.label), discountValue, cols, options.language, options.capabilities), false, labelOf(totals.discount.label), discountValue);
@@ -370,10 +350,6 @@ export function renderBillDocumentToCompactLines(
   const paymentSourceControlLines: string[] = [];
   const paymentSourceLayouts: Array<RasterTextLayout | undefined> = [];
   if (payments && payments.lines.length > 0) {
-    lines.push(dash);
-    paymentSourceLines.push(dash);
-    paymentSourceControlLines.push(dash);
-    paymentSourceLayouts.push(undefined);
     for (const line of payments.lines) {
       const rawMethodLabel = paymentLabel(line.label);
       const methodLabel = truncate(rawMethodLabel, cols - 12, options.language, options.capabilities);
@@ -394,23 +370,10 @@ export function renderBillDocumentToCompactLines(
   }
   markGroup('payments', paymentsStart, paymentSourceLines, paymentSourceControlLines, true, paymentSourceLayouts);
 
-  // Footer contact details.
-  lines.push(bar);
+  // Compact footer keeps tax identity and the configured customer message.
   const businessFooterStart = lines.length;
   const businessFooterSourceLines: string[] = [];
   const businessFooterSourceControlLines: string[] = [];
-  if (header?.address) {
-    const start = lines.length;
-    pushWrapped(lines, header.address.text, cols, options.language, options.capabilities);
-    businessFooterSourceLines.push(header.address.text);
-    businessFooterSourceControlLines.push(lines[start] ?? '');
-  }
-  if (header?.phone && header.phoneLabel) {
-    const start = lines.length;
-    pushWrapped(lines, labelOf(header.phoneLabel) + ': ' + header.phone.text, cols, options.language, options.capabilities);
-    businessFooterSourceLines.push(labelOf(header.phoneLabel) + ': ' + header.phone.text);
-    businessFooterSourceControlLines.push(lines[start] ?? '');
-  }
   if (header?.taxId) {
     const start = lines.length;
     pushWrapped(lines, labelOf(header.taxId.label) + ': ' + header.taxId.value.text, cols, options.language, options.capabilities);
