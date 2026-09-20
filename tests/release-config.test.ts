@@ -852,6 +852,7 @@ exit 1
   const matrixWorkflow = loadWorkflow('nightly-release.yml');
   const matrixTriggers = matrixWorkflow.on || matrixWorkflow['true'];
   assert.deepEqual(matrixTriggers.push.branches, ['main']);
+  assert.deepEqual(matrixTriggers.push['paths-ignore'], ['**/*.md'], 'documentation-only pushes must not run the full package matrix');
   assert.ok(matrixTriggers.workflow_dispatch !== undefined);
   assert.equal(matrixTriggers.pull_request, undefined);
   assert.equal(matrixWorkflow.concurrency['cancel-in-progress'], false);
@@ -904,6 +905,7 @@ exit 1
   const developmentWorkflow = loadWorkflow('development-windows.yml');
   const developmentTriggers = developmentWorkflow.on || developmentWorkflow['true'];
   assert.deepEqual(developmentTriggers.push.branches, ['main'], 'test installers must build automatically from main');
+  assert.deepEqual(developmentTriggers.push['paths-ignore'], ['**/*.md'], 'documentation-only pushes must not rebuild Windows installers');
   assert.ok(developmentTriggers.workflow_dispatch !== undefined, 'test installer builds must support manual dispatch');
   assert.equal(developmentWorkflow.permissions.contents, 'read', 'development builds must not publish releases');
   const developmentJob = developmentWorkflow.jobs['build-windows-test-installer'];

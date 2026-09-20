@@ -5,6 +5,7 @@ name: Full Cross-Platform Matrix
 on:
   push:
     branches: [main]
+    paths-ignore: ['**/*.md']
   schedule:
     - cron: '0 0 * * *' # Nightly
   workflow_dispatch:
