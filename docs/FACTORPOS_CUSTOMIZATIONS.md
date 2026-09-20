@@ -35,8 +35,9 @@ New installations default to:
 - Interface language: English
 - Number digits: Western/Latin (`0-9`)
 
-The Saudi country profile only exposes the Latin digit preference. UI language,
-regional settings, and tax behavior remain separate domains.
+The Saudi country profile offers Arabic (`٠-٩`) and Latin (`0-9`) digit
+preferences, with Latin selected by default. UI language, regional settings,
+and tax behavior remain separate domains.
 
 The shared source of truth for first-run defaults is
 `shared/factorpos-defaults.ts`. Both the setup interface and backend setup API
