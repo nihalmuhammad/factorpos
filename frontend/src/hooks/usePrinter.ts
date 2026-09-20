@@ -181,14 +181,11 @@ export const usePrinterStore = create<PrinterState>()(
             ? null
             : makeBillTemplateFallbackWarning({ source: billTemplateSource ?? 'unknown', id: billTemplate });
           const rasterBillTemplate = resolveCoreBillTemplate(billTemplate, billTemplateSource);
-          const browserBillTemplate: 'classic' | 'compact' = rasterBillTemplate
-            ?? (billTemplateSource === null && billTemplate === 'compact' ? 'compact' : 'classic');
 
           const executeBrowserPrint = async (): Promise<PrintWarning[]> => {
             const { printWebBill } = await import('@/lib/printer/web-print');
             const browserWarnings = await printWebBill(bill, tenant, {
               paperSize: printerPaperSize,
-              template: browserBillTemplate,
               languages: opts?.languages ?? resolveBillPrintLanguages(),
               includeTaxId: billShowTaxId,
               taxRegistrationNumber: billShowTaxId && billTaxRegistrationNumber ? billTaxRegistrationNumber : undefined,
