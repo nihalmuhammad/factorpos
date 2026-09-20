@@ -1416,6 +1416,25 @@ async function main() {
       assert(JSON.stringify(directTail) === JSON.stringify([0x1B, 0x70, 0x00, 0x19, 0xFA]),
         `F4 direct: forced drawer pulse tail (got ${JSON.stringify(directTail)})`);
       const { GENERIC_THERMAL_CAPABILITIES } = require('../shared/print/thermal-capabilities');
+      const originalCurrency = db.prepare(`SELECT value FROM settings WHERE key='currency'`).get() as { value?: string } | undefined;
+      const originalCountry = db.prepare(`SELECT value FROM settings WHERE key='country'`).get() as { value?: string } | undefined;
+      try {
+        db.prepare(`INSERT INTO settings (key, value, updated_at) VALUES ('currency', 'SAR', ?) ON CONFLICT(key) DO UPDATE SET value='SAR', updated_at=excluded.updated_at`).run(now());
+        db.prepare(`INSERT INTO settings (key, value, updated_at) VALUES ('country', 'SA', ?) ON CONFLICT(key) DO UPDATE SET value='SA', updated_at=excluded.updated_at`).run(now());
+        const sarWarnings: any[] = [];
+        const sarBody = thermalModule.buildZReportBody(z, undefined, {
+          columns: 48,
+          capabilities: GENERIC_THERMAL_CAPABILITIES,
+        }, sarWarnings);
+        const sarPreview = thermalModule.escPosToText(sarBody);
+        assert(sarWarnings.every((warning: any) => warning.kind !== 'financial'),
+          `F4 direct: SAR Z report has no unsupported financial-row warning (got ${JSON.stringify(sarWarnings)})`);
+        assert(sarPreview.includes('SAR') && !sarPreview.includes('ر.س'),
+          `F4 direct: unsupported Saudi currency symbol falls back to ASCII SAR (preview ${JSON.stringify(sarPreview.slice(0, 500))})`);
+      } finally {
+        db.prepare(`INSERT INTO settings (key, value, updated_at) VALUES ('currency', ?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at`).run(originalCurrency?.value || 'INR', now());
+        db.prepare(`INSERT INTO settings (key, value, updated_at) VALUES ('country', ?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at`).run(originalCountry?.value || 'IN', now());
+      }
       const shapingCapabilities = {
         ...GENERIC_THERMAL_CAPABILITIES,
         shaping: { arabic: true },

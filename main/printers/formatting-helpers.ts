@@ -173,7 +173,9 @@ export function formatCurrency(amount: number, prefix: string, locale: string = 
   const formattedNum = numeric.toLocaleString(safeLocale, {
     minimumFractionDigits: trimDecimals && !hasDecimals ? 0 : fractionDigits,
     maximumFractionDigits: fractionDigits,
-  }).replace(/[\u00A0\u202F]/g, ' ');
+  })
+    .replace(/[\u00A0\u202F]/g, ' ')
+    .replace(/[\u061C\u200E\u200F]/g, '');
   return prefix + formattedNum;
 }
 
