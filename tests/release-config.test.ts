@@ -60,7 +60,7 @@ function executeWorkflowStep(step: any, options: {
   fakeNodeVersion?: string;
   fakeCommands?: Record<string, string>;
 } = {}): { status: number | null; stdout: string; stderr: string; outputs: Record<string, string>; log: string } {
-  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'flocafe-release-config-'));
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'factorpos-release-config-'));
   const binDir = path.join(tempDir, 'bin');
   const outputPath = path.join(tempDir, 'github-output');
   const logPath = path.join(tempDir, 'commands.log');
@@ -203,8 +203,8 @@ function run() {
   assert.equal(build?.snapcraft?.core24?.environment?.TMPDIR, '$XDG_RUNTIME_DIR', 'snapcraft must use a writable runtime temp directory');
   assert.ok(typeof build?.linux?.synopsis === 'string' && build.linux.synopsis.length > 0 && build.linux.synopsis.length <= 78, 'linux synopsis must be present and short');
 
-  assert.equal(build?.linux?.artifactName, 'flocafe-${version}-linux.${ext}', 'Linux package artifact template must remain deterministic');
-  assert.equal(build?.appImage?.artifactName, 'flocafe-${version}-linux.appimage', 'AppImage artifact extension must be lowercase');
+  assert.equal(build?.linux?.artifactName, 'factorpos-${version}-linux.${ext}', 'Linux package artifact template must remain deterministic');
+  assert.equal(build?.appImage?.artifactName, 'factorpos-${version}-linux.appimage', 'AppImage artifact extension must be lowercase');
   assert.equal(builderUtil.getArtifactArchName(builderUtil.Arch.x64, 'AppImage'), 'x86_64', 'electron-builder AppImage x64 macro spelling must be documented');
   assert.equal(builderUtil.getArtifactArchName(builderUtil.Arch.arm64, 'AppImage'), 'arm64', 'electron-builder AppImage arm64 macro spelling must be documented');
   for (const artifact of [build?.linux?.artifactName, build?.appImage?.artifactName]) {
@@ -862,7 +862,7 @@ exit 1
     ['linux-x64', 'macos-arm64', 'macos-x64', 'windows-x64'].sort()
   );
   const matrixUpload = findStep(matrixJob, 'Upload build artifacts');
-  assert.equal(matrixUpload.with.name, 'flocafe-build-${{ matrix.name }}');
+  assert.equal(matrixUpload.with.name, 'factorpos-build-${{ matrix.name }}');
 
   const ciWorkflow = loadWorkflow('ci.yml');
   const requiredGateJob = ciWorkflow.jobs['required-checks-gate'];
@@ -893,14 +893,14 @@ exit 1
   const releaseRegression = findStep(e2eJob, 'Run renderer and printer regression suites');
   assertShellStep(e2eJob, 'Run renderer and printer regression suites');
   assert.equal(releaseRegression.env.REQUIRE_VISUAL_EVIDENCE, '1');
-  assert.equal(releaseRegression.env.EVIDENCE_DIR, '${{ runner.temp }}/flocafe-release-regressions');
+  assert.equal(releaseRegression.env.EVIDENCE_DIR, '${{ runner.temp }}/factorpos-release-regressions');
   const evidenceUpload = (e2eJob.steps || []).find((step: any) => step.with?.name === 'release-regression-evidence');
   assert.ok(evidenceUpload, 'CI must upload release regression evidence');
-  assert.equal(evidenceUpload.with.path, '${{ runner.temp }}/flocafe-release-regressions/');
+  assert.equal(evidenceUpload.with.path, '${{ runner.temp }}/factorpos-release-regressions/');
 
-  const metaFilePath = path.join(__dirname, '../assets/com.flo.desktop.metainfo.xml');
+  const metaFilePath = path.join(__dirname, '../assets/com.factorpos.desktop.metainfo.xml');
   const originalMetaContent = fs.readFileSync(metaFilePath, 'utf8');
-  const testNotesPath = path.join(os.tmpdir(), `flocafe-release-notes-${Date.now()}.md`);
+  const testNotesPath = path.join(os.tmpdir(), `factorpos-release-notes-${Date.now()}.md`);
   try {
     fs.writeFileSync(testNotesPath, 'Features & fixes:\n- Added <parity> & metadata synchronization');
     const updateResult = childProcess.spawnSync(

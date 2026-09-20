@@ -4,7 +4,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 const releaseDir = path.resolve(__dirname, '../release');
-const markerName = 'flo-unpacked-dev.marker';
+const markerName = 'factorpos-unpacked-dev.marker';
 
 function findResourceDirectories(currentDir, found = []) {
   let entries;
@@ -40,5 +40,5 @@ if (candidates.length !== 1) {
 }
 
 const markerPath = path.join(candidates[0], markerName);
-fs.writeFileSync(markerPath, 'FloCafe unpacked development artifact\n', 'utf8');
+fs.writeFileSync(markerPath, 'FactorPOS unpacked development artifact\n', 'utf8');
 console.log(`Marked unpacked artifact: ${markerPath}`);

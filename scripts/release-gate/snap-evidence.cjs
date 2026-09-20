@@ -12,7 +12,7 @@ function arg(argv, name) {
 function createSnapEvidence({ tag, channel, architecture }) {
   const evidence = {
     schemaVersion: 1,
-    type: 'flocafe-snap-publication',
+    type: 'factorpos-snap-publication',
     tag,
     channel,
     architecture,

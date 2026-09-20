@@ -998,7 +998,7 @@ export default function POSPage() {
                     try {
                       await api.post('/support-ticket', {
                         ...supportError.payload,
-                        subject: 'FloCafe printing problem',
+                        subject: 'FactorPOS printing problem',
                         correlation_id: crypto.randomUUID(),
                         client_ticket_id: clientTicketId,
                       });

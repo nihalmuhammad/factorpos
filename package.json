@@ -1,7 +1,7 @@
 {
-  "name": "flo-desktop",
+  "name": "factorpos",
   "version": "3.9.0",
-  "description": "Free, open-source, offline-first restaurant POS with KDS, SQLite, and thermal printer support.",
+  "description": "FactorPOS is an offline-first restaurant POS with KDS, SQLite, and thermal printer support.",
   "engines": {
     "node": ">=22.12.0"
   },
@@ -217,16 +217,15 @@
     "test:issue-252": "node tests/run-electron-node-test.cjs tests/issue-252-order-lifecycle-inventory.test.ts"
   },
   "author": {
-    "name": "Flo",
-    "email": "support@flo.local"
+    "name": "FactorPOS"
   },
   "homepage": "https://flopos.com",
   "repository": {
     "type": "git",
-    "url": "https://github.com/FreeOpenSourcePOS/FloCafe.git"
+    "url": "https://github.com/nihalmuhammad/factorpos.git"
   },
   "bugs": {
-    "url": "https://github.com/FreeOpenSourcePOS/FloCafe/issues"
+    "url": "https://github.com/nihalmuhammad/factorpos/issues"
   },
   "license": "MIT",
   "overrides": {
@@ -280,8 +279,8 @@
     "ws": "^8.21.2"
   },
   "build": {
-    "appId": "com.flo.desktop",
-    "productName": "Flo Cafe",
+    "appId": "com.factorpos.desktop",
+    "productName": "FactorPOS",
     "icon": "assets/icon-512.png",
     "afterPack": "scripts/afterPack.js",
     "asar": true,
@@ -294,13 +293,6 @@
       "node_modules/**/*",
       "!**/better-sqlite3/build/Release/test_extension.node"
     ],
-    "publish": {
-      "provider": "github",
-      "owner": "FreeOpenSourcePOS",
-      "repo": "FloCafe",
-      "releaseType": "release",
-      "channel": "latest"
-    },
     "detectUpdateChannel": false,
     "generateUpdatesFilesForAllChannels": true,
     "extraResources": [
@@ -320,25 +312,18 @@
           "arch": [
             "x64"
           ]
-        },
-        {
-          "target": "appx",
-          "arch": [
-            "x64",
-            "arm64"
-          ]
         }
       ],
       "icon": "assets/icon.ico",
-      "artifactName": "flocafe-${version}-win-${arch}.${ext}"
+      "artifactName": "factorpos-${version}-win-${arch}.${ext}"
     },
     "appx": {
-      "applicationId": "FloCafe",
+      "applicationId": "FactorPOS",
       "backgroundColor": "#1e1e2e",
-      "publisherDisplayName": "Codify Apps Private Limited",
-      "identityName": "CodifyAppsPrivateLimited.FloCafe",
-      "publisher": "CN=34AFD24D-EC88-44B8-B309-08BB8A6BB5F7",
-      "displayName": "Flo Cafe",
+      "publisherDisplayName": "FactorPOS",
+      "identityName": "FactorPOS.FactorPOS",
+      "publisher": "CN=FactorPOS",
+      "displayName": "FactorPOS",
       "languages": [
         "en-US"
       ]
@@ -362,15 +347,15 @@
       ],
       "icon": "assets/icon.icns",
       "category": "public.app-category.business",
-      "identity": "Codify Apps Private Limited (BKDY677XJA)",
+      "identity": null,
       "entitlements": "build/entitlements.plist",
       "entitlementsInherit": "build/entitlements.plist",
       "hardenedRuntime": true,
       "gatekeeperAssess": false,
-      "notarize": true,
-      "artifactName": "flocafe-${version}-mac-${arch}.${ext}",
+      "notarize": false,
+      "artifactName": "factorpos-${version}-mac-${arch}.${ext}",
       "extendInfo": {
-        "NSLocalNetworkUsageDescription": "Flo Cafe connects to thermal printers, KDS displays, and the Waiter & Table Terminal on your local network.",
+        "NSLocalNetworkUsageDescription": "FactorPOS connects to thermal printers, KDS displays, and the Waiter & Table Terminal on your local network.",
         "NSBonjourServices": [
           "_http._tcp"
         ]
@@ -388,7 +373,7 @@
       "type": "distribution",
       "extendInfo": {
         "ITSAppUsesNonExemptEncryption": false,
-        "NSLocalNetworkUsageDescription": "Flo Cafe connects to thermal printers, KDS displays, and the Waiter & Table Terminal on your local network.",
+        "NSLocalNetworkUsageDescription": "FactorPOS connects to thermal printers, KDS displays, and the Waiter & Table Terminal on your local network.",
         "NSBonjourServices": [
           "_http._tcp"
         ]
@@ -406,7 +391,7 @@
     },
     "linux": {
       "synopsis": "Self-hosted Point of Sale for cafes and restaurants",
-      "description": "Flo is a free, open-source point-of-sale system for cafes, restaurants, and small kitchens. Local-first, offline-capable, no cloud lock-in, no per-seat fees.",
+      "description": "FactorPOS is an offline-first point-of-sale system for cafes, restaurants, and small kitchens.",
       "target": [
         {
           "target": "AppImage",
@@ -439,12 +424,12 @@
       ],
       "icon": "assets",
       "category": "Office",
-      "executableName": "flocafe",
-      "artifactName": "flocafe-${version}-linux.${ext}",
+      "executableName": "factorpos",
+      "artifactName": "factorpos-${version}-linux.${ext}",
       "extraFiles": [
         {
-          "from": "assets/com.flo.desktop.metainfo.xml",
-          "to": "usr/share/metainfo/com.flo.desktop.metainfo.xml"
+          "from": "assets/com.factorpos.desktop.metainfo.xml",
+          "to": "usr/share/metainfo/com.factorpos.desktop.metainfo.xml"
         },
         {
           "from": "assets/icons",
@@ -453,16 +438,16 @@
       ],
       "desktop": {
         "entry": {
-          "Name": "Flo Cafe",
-          "Comment": "Free, open-source POS for cafes and restaurants",
+          "Name": "FactorPOS",
+          "Comment": "Offline-first POS for cafes and restaurants",
           "GenericName": "Point of Sale",
           "Keywords": "pos;point of sale;restaurant;cafe;billing;invoice;",
-          "StartupWMClass": "flo-desktop"
+          "StartupWMClass": "factorpos"
         }
       }
     },
     "appImage": {
-      "artifactName": "flocafe-${version}-linux.appimage"
+      "artifactName": "factorpos-${version}-linux.appimage"
     },
     "snapcraft": {
       "base": "core24",

@@ -90,7 +90,7 @@ jobs:
         run: |
           mkdir -p "$RUNNER_TEMP/matrix" && cd "$RUNNER_TEMP/matrix"
           curl -sSL -o "setup-N.exe" \
-            "https://github.com/FreeOpenSourcePOS/FloCafe/releases/download/${FROM_VERSION}/flocafe-${FROM_VERSION}-win-x64.exe"
+            "https://github.com/FreeOpenSourcePOS/FloCafe/releases/download/${FROM_VERSION}/factorpos-${FROM_VERSION}-win-x64.exe"
           ls -la setup-N.exe
           # Git Bash path-converts the leading slash in NSIS switches unless
           # disabled, which would leave the assisted installer waiting for UI
@@ -271,9 +271,9 @@ jobs:
         run: |
           mkdir -p "$RUNNER_TEMP/matrix" && cd "$RUNNER_TEMP/matrix"
           if ! curl -fsSL -o flocafe.AppImage \
-            "https://github.com/FreeOpenSourcePOS/FloCafe/releases/download/${FROM_VERSION}/flocafe-${FROM_VERSION}-${{ matrix.asset_suffix }}"; then
+            "https://github.com/FreeOpenSourcePOS/FloCafe/releases/download/${FROM_VERSION}/factorpos-${FROM_VERSION}-${{ matrix.asset_suffix }}"; then
             curl -fsSL -o flocafe.AppImage \
-              "https://github.com/FreeOpenSourcePOS/FloCafe/releases/download/${FROM_VERSION}/flocafe-${FROM_VERSION}-${{ matrix.legacy_asset_suffix }}"
+              "https://github.com/FreeOpenSourcePOS/FloCafe/releases/download/${FROM_VERSION}/factorpos-${FROM_VERSION}-${{ matrix.legacy_asset_suffix }}"
           fi
           chmod +x flocafe.AppImage
           echo "FLO_APPIMAGE=$RUNNER_TEMP/matrix/flocafe.AppImage" >> "$GITHUB_ENV"
@@ -426,9 +426,9 @@ jobs:
         run: |
           cd "$RUNNER_TEMP"
           if ! curl -fsSL -o pkg.${{ matrix.pkg }} \
-            "https://github.com/FreeOpenSourcePOS/FloCafe/releases/download/${FROM_VERSION}/flocafe-${FROM_VERSION}-${{ matrix.asset_suffix }}"; then
+            "https://github.com/FreeOpenSourcePOS/FloCafe/releases/download/${FROM_VERSION}/factorpos-${FROM_VERSION}-${{ matrix.asset_suffix }}"; then
             curl -fsSL -o pkg.${{ matrix.pkg }} \
-              "https://github.com/FreeOpenSourcePOS/FloCafe/releases/download/${FROM_VERSION}/flocafe-${FROM_VERSION}-${{ matrix.legacy_asset_suffix }}"
+              "https://github.com/FreeOpenSourcePOS/FloCafe/releases/download/${FROM_VERSION}/factorpos-${FROM_VERSION}-${{ matrix.legacy_asset_suffix }}"
           fi
           if [ "${{ matrix.pkg }}" = deb ]; then
             sudo dpkg -i pkg.deb || sudo apt-get install -y -f -qq

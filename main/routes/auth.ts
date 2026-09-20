@@ -85,10 +85,10 @@ function buildLocalTenant(db: ReturnType<typeof getDatabase>, userRole: string) 
     slug: 'local',
     database_name: 'local',
     business_type: s.business_type || 'restaurant',
-    country: s.country || 'IN',
-    currency: s.currency || 'INR',
-    currency_symbol: getCurrencySymbol(s.currency || 'INR', getCountryByCode(s.country)?.locale) || '₹',
-    timezone: s.timezone || 'Asia/Kolkata',
+    country: s.country || 'SA',
+    currency: s.currency || 'SAR',
+    currency_symbol: getCurrencySymbol(s.currency || 'SAR', getCountryByCode(s.country || 'SA')?.locale) || 'SAR',
+    timezone: s.timezone || 'Asia/Riyadh',
     business_day_start_time: s.business_day_start_time || '00:00',
     language: s.language || 'en',
     // Include print policies in tenant snapshot so renderer bootstraps them before first print.
@@ -96,7 +96,7 @@ function buildLocalTenant(db: ReturnType<typeof getDatabase>, userRole: string) 
     kot_language_policy: s.kot_language_policy || null,
     service_model: s.service_model || 'finedine',
     currency_display: s.currency_display || 'rial',
-    number_digits: s.number_digits || 'locale',
+    number_digits: s.number_digits || 'latin',
     calendar: s.calendar || 'locale',
     plan: 'desktop',
     status: 'active',
@@ -882,10 +882,10 @@ router.post('/setup/initialize', (req: Request, res: Response) => {
       language,
       business_name,
       store_name,
-      country = 'IN',
-      currency = 'INR',
+      country = 'SA',
+      currency = 'SAR',
       currency_symbol,
-      timezone = 'Asia/Kolkata',
+      timezone = 'Asia/Riyadh',
       business_address,
       address,
       business_phone,
@@ -955,7 +955,7 @@ router.post('/setup/initialize', (req: Request, res: Response) => {
     }
 
     if (!VALID_BUSINESS_TYPES.has(normalizedBusinessType)) {
-      return res.status(400).json({ error: 'FloCafe setup only supports restaurant businesses' });
+      return res.status(400).json({ error: 'FactorPOS setup only supports restaurant businesses' });
     }
 
     if (!VALID_SETUP_PROFILES.has(normalizedSetupProfile)) {
@@ -1011,6 +1011,7 @@ router.post('/setup/initialize', (req: Request, res: Response) => {
         currency_symbol: currency_symbol || getCurrencySymbol(normalizedCurrency, getCountryByCode(country)?.locale),
         timezone,
         language,
+        number_digits: country === 'SA' ? 'latin' : undefined,
         business_address: outletAddress,
         business_phone: outletPhone,
         address: outletAddress,

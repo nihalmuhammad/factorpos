@@ -79,7 +79,7 @@ function summaryContract(manifest, candidateManifestBytes, matrixStatus) {
   if (!MATRIX_STATUSES.has(matrixStatus)) throw new Error(`installed artifact matrix status must be PASS, FAIL, or NOT-RUN`);
   return {
     schemaVersion: 1,
-    type: 'flocafe-release-summary',
+    type: 'factorpos-release-summary',
     release: {
       tag: manifest.release.tag,
       channel: manifest.release.channel,

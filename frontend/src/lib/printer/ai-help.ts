@@ -19,9 +19,9 @@ const SUPPORT_WHATSAPP_URL = 'https://chat.whatsapp.com/LxHobzv6d2X81NzrVfMjzo?m
 async function resolveAppContext(): Promise<string> {
   try {
     const info = await window.electronAPI?.getAppInfo?.();
-    if (info && 'version' in info) return `FloCafe ${info.version} on ${info.platform}`;
+    if (info && 'version' in info) return `FactorPOS ${info.version} on ${info.platform}`;
   } catch { /* best-effort only */ }
-  return 'FloCafe (desktop app)';
+  return 'FactorPOS (desktop app)';
 }
 
 /** Builds the prompt copied to the clipboard for AI hand-off on a printer failure. */

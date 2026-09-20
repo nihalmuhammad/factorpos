@@ -140,7 +140,8 @@ function isLocalePreferenceSupported(key: LocalePreferenceKey, value: string, co
 
 function resolveStoredLocalePreference(key: LocalePreferenceKey, stored: string | undefined, countryCode: string): string {
   if (stored && isLocalePreferenceSupported(key, stored, countryCode)) return stored;
-  return NEUTRAL_LOCALE_PREFERENCES[key];
+  const options = getCountryByCode(countryCode)?.localeOptions?.[LOCALE_OPTION_FIELDS[key]];
+  return options?.[0] ?? NEUTRAL_LOCALE_PREFERENCES[key];
 }
 
 // Flags stored as strict '1'/'0' to match cloud database conventions.
@@ -160,10 +161,10 @@ function isMaskedSecret(value: unknown): boolean {
 function businessShape(s: Record<string, string>) {
   return {
     business_name: s.business_name || '',
-    timezone: s.timezone || 'Asia/Kolkata',
+    timezone: s.timezone || 'Asia/Riyadh',
     business_day_start_time: s.business_day_start_time || '00:00',
-    currency: s.currency || 'INR',
-    country: s.country || 'IN',
+    currency: s.currency || 'SAR',
+    country: s.country || 'SA',
     language: s.language || 'en',
     tax_registration_number: s.tax_registration_number || '',
     state_code: s.state_code || '',
@@ -181,11 +182,11 @@ function businessShape(s: Record<string, string>) {
     bill_show_customer_name: s.bill_show_customer_name !== 'false',
     bill_show_customer_phone: s.bill_show_customer_phone !== 'false',
     bill_show_table_number: s.bill_show_table_number !== 'false',
-    currency_display: resolveStoredLocalePreference('currency_display', s.currency_display, s.country || 'IN'),
-    number_digits: resolveStoredLocalePreference('number_digits', s.number_digits, s.country || 'IN'),
-    calendar: resolveStoredLocalePreference('calendar', s.calendar, s.country || 'IN'),
+    currency_display: resolveStoredLocalePreference('currency_display', s.currency_display, s.country || 'SA'),
+    number_digits: resolveStoredLocalePreference('number_digits', s.number_digits, s.country || 'SA'),
+    calendar: resolveStoredLocalePreference('calendar', s.calendar, s.country || 'SA'),
     // Non-blocking informational tax format description for the UI.
-    tax_id_format: resolveTaxIdFormat(s.country || 'IN'),
+    tax_id_format: resolveTaxIdFormat(s.country || 'SA'),
   };
 }
 

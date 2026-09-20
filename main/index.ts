@@ -85,7 +85,7 @@ const isMsixBuild =
 
 // Either store build: skip third-party auto-updater entirely.
 const isStoreBuild = isMasBuild || isMsixBuild;
-const UNPACKED_DEV_MARKER = 'flo-unpacked-dev.marker';
+const UNPACKED_DEV_MARKER = 'factorpos-unpacked-dev.marker';
 
 log.initialize();
 log.transports.file.level = 'info';
@@ -576,8 +576,8 @@ if (process.env.FLO_E2E_USER_DATA_DIR) {
   app.setPath('userData', path.resolve(process.env.FLO_E2E_USER_DATA_DIR));
 } else if (process.platform === 'linux') {
   // Set explicit paths on Linux to avoid temporary mount directories.
-  app.name = 'flo-desktop';
-  app.setPath('userData', path.join(os.homedir(), '.config', 'flo-desktop'));
+  app.name = 'factorpos';
+  app.setPath('userData', path.join(os.homedir(), '.config', 'factorpos'));
 }
 
 gotSingleInstanceLock = app.requestSingleInstanceLock();
@@ -939,7 +939,7 @@ function createTray(): void {
         },
       ]);
 
-      tray.setToolTip('Flo Cafe');
+      tray.setToolTip('FactorPOS');
       tray.setContextMenu(linuxMenu);
       // Single-click also shows the window on Linux (no double-click standard).
       tray.on('click', () => {
@@ -965,7 +965,7 @@ function createTray(): void {
     tray = new Tray(icon.resize({ width: 16, height: 16 }));
 
     const contextMenu = Menu.buildFromTemplate([
-      { label: 'Open Flo', click: () => { showMainWindow(); } },
+      { label: 'Open FactorPOS', click: () => { showMainWindow(); } },
       { type: 'separator' },
       { label: 'Quit', click: () => { isQuitting = true; app.quit(); } },
     ]);
@@ -1107,7 +1107,7 @@ function createMenu(): void {
     {
       label: 'Window',
       submenu: [
-        { label: 'Flo Cafe', click: () => { if (showMainWindow()) mainWindow?.focus(); } },
+        { label: 'FactorPOS', click: () => { if (showMainWindow()) mainWindow?.focus(); } },
         { type: 'separator' },
         { role: 'minimize' },
         ...(process.platform === 'darwin' ? [
@@ -1120,7 +1120,7 @@ function createMenu(): void {
     {
       label: 'Help',
       submenu: [
-        ...(process.platform !== 'darwin' ? [{ label: 'About Flo', click: () => showAbout() }] : []),
+        ...(process.platform !== 'darwin' ? [{ label: 'About FactorPOS', click: () => showAbout() }] : []),
         ...(isStoreBuild
           ? []
           : [{ label: 'Check for Updates', click: () => checkForUpdates() }]),
@@ -1149,8 +1149,8 @@ function showAbout(): void {
   const serverAppPort = getServerAppPort();
   dialog.showMessageBox({
     type: 'info',
-    title: 'About Flo',
-    message: 'Flo Cafe',
+    title: 'About FactorPOS',
+    message: 'FactorPOS',
     detail: [
       `Version: ${app.getVersion()}`,
       `Electron: ${process.versions.electron}`,

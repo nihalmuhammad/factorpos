@@ -377,8 +377,8 @@ jobs:
         run: |
           npm run build:frontend && npm run build && npx electron-builder --linux AppImage deb rpm snap --publish never \
             -c.publish.channel="${{ needs.create-release.outputs.manifest_prefix }}" \
-            -c.linux.artifactName="flocafe-\${version}-linux-\${env.FLO_LINUX_ARCH}.\${ext}" \
-            -c.appImage.artifactName="flocafe-\${version}-linux-\${env.FLO_LINUX_ARCH}.appimage"
+            -c.linux.artifactName="factorpos-\${version}-linux-\${env.FLO_LINUX_ARCH}.\${ext}" \
+            -c.appImage.artifactName="factorpos-\${version}-linux-\${env.FLO_LINUX_ARCH}.appimage"
           node scripts/assert-release-artifact-names.cjs release
         env:
           SNAPCRAFT_BUILD_ENVIRONMENT: lxd

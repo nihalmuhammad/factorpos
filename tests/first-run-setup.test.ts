@@ -92,6 +92,10 @@ assert.equal(getCurrentSchemaVersion(), MIGRATIONS[MIGRATIONS.length - 1].versio
   assert.equal(count('products'), 0, 'fresh install starts with no sample products');
   assert.equal(count('tables'), 0, 'fresh install starts with no sample tables');
   assert.equal(count('printers'), 0, 'fresh install starts with no default printer');
+  assert.equal(setting('country'), 'SA', 'fresh FactorPOS install defaults to Saudi Arabia');
+  assert.equal(setting('currency'), 'SAR', 'fresh FactorPOS install defaults to Saudi riyal');
+  assert.equal(setting('timezone'), 'Asia/Riyadh', 'fresh FactorPOS install defaults to Riyadh time');
+  assert.equal(setting('number_digits'), 'latin', 'fresh FactorPOS install uses Western digits');
   assert.equal(setting('cloud_server_url'), 'https://blue.flopos.com/', 'cloud server URL is seeded');
   assert.match(setting('cloud_pos_hash') || '', /^pos_[a-f0-9]{40}$/, 'fresh install has a POS hash');
   assert.ok((setting('cloud_device_secret') || '').length >= 32, 'fresh install has a local cloud secret');

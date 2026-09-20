@@ -82,11 +82,11 @@ export default function SetupPage() {
   const language = usePosSettingsStore((s) => s.language);
   const setStoreLanguage = usePosSettingsStore((s) => s.setLanguage);
   const [browserLanguage] = useState<Language>(() => getBrowserLanguage());
-  const [country, setCountry] = useState<string>('IN');
+  const [country, setCountry] = useState<string>('SA');
   const [countryQuery, setCountryQuery] = useState<string>('');
   // The country profile timezone is only a suggested default; the owner can
   // override it here for multi-timezone countries before completing setup.
-  const [timezone, setTimezone] = useState<string>(() => getCountryByCode('IN')?.timezone || 'Asia/Kolkata');
+  const [timezone, setTimezone] = useState<string>(() => getCountryByCode('SA')?.timezone || 'Asia/Riyadh');
   const [form, setForm] = useState({
     name: '',
     email: '',
