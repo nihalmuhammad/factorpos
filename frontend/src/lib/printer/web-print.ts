@@ -268,13 +268,11 @@ export function generateBillHtml(
     table: stripLabelPlaceholder(metaTableLabel),
     customer: documentLabel(customer?.nameLabel, 'pos.customer', lang),
     customerNo: documentLabel(customer?.phoneLabel, 'print.numberShort', lang),
-    rate: itemsBlock?.header.rate.primary ?? printLabelResolver('receipt.rate', lang),
     totalTax: surfaceLabel(totals?.tax?.label, 'pos.tax', 'receipt.totalTax', lang),
     deliveryCharge: surfaceLabel(totals?.deliveryCharge?.label, 'pos.delivery', 'receipt.deliveryCharge', lang),
     packagingCharge: documentLabel(totals?.packagingCharge?.label, 'pos.packaging', lang),
     grandTotal: surfaceLabel(totals?.grandTotal?.label, 'print.grandTotal', 'receipt.grandTotal', lang),
     taxDetails: breakdown?.heading.primary ?? printLabelResolver('receipt.taxDetails', lang),
-    paymentsHeader: payments?.heading.primary ?? printLabelResolver('receipt.payments', lang),
     thankYou: surfaceLabel(messages?.thankYou, 'print.thankYouShort', 'receipt.thankYou', lang),
     taxIncluded: messages?.taxIncluded.primary ?? printLabelResolver('receipt.taxIncluded', lang),
     printBill: printLabelResolver('receipt.printBill', lang),
@@ -321,6 +319,7 @@ export function generateBillHtml(
 
     <!-- Bill Details -->
     <div class="bill-details">
+      ${meta?.tokenNumber !== null && meta?.tokenNumber !== undefined ? `<div class="token">*** TOKEN #${escapeHtml(meta.tokenNumber)} ***</div>` : ''}
       <table>
         <tr>
           <td><strong>${escapeHtml(invoiceNumberLabel)}</strong> ${meta ? directionalValue(meta.invoiceNumber, base) : ''}</td>
@@ -338,7 +337,6 @@ export function generateBillHtml(
         <tr>
           <th>${escapeHtml(itemsBlock?.header.item.primary ?? '')}</th>
           <th class="text-end">${escapeHtml(itemsBlock?.header.quantity.primary ?? '')}</th>
-          <th class="text-end">${escapeHtml(L.rate)}</th>
           <th class="text-end">${escapeHtml(itemsBlock?.header.amount.primary ?? '')}</th>
         </tr>
       </thead>
@@ -351,7 +349,6 @@ export function generateBillHtml(
               ${row.specialInstructions ? `<br><small class="text-italic">${escapeHtml(row.specialInstructions.text)}</small>` : ''}
             </td>
             <td class="text-end num">${fmtQuantity(row.quantity)}</td>
-            <td class="text-end num">${fmtAmount(row.unitPrice ?? 0)}</td>
             <td class="text-end num">${fmtAmount(row.amount)}</td>
           </tr>
         `).join('')}
@@ -376,7 +373,7 @@ export function generateBillHtml(
     <table class="totals-table">
       ${totals ? `
       ${totals.pointsRedeemed ? `<tr><td>${escapeHtml(totals.pointsRedeemed.label.primary)}</td><td class="text-end num">-${escapeHtml(totals.pointsRedeemed.points)} pts</td></tr>` : ''}
-      <tr><td>${escapeHtml(totals.subtotal.label.primary)}</td><td class="text-end num">${fmtAmount(totals.subtotal.amount)}</td></tr>
+      ${totals.discount || hasTax || totals.serviceCharge || totals.deliveryCharge || totals.packagingCharge ? `<tr><td>${escapeHtml(totals.subtotal.label.primary)}</td><td class="text-end num">${fmtAmount(totals.subtotal.amount)}</td></tr>` : ''}
       ${totals.discount ? `<tr><td>${escapeHtml(totals.discount.label.primary)}</td><td class="text-end num">-${fmtAmount(totals.discount.amount)}</td></tr>` : ''}
       ${totals.tax ? `<tr><td>${escapeHtml(L.totalTax)}</td><td class="text-end num">${fmtAmount(totals.tax.amount)}</td></tr>` : ''}
       ${totals.serviceCharge ? `<tr><td>${escapeHtml(totals.serviceCharge.label.primary)}</td><td class="text-end num">${fmtAmount(totals.serviceCharge.amount)}</td></tr>` : ''}
@@ -391,9 +388,6 @@ export function generateBillHtml(
     <!-- Payments -->
     ${payments && payments.lines.length > 0 ? `
     <table class="payments-table">
-      <thead>
-        <tr><th colspan="2">${escapeHtml(L.paymentsHeader)}</th></tr>
-      </thead>
       <tbody>
         ${payments.lines.map((line) => `
           <tr><td>${escapeHtml(paymentLineLabel(line.label))}</td><td class="text-end num">${fmtAmount(line.amount)}</td></tr>
@@ -466,21 +460,23 @@ function getPaperStyles(size: PaperSize): string {
     .reprint-banner { text-align: center; font-size: 22px; font-weight: bold; letter-spacing: 2px; color: #c00; border: 3px solid #c00; padding: 6px; margin-bottom: 15px; }
     .online-order-banner { text-align: center; font-size: 18px; font-weight: bold; letter-spacing: 1px; border: 2px solid #333; padding: 6px; margin-bottom: 15px; }
     .online-order-banner .online-order-detail { font-size: 13px; font-weight: normal; letter-spacing: normal; margin-top: 2px; }
-    .header { text-align: center; margin-bottom: 20px; padding-bottom: 10px; border-bottom: 1px solid #ccc; }
-    .header h1 { font-size: 24px; margin-bottom: 5px; }
-    .bill-details { margin-bottom: 15px; }
+    .header { text-align: center; margin-bottom: 8px; padding-bottom: 5px; border-bottom: 1px solid #ccc; }
+    .header h1 { font-size: 24px; margin-bottom: 2px; }
+    .bill-details { margin-bottom: 6px; }
     .bill-details table { width: 100%; }
-    .items-table { width: 100%; border-collapse: collapse; margin-bottom: 15px; }
-    .items-table th, .items-table td { padding: 8px; border-bottom: 1px solid #eee; text-align: start; }
+    .token { direction: ltr; unicode-bidi: isolate; text-align: center; font-size: 24px; line-height: 1.1; font-weight: 800; border: 2px solid #333; padding: 5px 3px; margin: 4px 0 8px; }
+    .items-table { width: 100%; border-collapse: collapse; margin-bottom: 6px; }
+    .items-table th, .items-table td { padding: 3px 4px; border-bottom: 1px solid #eee; text-align: start; }
     .items-table th { background: #f5f5f5; font-weight: bold; }
-    .tax-table, .payments-table { width: 50%; margin-inline-start: 50%; border-collapse: collapse; margin-bottom: 15px; }
-    .tax-table th, .tax-table td, .payments-table th, .payments-table td { padding: 6px 8px; }
+    .tax-table, .payments-table { width: 100%; border-collapse: collapse; margin-bottom: 5px; }
+    .tax-table th, .tax-table td, .payments-table th, .payments-table td { padding: 2px 4px; }
     .tax-table th, .payments-table th { background: #f9f9f9; text-align: start; }
-    .totals-table { width: 100%; border-collapse: collapse; margin-bottom: 15px; }
-    .totals-table td { padding: 6px 8px; }
-    .total-row { border-top: 2px solid #333; font-size: 16px; }
-    .footer { text-align: center; margin-top: 30px; padding-top: 15px; border-top: 1px solid #ccc; }
-    .powered-by { font-size: 10px; margin-top: 8px; color: #555; }
+    .totals-table { width: 100%; border-collapse: collapse; margin-bottom: 5px; }
+    .totals-table td { padding: 2px 4px; }
+    .total-row { border-top: 2px solid #333; font-size: 22px; line-height: 1.15; }
+    .footer { text-align: center; margin-top: 8px; padding-top: 6px; border-top: 1px solid #ccc; }
+    .footer p { margin: 0; }
+    .powered-by { font-size: 10px; margin-top: 3px !important; color: #555; }
     .text-end { text-align: end !important; }
     .num { unicode-bidi: isolate; white-space: nowrap; }
     .ltr { direction: ltr; unicode-bidi: isolate; }
