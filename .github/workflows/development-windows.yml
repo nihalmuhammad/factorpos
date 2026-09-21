@@ -53,6 +53,47 @@ jobs:
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: false
 
+      - name: Install and launch test build
+        shell: pwsh
+        run: |
+          $installer = Get-ChildItem release\factorpos-*-win-x64.exe | Select-Object -First 1
+          if ($null -eq $installer) {
+            throw 'Windows test installer was not created.'
+          }
+
+          $install = Start-Process -FilePath $installer.FullName -ArgumentList '/S' -PassThru -Wait
+          if ($install.ExitCode -ne 0) {
+            throw "Silent NSIS install failed with exit code $($install.ExitCode)."
+          }
+
+          $app = Get-ChildItem "$env:LOCALAPPDATA\Programs" -Filter 'Flo Cafe.exe' -File -Recurse |
+            Select-Object -First 1
+          if ($null -eq $app) {
+            throw 'Installed Flo Cafe executable was not found.'
+          }
+
+          Start-Process -FilePath $app.FullName | Out-Null
+          $healthy = $false
+          for ($attempt = 1; $attempt -le 60; $attempt++) {
+            try {
+              $response = Invoke-RestMethod -Uri 'http://127.0.0.1:3001/api/health' -TimeoutSec 2
+              if ($response.status -eq 'ok') {
+                $healthy = $true
+                break
+              }
+            } catch {
+              Start-Sleep -Seconds 2
+            }
+          }
+          if (-not $healthy) {
+            throw 'Installed Flo Cafe build did not become healthy within 120 seconds.'
+          }
+
+      - name: Stop installed test build
+        if: always()
+        shell: pwsh
+        run: Get-Process -Name 'Flo Cafe' -ErrorAction SilentlyContinue | Stop-Process -Force
+
       - name: Create SHA-256 checksums
         shell: pwsh
         run: |

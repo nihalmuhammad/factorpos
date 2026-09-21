@@ -23,12 +23,12 @@ test('IR country profile properties', () => {
   assert.equal(ir.taxIdFormat, undefined, 'No tax ID format should be enforced for IR');
 });
 
-test('SA country profile enforces Western digits', () => {
+test('SA country profile offers locale and Western digits', () => {
   const sa = getCountryByCode('SA');
   assert.ok(sa, 'SA country profile should exist');
   assert.equal(sa.currency, 'SAR');
   assert.equal(sa.timezone, 'Asia/Riyadh');
-  assert.deepEqual(sa.localeOptions?.digits, ['latin']);
+  assert.deepEqual(sa.localeOptions?.digits, ['locale', 'latin']);
 });
 
 test('FactorPOS onboarding defaults are Saudi, English, and Latin-digit based', () => {

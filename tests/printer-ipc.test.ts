@@ -7,6 +7,9 @@ const Module = require('module');
 const originalLoad = Module._load;
 const registered = new Map<string, (...args: any[]) => any>();
 const testDir = fs.mkdtempSync(path.join(os.tmpdir(), 'flo-printer-ipc-'));
+const testLogPath = path.join(testDir, 'main.log');
+fs.writeFileSync(testLogPath, '[2026-09-21 12:00:00.000] [error] Synthetic printer test error\n');
+let openedDraftPath = '';
 const { buildBillDocument, buildKotDocument } = require('../shared/print/document');
 
 Module._load = function (request: string, parent: unknown, isMain: boolean) {
@@ -30,7 +33,16 @@ Module._load = function (request: string, parent: unknown, isMain: boolean) {
         getName: () => 'FloCafe',
       },
       BrowserWindow: class {},
+      shell: {
+        openPath: async (filePath: string) => {
+          openedDraftPath = filePath;
+          return '';
+        },
+      },
     };
+  }
+  if (request === 'electron-log/main') {
+    return { transports: { file: { getFile: () => ({ path: testLogPath }) } } };
   }
   if (request === './middleware/security') {
     return { clearInMemoryRevokedTokens: () => {}, clearUserAuthCache: () => {} };
@@ -70,6 +82,15 @@ async function run(): Promise<void> {
     const getPrinters = registered.get('get-printers');
     assert.ok(savePrinter, 'save-printer IPC handler is registered');
     assert.ok(getPrinters, 'get-printers IPC handler is registered');
+
+    const emailErrorLog = registered.get('email-error-log');
+    assert.ok(emailErrorLog, 'email-error-log IPC handler is registered');
+    const emailResult = await emailErrorLog!(trustedSender);
+    assert.deepEqual(emailResult, { success: true }, 'email-error-log opens a local mail draft');
+    assert.ok(openedDraftPath.endsWith('.eml'), 'email-error-log opens an EML draft');
+    const emailDraft = fs.readFileSync(openedDraftPath, 'utf8');
+    assert.match(emailDraft, /^To: rasheedrestaurants@gmail\.com\r$/m);
+    assert.match(emailDraft, /Content-Disposition: attachment; filename="main\.log"/);
 
     const created = await savePrinter!(trustedSender, {
       name: 'Kitchen Printer',
@@ -133,7 +154,7 @@ async function run(): Promise<void> {
 
     const printDocument = buildBillDocument({
       isReprint: false,
-      order: { orderNumber: '', createdAt: '', tableName: '', onlinePlatform: '', externalOrderId: '', items: [] },
+      order: { orderNumber: '', createdAt: '', tableName: '', onlinePlatform: '', externalOrderId: '', tokenNumber: null, items: [] },
       bill: { billNumber: '', subtotal: 0, discountAmount: 0, taxAmount: 0, total: 0, taxComponents: [], payments: [], pointsEarned: 0, pointsRedeemed: 0, pointsBalance: null },
       business: { name: '', address: '', phone: '', taxRegistrationNumber: '', taxIdLabel: '', instagramHandle: '', footerNote: '', customerName: '', customerPhone: '', showName: true, showAddress: false, showPhone: false, showTaxId: 'never', showTaxBreakdown: false, showTableNumber: false, showCustomerName: false, showCustomerPhone: false },
     }, { columns: 42, languages: ['en'], baseDirection: 'ltr', locale: 'en-US', currency: 'USD', currencySymbol: '$', trimDecimals: false, resolveLabel: (conceptId: string) => conceptId });

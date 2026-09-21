@@ -913,6 +913,12 @@ exit 1
   const developmentPackageStep = findStep(developmentJob, 'Build unsigned NSIS installer');
   assert.match(developmentPackageStep.run, /--win nsis --x64 --publish never/, 'development build must create only an unsigned NSIS installer');
   assert.equal(developmentPackageStep.env.CSC_IDENTITY_AUTO_DISCOVERY, false);
+  const developmentInstallStep = findStep(developmentJob, 'Install and launch test build');
+  assert.match(developmentInstallStep.run, /ArgumentList '\/S'/, 'development workflow must silently install the generated NSIS package');
+  assert.match(developmentInstallStep.run, /Flo Cafe\.exe/, 'development workflow must launch the installed application');
+  assert.match(developmentInstallStep.run, /127\.0\.0\.1:3001\/api\/health/, 'development workflow must health-check the installed application');
+  const developmentStopStep = findStep(developmentJob, 'Stop installed test build');
+  assert.equal(developmentStopStep.if, 'always()', 'the installed test build must be stopped even after a failed smoke test');
   const developmentUpload = findStep(developmentJob, 'Upload test installer');
   assert.equal(developmentUpload.with.name, 'factorpos-windows-test-${{ github.sha }}');
   assert.equal(developmentUpload.with['retention-days'], 14);
