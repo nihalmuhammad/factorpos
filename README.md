@@ -4,7 +4,8 @@
   <p><strong>Free, open-source, offline-first point of sale for cafés, restaurants, and small kitchens.</strong></p>
   <p>
     <a href="https://github.com/nihalmuhammad/factorpos/actions">Builds</a> ·
-    <a href="https://github.com/nihalmuhammad/factorpos/issues">Report a bug</a>
+    <a href="https://github.com/nihalmuhammad/factorpos/issues">Report a bug</a> ·
+    <a href="PRIVACY.md">Privacy</a>
   </p>
   <p>
     <a href="https://github.com/nihalmuhammad/factorpos/blob/main/LICENSE"><img src="https://img.shields.io/github/license/nihalmuhammad/factorpos" alt="MIT License"></a>
