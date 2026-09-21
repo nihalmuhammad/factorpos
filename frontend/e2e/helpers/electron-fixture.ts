@@ -119,6 +119,7 @@ export async function injectElectronFixture(
       openWhatsAppShare: async () => result,
       getAppInfo: async () => appInfo,
       getLogTail: async () => ({ text: '', truncated: false }),
+      emailErrorLog: async () => result,
       getPrinters: async () => [],
       savePrinter: async () => result,
       rasterizePrintDocument: async () => ({ ok: false, error: 'fixture' }),

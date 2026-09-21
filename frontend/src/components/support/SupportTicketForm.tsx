@@ -1,7 +1,7 @@
 'use client';
 
 import { FormEvent, useEffect, useState } from 'react';
-import { Bug, CheckCircle2, Loader2, LifeBuoy, MessageSquareText, ShieldCheck } from 'lucide-react';
+import { Bug, CheckCircle2, Loader2, LifeBuoy, Mail, MessageSquareText, ShieldCheck } from 'lucide-react';
 import toast from 'react-hot-toast';
 import api from '@/lib/api';
 import { Button } from '@/components/ui/button';
@@ -69,9 +69,13 @@ export function SupportTicketForm({
   const [attachLog, setAttachLog] = useState(true);
   const [loading, setLoading] = useState(true);
   const [submitting, setSubmitting] = useState(false);
+  const [openingEmail, setOpeningEmail] = useState(false);
   const [submittedId, setSubmittedId] = useState('');
   const delivery = useSupportTicketStatus(submittedId || null, endpoints.statusBase);
   const diagnosticsPreview = useSupportDiagnosticsPreview(showDiagnosticsPreview ? category : null);
+  const canEmailLog = !loading
+    && typeof window !== 'undefined'
+    && typeof window.electronAPI?.emailErrorLog === 'function';
 
   useEffect(() => {
     api.get(endpoints.profile)
@@ -114,8 +118,39 @@ export function SupportTicketForm({
     }
   }
 
+  async function emailErrorLog() {
+    if (!window.electronAPI?.emailErrorLog) return;
+    setOpeningEmail(true);
+    try {
+      const result = await window.electronAPI.emailErrorLog();
+      if ('success' in result && result.success) {
+        toast.success(t('emailLogOpened'));
+      } else {
+        toast.error(t('emailLogFailed'));
+      }
+    } catch {
+      toast.error(t('emailLogFailed'));
+    } finally {
+      setOpeningEmail(false);
+    }
+  }
+
   return (
     <div className="space-y-6">
+      {canEmailLog && (
+        <Card>
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2"><Mail className="size-5" />{t('emailLogTitle')}</CardTitle>
+            <CardDescription>{t('emailLogHint')}</CardDescription>
+          </CardHeader>
+          <CardContent>
+            <Button type="button" onClick={emailErrorLog} disabled={openingEmail}>
+              {openingEmail ? <Loader2 className="animate-spin" /> : <Mail />}
+              {openingEmail ? t('emailLogOpening') : t('emailLogButton')}
+            </Button>
+          </CardContent>
+        </Card>
+      )}
       {submittedId && (
         <div className="flex gap-3 rounded-xl border border-green-200 bg-green-50 p-4 text-green-900">
           <CheckCircle2 className="mt-0.5 size-5 shrink-0" />

@@ -191,12 +191,10 @@ export function useCashClose() {
             setOpeningFloatInput(unitAdapter.toDisplay(xr.priorClosedCashCents / minorFactor).toString());
             setAlreadyClosedOverride(false);
           } else {
-            // F1: no prior close for this date — reset the prefill so a
-            // POST cannot submit a stale value from a previously-closed
-            // day, and clear any stale alreadyClosed override (a 409 on
-            // day A must not leave a false closed banner + disabled
-            // submit on unclosed day B).
-            setOpeningFloatInput('');
+            // No prior close means there is no cash to carry forward.
+            // Keep this explicit so the displayed default is also valid
+            // when the operator submits the close.
+            setOpeningFloatInput('0');
             setAlreadyClosedOverride(false);
           }
         }

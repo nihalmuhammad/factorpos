@@ -186,6 +186,7 @@ export const usePrinterStore = create<PrinterState>()(
             const { printWebBill } = await import('@/lib/printer/web-print');
             const browserWarnings = await printWebBill(bill, tenant, {
               paperSize: printerPaperSize,
+              compactLayout: true,
               languages: opts?.languages ?? resolveBillPrintLanguages(),
               includeTaxId: billShowTaxId,
               taxRegistrationNumber: billShowTaxId && billTaxRegistrationNumber ? billTaxRegistrationNumber : undefined,

@@ -32,6 +32,8 @@ export interface ElectronAPI {
   getAppInfo: () => Promise<ElectronAppInfo | ElectronIpcError>;
   // Tail of the current session's log file, for attaching to support tickets.
   getLogTail: () => Promise<{ text: string; truncated: boolean } | ElectronIpcError>;
+  /** Opens a reviewable email draft with the recent POS log attached. */
+  emailErrorLog: () => Promise<ElectronActionResult | ElectronIpcError>;
 
   // Reports caught renderer errors to anonymous telemetry via main process.
   reportRendererError?: (report: { message?: string; stack?: string; digest?: string; route?: string }) => Promise<ElectronActionResult>;

@@ -51,6 +51,7 @@ import { useTranslations } from 'use-intl';
 import { Ltr } from '@/components/layout/Ltr';
 import { useFormatDate } from '@/hooks/useFormatDate';
 import { useUpdateStatus } from '@/hooks/useUpdateStatus';
+import { UpdateInstallGuardDialog } from '@/components/updates/UpdateInstallGuardDialog';
 import { ROLE_ACCESS, hasRole } from '@shared/role-permissions';
 
 
@@ -766,7 +767,8 @@ export default function SettingsPage() {
   const [revflo, setRevflo] = useState<MoreApp | null>(null);
 
   // ── Updates ─────────────────────────────────────────────────────────────────
-  const { updateStatus, appVersion, isElectron, checkForUpdates: handleCheckUpdates } = useUpdateStatus();
+  const { updateStatus, appVersion, isElectron, checkForUpdates: handleCheckUpdates, restartAndInstall } = useUpdateStatus();
+  const [updateInstallOpen, setUpdateInstallOpen] = useState(false);
 
   // ── Printers ─────────────────────────────────────────────────────────────
   const [hwPrinters, setHwPrinters] = useState<HwPrinter[]>([]);
@@ -4116,12 +4118,16 @@ export default function SettingsPage() {
             {isElectron && updateStatus?.status !== 'store-managed' && updateStatus?.status !== 'linux-managed' && (
               <div className="flex items-center gap-2">
                 <button
-                  onClick={handleCheckUpdates}
-                  disabled={updateStatus?.status === 'checking' || updateStatus?.status === 'available' || updateStatus?.status === 'downloading' || updateStatus?.status === 'ready-to-install'}
+                  onClick={() => updateStatus?.status === 'ready-to-install' ? setUpdateInstallOpen(true) : handleCheckUpdates()}
+                  disabled={updateStatus?.status === 'checking' || updateStatus?.status === 'available' || updateStatus?.status === 'downloading'}
                   className="px-4 py-2 rounded-lg text-sm font-medium flex items-center gap-2 disabled:opacity-50 bg-brand text-white hover:opacity-90"
                 >
                   <RefreshCw size={16} className={updateStatus?.status === 'checking' ? 'animate-spin' : ''} />
-                  {updateStatus?.status === 'checking' ? t('checking') : t('checkForUpdates')}
+                  {updateStatus?.status === 'ready-to-install'
+                    ? t('installWindowsPosUpdate')
+                    : updateStatus?.status === 'checking'
+                    ? t('checking')
+                    : t('updateWindowsPos')}
                 </button>
               </div>
             )}
@@ -4176,6 +4182,12 @@ export default function SettingsPage() {
         }
         onCancel={() => setPinGate(null)}
         onSubmit={handlePinGateSubmit}
+      />
+
+      <UpdateInstallGuardDialog
+        open={updateInstallOpen}
+        onCancel={() => setUpdateInstallOpen(false)}
+        onRequestRestart={(pin) => restartAndInstall(pin)}
       />
 
       <HealthCheckDialog

@@ -65,6 +65,8 @@ function directionalValue(value: DirectionalText | null, base: TextDirection): s
 
 export interface WebPrintOptions {
   paperSize?: PaperSize;
+  /** Use the minimal core receipt layout for faster thermal printing. */
+  compactLayout?: boolean;
   includeTaxId?: boolean;
   taxRegistrationNumber?: string;
   address?: string;
@@ -211,6 +213,7 @@ export function generateBillHtml(
 ): string {
   const {
     paperSize = 'thermal58',
+    compactLayout = false,
     includeTaxId = false,
     taxRegistrationNumber,
     address,
@@ -281,7 +284,7 @@ export function generateBillHtml(
   };
 
   const invoiceNumberLabel = L.billNumber;
-  const styles = getPaperStyles(paperSize);
+  const styles = getPaperStyles(paperSize, compactLayout);
 
   const items = itemsBlock?.rows ?? [];
   const fmtAmount = (value: number) => formatAmount(value, tenant, trimDecimals);
@@ -298,7 +301,7 @@ export function generateBillHtml(
 <html lang="${localeTag}" dir="${dir}">
 <head>
   <meta charset="utf-8">
-  <title>${escapeHtml(invoiceNumberLabel)} ${escapeHtml(meta?.invoiceNumber.text ?? '')}</title>
+  <title>${compactLayout ? 'Order Note' : escapeHtml(invoiceNumberLabel)} ${escapeHtml(meta?.invoiceNumber.text ?? '')}</title>
   <style>
     ${styles}
     @media print {
@@ -313,7 +316,8 @@ export function generateBillHtml(
     ${messages?.onlineOrderBanner ? `<div class="online-order-banner">${escapeHtml(messages.onlineOrderBanner.label.primary)}${messages.onlineOrderBanner.platform.text ? `<div class="online-order-detail">${escapeHtml(messages.onlineOrderBanner.platform.text)}</div>` : ''}${messages.onlineOrderBanner.externalOrderId.text ? `<div class="online-order-detail">#${escapeHtml(messages.onlineOrderBanner.externalOrderId.text)}</div>` : ''}</div>` : ''}
     <!-- Header -->
     <div class="header">
-      ${header?.name ? `<h1>${escapeHtml(header.name.text)}</h1>` : ''}
+      ${compactLayout ? '<div class="document-title">ORDER NOTE</div>' : ''}
+      ${!compactLayout && header?.name ? `<h1>${escapeHtml(header.name.text)}</h1>` : ''}
       ${header?.address ? `<p>${escapeHtml(header.address.text).replace(/\n/g, '<br>')}</p>` : ''}
       ${header?.phone && header.phoneLabel ? `<p>${escapeHtml(header.phoneLabel.primary)}: ${directionalValue(header.phone, base)}</p>` : ''}
       ${header?.taxId ? `<p>${escapeHtml(header.taxId.label.primary)}: ${directionalValue(header.taxId.value, base)}</p>` : ''}
@@ -321,15 +325,26 @@ export function generateBillHtml(
 
     <!-- Bill Details -->
     <div class="bill-details">
+      ${meta?.tokenNumber !== null && meta?.tokenNumber !== undefined ? `<div class="token-number">TOKEN #${escapeHtml(meta.tokenNumber)}</div>` : ''}
+      ${compactLayout ? `
+      <table class="compact-meta">
+        <tr><td><strong>${escapeHtml(invoiceNumberLabel)}</strong></td><td class="text-end">${meta ? directionalValue(meta.invoiceNumber, base) : ''}</td></tr>
+        <tr><td><strong>${escapeHtml(L.date)}</strong></td><td class="text-end receipt-date">${meta ? escapeHtml(formatReceiptDate(meta.timestamp.text, tenant, LANGUAGES[lang]?.locale ?? lang, true)) : ''}</td></tr>
+        ${meta?.table ? `<tr><td><strong>${escapeHtml(L.table)}</strong></td><td class="text-end">${escapeHtml(meta.table.name.text)}</td></tr>` : ''}
+        ${customer?.name ? `<tr><td><strong>${escapeHtml(L.customer)}</strong></td><td class="text-end">${escapeHtml(customer.name.text)}</td></tr>` : ''}
+        ${customer?.phone ? `<tr><td><strong>${escapeHtml(L.customerNo)}</strong></td><td class="text-end">${directionalValue(customer.phone, base)}</td></tr>` : ''}
+      </table>
+      ` : `
       <table>
         <tr>
           <td><strong>${escapeHtml(invoiceNumberLabel)}</strong> ${meta ? directionalValue(meta.invoiceNumber, base) : ''}</td>
-          <td class="text-end"><strong>${escapeHtml(L.date)}</strong> ${meta ? escapeHtml(formatReceiptDate(meta.timestamp.text, tenant, LANGUAGES[lang]?.locale ?? lang)) : ''}</td>
+          <td class="text-end receipt-date"><strong>${escapeHtml(L.date)}</strong> ${meta ? escapeHtml(formatReceiptDate(meta.timestamp.text, tenant, LANGUAGES[lang]?.locale ?? lang, compactLayout)) : ''}</td>
         </tr>
         ${meta?.table ? `<tr><td><strong>${escapeHtml(L.table)}</strong> ${escapeHtml(meta.table.name.text)}</td><td></td></tr>` : ''}
         ${customer?.name ? `<tr><td><strong>${escapeHtml(L.customer)}</strong> ${escapeHtml(customer.name.text)}</td><td></td></tr>` : ''}
         ${customer?.phone ? `<tr><td><strong>${escapeHtml(L.customerNo)}</strong> ${directionalValue(customer.phone, base)}</td><td></td></tr>` : ''}
       </table>
+      `}
     </div>
 
     <!-- Items Table -->
@@ -338,7 +353,7 @@ export function generateBillHtml(
         <tr>
           <th>${escapeHtml(itemsBlock?.header.item.primary ?? '')}</th>
           <th class="text-end">${escapeHtml(itemsBlock?.header.quantity.primary ?? '')}</th>
-          <th class="text-end">${escapeHtml(L.rate)}</th>
+          ${compactLayout ? '' : `<th class="text-end">${escapeHtml(L.rate)}</th>`}
           <th class="text-end">${escapeHtml(itemsBlock?.header.amount.primary ?? '')}</th>
         </tr>
       </thead>
@@ -351,7 +366,7 @@ export function generateBillHtml(
               ${row.specialInstructions ? `<br><small class="text-italic">${escapeHtml(row.specialInstructions.text)}</small>` : ''}
             </td>
             <td class="text-end num">${fmtQuantity(row.quantity)}</td>
-            <td class="text-end num">${fmtAmount(row.unitPrice ?? 0)}</td>
+            ${compactLayout ? '' : `<td class="text-end num">${fmtAmount(row.unitPrice ?? 0)}</td>`}
             <td class="text-end num">${fmtAmount(row.amount)}</td>
           </tr>
         `).join('')}
@@ -359,7 +374,7 @@ export function generateBillHtml(
     </table>
 
     <!-- Tax Breakdown -->
-    ${breakdown && breakdown.lines.length > 0 ? `
+    ${!compactLayout && breakdown && breakdown.lines.length > 0 ? `
     <table class="tax-table">
       <thead>
         <tr><th colspan="2">${escapeHtml(L.taxDetails)}</th></tr>
@@ -375,21 +390,26 @@ export function generateBillHtml(
     <!-- Totals -->
     <table class="totals-table">
       ${totals ? `
-      ${totals.pointsRedeemed ? `<tr><td>${escapeHtml(totals.pointsRedeemed.label.primary)}</td><td class="text-end num">-${escapeHtml(totals.pointsRedeemed.points)} pts</td></tr>` : ''}
-      <tr><td>${escapeHtml(totals.subtotal.label.primary)}</td><td class="text-end num">${fmtAmount(totals.subtotal.amount)}</td></tr>
-      ${totals.discount ? `<tr><td>${escapeHtml(totals.discount.label.primary)}</td><td class="text-end num">-${fmtAmount(totals.discount.amount)}</td></tr>` : ''}
-      ${totals.tax ? `<tr><td>${escapeHtml(L.totalTax)}</td><td class="text-end num">${fmtAmount(totals.tax.amount)}</td></tr>` : ''}
-      ${totals.serviceCharge ? `<tr><td>${escapeHtml(totals.serviceCharge.label.primary)}</td><td class="text-end num">${fmtAmount(totals.serviceCharge.amount)}</td></tr>` : ''}
-      ${totals.deliveryCharge ? `<tr><td>${escapeHtml(L.deliveryCharge)}</td><td class="text-end num">${fmtAmount(totals.deliveryCharge.amount)}</td></tr>` : ''}
-      ${totals.packagingCharge ? `<tr><td>${escapeHtml(L.packagingCharge)}</td><td class="text-end num">${fmtAmount(totals.packagingCharge.amount)}</td></tr>` : ''}
-      <tr class="total-row"><td><strong>${escapeHtml(L.grandTotal)}</strong></td><td class="text-end num"><strong>${fmtAmount(totals.grandTotal.amount)}</strong></td></tr>
-      ${totals.pointsEarned ? `<tr><td>${escapeHtml(totals.pointsEarned.label.primary)}</td><td class="text-end num">${escapeHtml(totals.pointsEarned.points)} pts</td></tr>` : ''}
-      ${totals.pointsBalance ? `<tr><td>${escapeHtml(totals.pointsBalance.label.primary)}</td><td class="text-end num">${escapeHtml(totals.pointsBalance.points)} pts</td></tr>` : ''}
+      ${!compactLayout && totals.pointsRedeemed ? `<tr><td>${escapeHtml(totals.pointsRedeemed.label.primary)}</td><td class="text-end num">-${escapeHtml(totals.pointsRedeemed.points)} pts</td></tr>` : ''}
+      <tr class="subtotal-row"><td>${compactLayout ? `<strong>${escapeHtml(totals.subtotal.label.primary)}</strong>` : escapeHtml(totals.subtotal.label.primary)}</td><td class="text-end num">${compactLayout ? `<strong>${fmtAmount(totals.subtotal.amount)}</strong>` : fmtAmount(totals.subtotal.amount)}</td></tr>
+      ${!compactLayout && totals.discount ? `<tr><td>${escapeHtml(totals.discount.label.primary)}</td><td class="text-end num">-${fmtAmount(totals.discount.amount)}</td></tr>` : ''}
+      ${!compactLayout && totals.tax ? `<tr><td>${escapeHtml(L.totalTax)}</td><td class="text-end num">${fmtAmount(totals.tax.amount)}</td></tr>` : ''}
+      ${!compactLayout && totals.serviceCharge ? `<tr><td>${escapeHtml(totals.serviceCharge.label.primary)}</td><td class="text-end num">${fmtAmount(totals.serviceCharge.amount)}</td></tr>` : ''}
+      ${!compactLayout && totals.deliveryCharge ? `<tr><td>${escapeHtml(L.deliveryCharge)}</td><td class="text-end num">${fmtAmount(totals.deliveryCharge.amount)}</td></tr>` : ''}
+      ${!compactLayout && totals.packagingCharge ? `<tr><td>${escapeHtml(L.packagingCharge)}</td><td class="text-end num">${fmtAmount(totals.packagingCharge.amount)}</td></tr>` : ''}
+      <tr class="total-row"><td><strong>${escapeHtml(compactLayout ? printLabelResolver('print.grandTotal', lang) : L.grandTotal)}</strong></td><td class="text-end num total-amount"><strong>${fmtAmount(totals.grandTotal.amount)}</strong></td></tr>
+      ${!compactLayout && totals.pointsEarned ? `<tr><td>${escapeHtml(totals.pointsEarned.label.primary)}</td><td class="text-end num">${escapeHtml(totals.pointsEarned.points)} pts</td></tr>` : ''}
+      ${!compactLayout && totals.pointsBalance ? `<tr><td>${escapeHtml(totals.pointsBalance.label.primary)}</td><td class="text-end num">${escapeHtml(totals.pointsBalance.points)} pts</td></tr>` : ''}
       ` : ''}
     </table>
 
     <!-- Payments -->
     ${payments && payments.lines.length > 0 ? `
+    ${compactLayout ? `
+    <table class="payment-line">
+      ${payments.lines.map((line) => `<tr><td><strong>${escapeHtml(paymentLineLabel(line.label))}</strong></td><td class="text-end num">${fmtAmount(line.amount)}</td></tr>`).join('')}
+    </table>
+    ` : `
     <table class="payments-table">
       <thead>
         <tr><th colspan="2">${escapeHtml(L.paymentsHeader)}</th></tr>
@@ -400,13 +420,14 @@ export function generateBillHtml(
         `).join('')}
       </tbody>
     </table>
+    `}
     ` : ''}
 
     <!-- Footer -->
     <div class="footer">
       ${messages?.footerNote ? `<p>${escapeHtml(messages.footerNote.text)}</p>` : `<p>${escapeHtml(L.thankYou)}</p>`}
       ${hasTax ? `<p>${escapeHtml(L.taxIncluded)}</p>` : ''}
-      <p class="powered-by">${escapeHtml(RECEIPT_BRANDING_NAME)}</p>
+      ${compactLayout ? '' : `<p class="powered-by">${escapeHtml(RECEIPT_BRANDING_NAME)}</p>`}
     </div>
   </div>
 
@@ -458,7 +479,7 @@ function paymentLineLabel(label: { conceptId?: string; primary: string }): strin
     : label.primary.charAt(0).toUpperCase() + label.primary.slice(1);
 }
 
-function getPaperStyles(size: PaperSize): string {
+function getPaperStyles(size: PaperSize, compactLayout: boolean): string {
   const baseStyles = `
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body { font-family: -apple-system, 'Segoe UI', Tahoma, 'Noto Naskh Arabic', 'Helvetica Neue', Arial, sans-serif; font-size: 12px; line-height: 1.4; color: #333; }
@@ -467,9 +488,12 @@ function getPaperStyles(size: PaperSize): string {
     .online-order-banner { text-align: center; font-size: 18px; font-weight: bold; letter-spacing: 1px; border: 2px solid #333; padding: 6px; margin-bottom: 15px; }
     .online-order-banner .online-order-detail { font-size: 13px; font-weight: normal; letter-spacing: normal; margin-top: 2px; }
     .header { text-align: center; margin-bottom: 20px; padding-bottom: 10px; border-bottom: 1px solid #ccc; }
+    .document-title { font-size: 1.25em; font-weight: 800; letter-spacing: .08em; margin-bottom: 2px; }
     .header h1 { font-size: 24px; margin-bottom: 5px; }
     .bill-details { margin-bottom: 15px; }
+    .token-number { text-align: center; font-size: calc(1em + 3pt); font-weight: 700; margin-bottom: 6px; }
     .bill-details table { width: 100%; }
+    .receipt-date { white-space: nowrap; }
     .items-table { width: 100%; border-collapse: collapse; margin-bottom: 15px; }
     .items-table th, .items-table td { padding: 8px; border-bottom: 1px solid #eee; text-align: start; }
     .items-table th { background: #f5f5f5; font-weight: bold; }
@@ -478,7 +502,11 @@ function getPaperStyles(size: PaperSize): string {
     .tax-table th, .payments-table th { background: #f9f9f9; text-align: start; }
     .totals-table { width: 100%; border-collapse: collapse; margin-bottom: 15px; }
     .totals-table td { padding: 6px 8px; }
-    .total-row { border-top: 2px solid #333; font-size: 16px; }
+    .subtotal-row { font-size: 1.08em; }
+    .total-row { border-top: 2px solid #333; }
+    .total-amount { font-size: calc(1em + 3pt); font-weight: 700; }
+    .payment-line { width: 100%; border-collapse: collapse; margin-bottom: 10px; white-space: nowrap; }
+    .payment-line td { padding: 1px 3px; }
     .footer { text-align: center; margin-top: 30px; padding-top: 15px; border-top: 1px solid #ccc; }
     .powered-by { font-size: 10px; margin-top: 8px; color: #555; }
     .text-end { text-align: end !important; }
@@ -488,17 +516,29 @@ function getPaperStyles(size: PaperSize): string {
     .text-italic { font-style: italic; color: #888; }
   `;
 
+  const compactStyles = compactLayout ? `
+    .header { margin-bottom: 8px; padding-bottom: 5px; }
+    .header h1 { font-size: 1.15em; margin-bottom: 2px; }
+    .bill-details, .items-table, .totals-table { margin-bottom: 7px; }
+    .compact-meta td { padding: 1px 3px; }
+    .items-table th, .items-table td, .totals-table td { padding: 2px 3px; }
+    .payment-line { margin-bottom: 4px; }
+    .footer { margin-top: 4px; padding-top: 4px; }
+    .footer p + p { margin-top: 2px; }
+    .powered-by { margin-top: 3px; }
+  ` : '';
+
   switch (size) {
     case 'thermal58':
-      return baseStyles + `
+      return baseStyles + compactStyles + `
         .bill-container { padding: 5px; max-width: 58mm; font-size: 10px; }
-        .header h1 { font-size: 14px; }
+        .header h1 { font-size: ${compactLayout ? '11px' : '14px'}; }
         .items-table th, .items-table td, .tax-table td, .totals-table td, .payments-table td { padding: 2px 4px; }
       `;
     case 'thermal80':
-      return baseStyles + `
+      return baseStyles + compactStyles + `
         .bill-container { padding: 10px; max-width: 80mm; font-size: 11px; }
-        .header h1 { font-size: 16px; }
+        .header h1 { font-size: ${compactLayout ? '12px' : '16px'}; }
       `;
     default:
       return baseStyles;
@@ -538,7 +578,7 @@ function formatAmount(value: number, tenant: ReceiptTenant, trimDecimals = false
   return formatCurrencyForTenant(numeric, tenant.country, tenant.currency, prefs);
 }
 
-function formatReceiptDate(iso: string, tenant: ReceiptTenant, locale?: string): string {
+function formatReceiptDate(iso: string, tenant: ReceiptTenant, locale?: string, compact = false): string {
   if (!iso) return '';
   try {
     const d = parseDbTimestamp(iso);
@@ -548,7 +588,9 @@ function formatReceiptDate(iso: string, tenant: ReceiptTenant, locale?: string):
       tenant.country,
       tenant.timezone || Intl.DateTimeFormat().resolvedOptions().timeZone,
       { digits: tenant.number_digits, calendar: tenant.calendar },
-      { year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' },
+      compact
+        ? { year: '2-digit', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false }
+        : { year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' },
       locale,
     );
   } catch {

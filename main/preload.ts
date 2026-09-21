@@ -57,6 +57,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   setBetaChannel: (enabled: boolean) => ipcRenderer.invoke('updates:set-beta-channel', enabled),
   checkForUpdates: () => ipcRenderer.invoke('check-for-updates'),
   restartAndInstall: (pin?: string) => ipcRenderer.invoke('restart-and-install', pin),
+  emailErrorLog: () => ipcRenderer.invoke('email-error-log'),
   onUpdateStatus: (callback: (status: unknown) => void) => {
     const handler = (_event: unknown, status: unknown) => callback(status);
     ipcRenderer.on('update-status', handler);

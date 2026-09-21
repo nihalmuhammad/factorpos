@@ -80,6 +80,7 @@ async function run() {
   const testIranOrder: Order = {
     id: 101,
     order_number: 'ORD-IR-2026-08',
+    token_number: 42,
     customer_id: 'cust-ir-1',
     status: 'completed',
     subtotal: 900000,
@@ -306,6 +307,8 @@ async function run() {
     // English
     const enHtml = generateBillHtml(sampleEnBill, usTenant, { language: 'en', isReprint: true });
     assert('EN receipt has lang="en" and dir="ltr"', enHtml.includes('<html lang="en" dir="ltr">'));
+    assert('EN receipt emphasizes token by 3pt in bold', enHtml.includes('<div class="token-number">TOKEN #42</div>') && enHtml.includes('.token-number { text-align: center; font-size: calc(1em + 3pt); font-weight: 700;'));
+    assert('EN receipt emphasizes total amount by 3pt in bold', enHtml.includes('class="text-end num total-amount"') && enHtml.includes('.total-amount { font-size: calc(1em + 3pt); font-weight: 700;'));
     assert('EN labels are English',
       enHtml.includes('REPRINT') &&
       enHtml.includes('Bill #') &&
@@ -409,6 +412,41 @@ async function run() {
       unknownHtml.includes('<p>Thank you for your visit!</p>') &&
       !unknownHtml.includes('receipt.grandTotal'),
     );
+  }
+
+  console.log('\nTest Suite 7: Compact browser receipt layout');
+  {
+    const compactHtml = generateBillHtml(testIranBill, baseIranTenant, {
+      language: 'en',
+      compactLayout: true,
+      showTaxBreakdown: true,
+    });
+    assert('compact receipt omits the rate column', !compactHtml.includes('<th class="text-end">Rate</th>'));
+    assert('compact receipt omits tax breakdown and intermediate totals',
+      !compactHtml.includes('Tax details') && !compactHtml.includes('Total tax'));
+    assert('compact receipt keeps bold subtotal and larger bold total',
+      compactHtml.includes('<tr class="subtotal-row"><td><strong>Subtotal</strong>') &&
+      compactHtml.includes('class="text-end num total-amount"><strong>'));
+    assert('compact receipt labels the final amount as Total',
+      compactHtml.includes('<tr class="total-row"><td><strong>TOTAL</strong>') &&
+      !compactHtml.includes('<strong>Grand Total</strong>'));
+    assert('compact receipt is titled Order Note',
+      compactHtml.includes('<title>Order Note BILL-IR-0089</title>') &&
+      compactHtml.includes('<div class="document-title">ORDER NOTE</div>'));
+    assert('compact receipt omits store name and FactorPOS branding',
+      !compactHtml.includes(`<h1>${baseIranTenant.business_name}</h1>`) &&
+      !compactHtml.includes('Powered by FactorPOS'));
+    assert('compact metadata uses aligned label-value rows',
+      compactHtml.includes('<table class="compact-meta">') &&
+      compactHtml.includes('<strong>Bill #</strong></td><td class="text-end">'));
+    assert('compact receipt renders payments on one line',
+      compactHtml.includes('<table class="payment-line">') &&
+      compactHtml.includes('<strong>Card</strong>'));
+    assert('compact receipt uses reduced store-name sizing',
+      compactHtml.includes('.header h1 { font-size: 11px; }'));
+    assert('compact receipt uses a short 24-hour date on one line',
+      compactHtml.includes('class="text-end receipt-date"') &&
+      !compactHtml.includes('Aug 17, 2026'));
   }
 
   // Generate Reviewer-Visible Artifacts (HTML & Screenshots via Playwright)

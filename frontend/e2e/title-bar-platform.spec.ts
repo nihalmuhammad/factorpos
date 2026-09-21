@@ -193,6 +193,7 @@ test('browser Electron fixture exposes the complete renderer API and explicit in
     'getDailySummary',
     'getKdsInfo',
     'getLogTail',
+    'emailErrorLog',
     'getMasterPinStatus',
     'getPrinters',
     'getSettings',

@@ -189,6 +189,7 @@ export function CashCloseModal({ model }: { model: CashCloseModel }) {
               inputMode="decimal"
               min={0}
               step={unitAdapter.step}
+              placeholder="0"
               value={openingFloatInput}
               onChange={(e) => setOpeningFloatInput(e.target.value)}
               className="w-full px-3 py-2 text-sm border border-border rounded-lg bg-background text-foreground outline-none focus:ring-2 focus:ring-brand/30"
@@ -207,6 +208,7 @@ export function CashCloseModal({ model }: { model: CashCloseModel }) {
               inputMode="decimal"
               min={0}
               step={unitAdapter.step}
+              placeholder="0"
               value={countedInput}
               onChange={(e) => setCountedInput(e.target.value)}
               className="w-full px-3 py-2 text-sm border border-border rounded-lg bg-background text-foreground outline-none focus:ring-2 focus:ring-brand/30"

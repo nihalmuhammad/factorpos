@@ -31,6 +31,72 @@ const LOG_TAIL_MAX_BYTES = 200_000;
 const LOG_TAIL_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 // Matches electron-log's default line prefix, e.g. "[2026-09-13 10:15:30.123] [info] ...".
 const LOG_LINE_TIMESTAMP_RE = /^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})/;
+const ERROR_LOG_RECIPIENT = 'rasheedrestaurants@gmail.com';
+
+function readRecentLogTail(): { text: string; truncated: boolean } {
+  const logFilePath = log.transports.file.getFile().path;
+  const content = fs.readFileSync(logFilePath, 'utf8');
+  const lines = content.split('\n');
+  const cutoff = Date.now() - LOG_TAIL_MAX_AGE_MS;
+  let cutIndex = -1;
+  for (let i = 0; i < lines.length; i++) {
+    const match = lines[i].match(LOG_LINE_TIMESTAMP_RE);
+    if (!match) continue;
+    const ts = new Date(match[1].replace(' ', 'T')).getTime();
+    if (Number.isFinite(ts) && ts >= cutoff) {
+      cutIndex = i;
+      break;
+    }
+  }
+  const filteredText = (cutIndex === -1 ? lines : lines.slice(cutIndex)).join('\n');
+  const buffer = Buffer.from(filteredText, 'utf8');
+  const overCap = buffer.length > LOG_TAIL_MAX_BYTES;
+  return {
+    text: overCap ? buffer.subarray(-LOG_TAIL_MAX_BYTES).toString('utf8') : filteredText,
+    truncated: overCap || cutIndex > 0,
+  };
+}
+
+function wrapBase64(value: string): string {
+  return value.match(/.{1,76}/g)?.join('\r\n') ?? '';
+}
+
+function createErrorLogEmailDraft(logText: string): string {
+  const boundary = `factorpos-${randomUUID()}`;
+  const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const subject = `FactorPOS error log ${app.getVersion()}`;
+  const body = [
+    'Please review the attached FactorPOS error log.',
+    '',
+    `App version: ${app.getVersion()}`,
+    `Platform: ${process.platform}`,
+    `Generated: ${new Date().toISOString()}`,
+  ].join('\r\n');
+  const eml = [
+    `To: ${ERROR_LOG_RECIPIENT}`,
+    `Subject: ${subject}`,
+    'MIME-Version: 1.0',
+    `Content-Type: multipart/mixed; boundary="${boundary}"`,
+    '',
+    `--${boundary}`,
+    'Content-Type: text/plain; charset="UTF-8"',
+    'Content-Transfer-Encoding: 8bit',
+    '',
+    body,
+    '',
+    `--${boundary}`,
+    `Content-Type: text/plain; name="factorpos-error-log-${timestamp}.log"`,
+    'Content-Transfer-Encoding: base64',
+    `Content-Disposition: attachment; filename="factorpos-error-log-${timestamp}.log"`,
+    '',
+    wrapBase64(Buffer.from(logText, 'utf8').toString('base64')),
+    `--${boundary}--`,
+    '',
+  ].join('\r\n');
+  const draftPath = path.join(app.getPath('temp'), `factorpos-error-log-${timestamp}.eml`);
+  fs.writeFileSync(draftPath, eml, { encoding: 'utf8', mode: 0o600 });
+  return draftPath;
+}
 
 // Settings keys the renderer is allowed to write via IPC.
 // Must stay in sync with routes/settings.ts ALLOWED_WILDCARD_KEYS.
@@ -484,35 +550,22 @@ export function registerIpcHandlers(
   // Tail of the current session's log file, for attaching to support tickets.
   handle('get-log-tail', async () => {
     try {
-      // electron-log rotates main.log at ~1MB, so reading it whole is cheap.
-      const logFilePath = log.transports.file.getFile().path;
-      const content = fs.readFileSync(logFilePath, 'utf8');
-      const lines = content.split('\n');
-
-      // Cut at the first line whose timestamp is within the window (a byte
-      // cut wouldn't line up with "recent enough" for a quiet store's log).
-      const cutoff = Date.now() - LOG_TAIL_MAX_AGE_MS;
-      let cutIndex = -1;
-      for (let i = 0; i < lines.length; i++) {
-        const match = lines[i].match(LOG_LINE_TIMESTAMP_RE);
-        if (!match) continue;
-        const ts = new Date(match[1].replace(' ', 'T')).getTime();
-        if (Number.isFinite(ts) && ts >= cutoff) {
-          cutIndex = i;
-          break;
-        }
-      }
-      const filtered = cutIndex === -1 ? lines : lines.slice(cutIndex);
-      const filteredText = filtered.join('\n');
-
-      // Byte cap stays as a backstop in case even the time-windowed content
-      // is still large (e.g. a very chatty week).
-      const buffer = Buffer.from(filteredText, 'utf8');
-      const overCap = buffer.length > LOG_TAIL_MAX_BYTES;
-      const text = overCap ? buffer.subarray(-LOG_TAIL_MAX_BYTES).toString('utf8') : filteredText;
-      return { text, truncated: overCap || cutIndex > 0 };
+      return readRecentLogTail();
     } catch (error: unknown) {
       return { error: getErrorMessage(error) };
+    }
+  });
+
+  handle('email-error-log', async () => {
+    try {
+      const { text } = readRecentLogTail();
+      const draftPath = createErrorLogEmailDraft(text);
+      const openError = await shell.openPath(draftPath);
+      return openError
+        ? { success: false, error: openError }
+        : { success: true };
+    } catch (error: unknown) {
+      return { success: false, error: getErrorMessage(error) };
     }
   });
 
