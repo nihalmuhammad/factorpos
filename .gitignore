@@ -15,6 +15,10 @@ backups/
 .DS_Store
 .claude/
 .agents/
+# Local AI-agent instructions and working plans
+**/AGENTS.md
+**/CLAUDE.md
+/plan.md
 docs/superpowers/
 .superpowers
 .gstack
