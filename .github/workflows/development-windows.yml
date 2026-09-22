@@ -66,10 +66,10 @@ jobs:
             throw "Silent NSIS install failed with exit code $($install.ExitCode)."
           }
 
-          $app = Get-ChildItem "$env:LOCALAPPDATA\Programs" -Filter 'Flo Cafe.exe' -File -Recurse |
+          $app = Get-ChildItem "$env:LOCALAPPDATA\Programs" -Filter 'FactorPOS.exe' -File -Recurse |
             Select-Object -First 1
           if ($null -eq $app) {
-            throw 'Installed Flo Cafe executable was not found.'
+            throw 'Installed FactorPOS executable was not found.'
           }
 
           Start-Process -FilePath $app.FullName | Out-Null
@@ -92,7 +92,7 @@ jobs:
       - name: Stop installed test build
         if: always()
         shell: pwsh
-        run: Get-Process -Name 'Flo Cafe' -ErrorAction SilentlyContinue | Stop-Process -Force
+        run: Get-Process -Name 'FactorPOS' -ErrorAction SilentlyContinue | Stop-Process -Force
 
       - name: Create SHA-256 checksums
         shell: pwsh

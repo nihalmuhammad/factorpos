@@ -915,7 +915,7 @@ exit 1
   assert.equal(developmentPackageStep.env.CSC_IDENTITY_AUTO_DISCOVERY, false);
   const developmentInstallStep = findStep(developmentJob, 'Install and launch test build');
   assert.match(developmentInstallStep.run, /ArgumentList '\/S'/, 'development workflow must silently install the generated NSIS package');
-  assert.match(developmentInstallStep.run, /Flo Cafe\.exe/, 'development workflow must launch the installed application');
+  assert.match(developmentInstallStep.run, /FactorPOS\.exe/, 'development workflow must launch the installed application');
   assert.match(developmentInstallStep.run, /127\.0\.0\.1:3001\/api\/health/, 'development workflow must health-check the installed application');
   const developmentStopStep = findStep(developmentJob, 'Stop installed test build');
   assert.equal(developmentStopStep.if, 'always()', 'the installed test build must be stopped even after a failed smoke test');
