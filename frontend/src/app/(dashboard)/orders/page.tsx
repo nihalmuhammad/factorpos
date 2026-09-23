@@ -1108,6 +1108,9 @@ export default function OrdersPage() {
                 <div className="flex items-center justify-between gap-2 px-4 py-3 bg-muted border-b border-border">
                   <div className="flex items-center gap-2 flex-wrap min-w-0">
                     <span className="font-bold text-foreground">#<Ltr>{order.order_number}</Ltr></span>
+                    {order.token_number != null && (
+                      <span className="text-sm font-semibold text-foreground">TOKEN #<Ltr>{order.token_number}</Ltr></span>
+                    )}
                     {(() => { const badge = orderStatusBadge[order.status]; return badge ? (
                       <span className={`px-2 py-0.5 rounded-full text-xs font-medium ${badge.bg} ${badge.text}`}>{tOrders(badge.labelKey)}</span>
                     ) : null; })()}

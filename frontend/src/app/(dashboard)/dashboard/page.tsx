@@ -81,6 +81,7 @@ interface TopProduct {
 interface RecentOrder {
   id: number;
   order_number: string;
+  token_number: number | null;
   status: string;
   total: number;
   customer_name: string | null;
@@ -537,6 +538,9 @@ export default function DashboardPage() {
                       <div className="min-w-0">
                         <div className="flex items-center gap-2">
                           <span className="text-sm font-medium text-foreground">#<Ltr>{order.order_number}</Ltr></span>
+                          {order.token_number != null && (
+                            <span className="text-xs font-semibold text-foreground">TOKEN #<Ltr>{order.token_number}</Ltr></span>
+                          )}
                           <span className={`text-xs font-medium ${orderStatusColor[order.status] || 'text-muted-foreground'}`}>
                             {(() => { const k = (ORDER_STATUS_LABEL_KEYS as Record<string, OrdersKey | undefined>)[order.status]; return k ? tOrders(k) : order.status; })()}
                           </span>
