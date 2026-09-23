@@ -488,10 +488,10 @@ console.log('\n✅ Test 1b2: Arabic shaping capability gate');
   assert('formatReceipt without flag reports a financial warning', defaultReceiptWarnings.some((warning) => warning.kind === 'financial'));
   assert('formatReceipt without flag emits precise Arabic shaping warnings', defaultReceiptWarnings.length >= 2 && defaultReceiptWarnings.every(w => /Arabic shaping|Persian\/Arabic/.test(w.message)));
 
-  // Receipt with capability flag: Persian business name and items printed with 0 warnings
+  // Receipt with capability flag: Persian items print with 0 warnings.
   const receiptWarnings: Array<{ field: string; text: string; message: string }> = [];
   const receipt = formatReceipt(persianReceiptOrder, fixtureBill, persianBiz, 'compact', 48, true, false, 'full', receiptWarnings, true);
-  assert('formatReceipt with arabicShaping prints the Persian business name', receipt.toString('utf8').includes('کافه فلو تهران'));
+  assert('compact order note omits the Persian business name', !receipt.toString('utf8').includes('کافه فلو تهران'));
   assert('formatReceipt with arabicShaping prints the Persian item name', receipt.toString('utf8').includes('چای زعفرانی مخصوص'));
   assert('formatReceipt with arabicShaping prints Persian addons', receipt.toString('utf8').includes('هل اضافه'));
   assert('formatReceipt with arabicShaping prints Persian notes', receipt.toString('utf8').includes('بدون قند'));
@@ -715,7 +715,7 @@ console.log('\n✅ Test 2: Compact receipt (80mm, 48 cols)');
   const buf = formatReceipt(fixtureOrder, fixtureBill, fixtureBusiness, 'compact', 48, true);
   const text = buf.toString('utf8');
 
-  assert('renders business name', text.includes('Flo Test Cafe'));
+  assert('compact order note has its title and no business name', text.includes('ORDER NOTE') && !text.includes('Flo Test Cafe'));
   assert('renders bill number', text.includes('INV-20260421-0001'));
   assert('highlights the customer token', text.includes('TOKEN #42'));
   assert('renders Cheeseburger row', text.includes('Cheeseburger'));
@@ -736,7 +736,8 @@ console.log('\n✅ Test 2: Compact receipt (80mm, 48 cols)');
   assert('renders Cash payment', text.includes('Cash') && text.includes('₹500.00'));
   assert('renders UPI payment', text.includes('UPI') && text.includes('₹450.00'));
   assert('renders tax registration number', text.includes('TAXID-0001'));
-  assert('renders non-configurable FactorPOS footer', text.includes('Powered by FactorPOS'));
+  assert('compact order note omits FactorPOS branding', !text.includes('Powered by FactorPOS'));
+  assert('compact order note has a short 24-hour date', /Date:\s+\d{2}\/\d{2}\/\d{2},?\s+\d{2}:\d{2}/.test(text));
   const rowLines = visiblePreview(buf, 48).split('\n');
   const longRowIndex = rowLines.findIndex((l) => l.includes('Very Long Product Name That'));
   assert('long product name wraps cleanly onto multiple lines', longRowIndex >= 0 && rowLines[longRowIndex + 1]?.includes('Truncated By Formatter'));
@@ -755,7 +756,7 @@ console.log('\n✅ Test 3: Compact receipt on 58mm paper (32 cols)');
   const buf = formatReceipt(fixtureOrder, fixtureBill, fixtureBusiness, 'compact', 32, true);
   const text = buf.toString('utf8');
 
-  assert('still renders business name', text.includes('Flo Test Cafe'));
+  assert('still renders the order note title', text.includes('ORDER NOTE'));
   assert('still renders TOTAL', text.includes('TOTAL'));
 
   const textLines = visiblePreview(buf, 32).split('\n').slice(1, -1);
@@ -1139,11 +1140,11 @@ console.log('\n✅ Test 11: IR country thermal receipt financial-line preservati
     assert(`[backend IR ${template}] preserves extreme IRR amount`, extreme.toString('utf8').includes('IRR100,000,000,000,000.00'));
   }
 
-  // Unsupported free-form Persian text warning contract test (backend)
+  // A hidden business name must not create an unsupported-text warning.
   const persianTextBusiness = { ...irBusiness, name: 'کافه فلو تهران' };
   const backendWarnings: Array<{ field: string; text: string; message: string }> = [];
   formatReceipt(irOrder, irBill, persianTextBusiness, 'compact', 48, false, false, 'full', backendWarnings);
-  assert('backend free-form Persian text emits unsupported character warning', backendWarnings.some((w) => w.text.includes('کافه')));
+  assert('compact order note does not warn about its hidden business name', !backendWarnings.some((w) => w.text.includes('کافه')));
 
   // 2. Frontend raw ESC/POS encoder tests
   const frontendModules = loadFrontendPrinterModules();

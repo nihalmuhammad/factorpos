@@ -249,7 +249,8 @@ function expectContent(
     payments?: string[];
     reprint?: boolean;
     reprintStyle?: 'ascii' | 'html';
-    businessName: string;
+    businessName?: string;
+    orderNote?: boolean;
     truncationMarker?: boolean;
     addons?: Array<{ name: string; quantity?: number }>;
     instructions?: string[];
@@ -283,7 +284,12 @@ function expectContent(
       : /\*{2}\s*REPRINT/i.test(text);
     warn(banner, `${label}: reprint banner=${expectations.reprint}`);
   }
-  warn(text.includes(expectations.businessName), `${label}: business header`);
+  if (expectations.orderNote) {
+    warn(text.includes('ORDER NOTE') && !text.includes('Powered by FactorPOS'), `${label}: unbranded order note`);
+    warn(!expectations.businessName || !text.includes(expectations.businessName), `${label}: business name omitted`);
+  } else if (expectations.businessName) {
+    warn(text.includes(expectations.businessName), `${label}: business header`);
+  }
   if (expectations.truncationMarker) {
     const stemRowIndex = rows.findIndex((r) => r.includes(LONG_NAME_STEM));
     const stemRow = stemRowIndex >= 0 ? rows[stemRowIndex] : '';
@@ -361,13 +367,13 @@ function run(): void {
         formatReceipt(order, bill, business, template, cols, false, false, undefined, [])
       );
       const withSubtotal = template === 'classic' ? { subtotal: 1220 } : {};
-      expectContent(`${template}/${cols}`, text, { ...baseExpect, ...withSubtotal, absentItems: [PERSIAN_ITEM] }, warn);
+      expectContent(`${template}/${cols}`, text, { ...baseExpect, ...withSubtotal, absentItems: [PERSIAN_ITEM], ...(template === 'compact' ? { orderNote: true } : {}) }, warn);
 
       section(`Backend ${template} @ ${cols} cols — reprint`);
       const reText = escPosToText(
         formatReceipt(order, bill, business, template, cols, false, true, undefined, [])
       );
-      expectContent(`${template}/${cols}/reprint`, reText, { ...baseExpect, ...withSubtotal, absentItems: [PERSIAN_ITEM], reprint: true }, warn);
+      expectContent(`${template}/${cols}/reprint`, reText, { ...baseExpect, ...withSubtotal, absentItems: [PERSIAN_ITEM], reprint: true, ...(template === 'compact' ? { orderNote: true } : {}) }, warn);
     }
   }
 
@@ -676,10 +682,11 @@ function run(): void {
       // Production entry point: formatReceipt('compact') is document-driven
       // since #443, so this compares the migrated pipeline against the oracle.
       const migratedBuf = formatReceipt(order, bill, business, 'compact', cols, false, isReprint, 'full', [], false, 'en');
-      warn(escPosToText(legacyBuf) === escPosToText(migratedBuf), `${label}: content-identical output to legacy compact`);
+      warn(escPosToText(legacyBuf) !== escPosToText(migratedBuf), `${label}: revised order-note layout differs from legacy compact`);
       expectContent(label, escPosToText(migratedBuf), {
         ...baseExpect,
         absentItems: [PERSIAN_ITEM],
+        orderNote: true,
         ...(isReprint ? { reprint: true } : {}),
       }, warn);
     }

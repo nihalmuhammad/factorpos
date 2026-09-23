@@ -7,7 +7,6 @@ import { isThermalTextRepresentable, type ThermalPrinterCapabilities } from '../
 import type { RasterSemanticLineGroup, RasterTextLayout } from '../../shared/print/raster';
 import {
   addonRows,
-  appendPoweredByFooter,
   buildEscPos,
   financialRows,
   formatCurrency,
@@ -183,15 +182,10 @@ export function renderBillDocumentToCompactLines(
   }
   markGroup('message', messageStart, messageSourceLines, messageSourceControlLines);
 
-  // Business header (store name only — compact keeps contact facts in the footer).
-  const headerStart = lines.length;
-  if (header?.name) lines.push('{STORE_NAME}{CENTER}{BOLD}' + truncateShapedLine(header.name.text, cols, options.arabicShaping, options.language, options.capabilities) + '{/BOLD}{/CENTER}');
-  markGroup('business-header', headerStart, header?.name ? [header.name.text] : [], header?.name ? [lines[headerStart] ?? ''] : []);
-  lines.push(bar);
-
   // Document meta.
   const metaStart = lines.length;
-  const metaSourceLines: string[] = [];
+  const metaSourceLines: string[] = ['ORDER NOTE', bar];
+  lines.push('{CENTER}{BOLD}ORDER NOTE{/BOLD}{/CENTER}', bar);
   if (meta) {
     if (meta.tokenNumber !== null) {
       const tokenText = `TOKEN #${meta.tokenNumber}`;
@@ -201,7 +195,11 @@ export function renderBillDocumentToCompactLines(
     lines.push(normalize(labelOf(meta.billNumberLabel) + ': ' + meta.invoiceNumber.text));
     metaSourceLines.push(labelOf(meta.billNumberLabel) + ': ' + meta.invoiceNumber.text);
     const date = parseDbTimestamp(meta.timestamp.text);
-    const dateText = date.toLocaleDateString(options.locale + '-u-nu-latn', tzOptions) + ' ' + date.toLocaleTimeString(options.locale + '-u-nu-latn', tzOptions);
+    const dateText = new Intl.DateTimeFormat('en-GB', {
+      ...tzOptions,
+      day: '2-digit', month: '2-digit', year: '2-digit',
+      hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
+    }).format(date);
     lines.push(normalize(labelOf(meta.dateLabel) + ': ' + dateText));
     metaSourceLines.push(labelOf(meta.dateLabel) + ': ' + dateText);
     if (meta.table) {
@@ -370,10 +368,6 @@ export function renderBillDocumentToCompactLines(
   const paymentSourceControlLines: string[] = [];
   const paymentSourceLayouts: Array<RasterTextLayout | undefined> = [];
   if (payments && payments.lines.length > 0) {
-    lines.push(dash);
-    paymentSourceLines.push(dash);
-    paymentSourceControlLines.push(dash);
-    paymentSourceLayouts.push(undefined);
     for (const line of payments.lines) {
       const rawMethodLabel = paymentLabel(line.label);
       const methodLabel = truncate(rawMethodLabel, cols - 12, options.language, options.capabilities);
@@ -433,7 +427,6 @@ export function renderBillDocumentToCompactLines(
     messageFooterSourceControlLines.push(lines.at(-1) ?? '');
   }
   markGroup('message', messageFooterStart, messageFooterSourceLines, messageFooterSourceControlLines);
-  appendPoweredByFooter(lines, cols);
   lines.push('{CUT}');
 
   return lines;
