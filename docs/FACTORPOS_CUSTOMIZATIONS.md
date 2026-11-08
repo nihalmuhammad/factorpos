@@ -9,7 +9,7 @@ upstream merges do not silently remove FactorPOS behavior.
 - Release: `3.9.0`
 - Local upstream remote: `upstream`
 - Long-lived branch: `main`
-- Private source repository: `https://github.com/nihalmuhammad/factorpos`
+- Source and release repository (public): `https://github.com/nihalmuhammad/factorpos`
 
 The upstream MIT license and copyright notice remain in `LICENSE`.
 
@@ -44,9 +44,32 @@ The shared source of truth for first-run defaults is
 consume it, and `tests/country-profile.test.ts` verifies Saudi currency,
 numbers, and dates do not emit Arabic-Indic digits.
 
+## Releases and updates
+
+- Shop PCs update from this repository's GitHub Releases, built by
+  `.github/workflows/factorpos-release.yml` on `v*` tags (stable `vX.Y.Z`,
+  pilot `vX.Y.Z-beta.N`). Upstream's `release.yml` is left as is and listens
+  only for tags starting with a digit.
+- Installing an update first takes a database backup and cancels the install
+  if the backup fails (`backupBeforeInstall` in `main/updater-shutdown.ts`).
+- Steps and rollout: `docs/FACTORPOS_RELEASES.md`.
+
+## Upstream merges
+
+- `tests/factorpos-customizations.test.ts` pins every customization in this
+  file and runs first in `npm test`. Add a check whenever you add a
+  customization.
+- `.github/workflows/factorpos-upstream-sync.yml` proposes FloCafe updates as
+  a pull request (or an issue when the merge conflicts) when the owner runs it;
+  it has no schedule. See
+  `docs/FACTORPOS_UPSTREAM_UPDATES.md`.
+- The language picker keeps `de, en, es, fa, fil, fr, pt, tr`; new FloCafe
+  languages are merged with `selectable: false`.
+- `.github/workflows/nightly-release.yml` is manual-only in FactorPOS.
+
 ## Still pending
 
 - FactorPOS logo, icons, and final color palette
-- Private source/release host and updater feed
-- Windows publisher identity and code-signing certificate
+- Windows publisher identity and code-signing certificate (installers ship
+  unsigned for now; see `docs/FACTORPOS_RELEASES.md`)
 - Physical receipt/KOT printer verification on the pilot Windows PC

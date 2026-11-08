@@ -27,8 +27,11 @@ FactorPOS is currently in pre-production development. Every verified push to
 [GitHub Actions](https://github.com/nihalmuhammad/factorpos/actions/workflows/development-windows.yml).
 These builds are for development and pilot testing only.
 
-Production releases will be published only after pilot hardware verification
-and Windows code signing are complete. See the [FactorPOS development
+Shop releases are published to
+[GitHub Releases](https://github.com/nihalmuhammad/factorpos/releases) from
+`v*` tags, and installed shop PCs update from there over the internet.
+Installers are unsigned for now. See [releases and shop
+updates](docs/FACTORPOS_RELEASES.md), the [FactorPOS development
 workflow](docs/DEVELOPMENT_WORKFLOW.md) and [customization
 status](docs/FACTORPOS_CUSTOMIZATIONS.md).
 
