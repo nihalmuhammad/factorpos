@@ -1,13 +1,10 @@
 name: Full Cross-Platform Matrix
 
-# Runs on merges/pushes to main, nightly schedule, and manual workflow_dispatch.
-# Does NOT run on pull requests (PRs are validated with fast, focused CI in ci.yml).
+# FactorPOS: manual runs only (docs/DEVELOPMENT_WORKFLOW.md, Actions usage
+# policy). Shop releases are tested by factorpos-release.yml and FloCafe
+# updates by factorpos-upstream-sync.yml. Upstream FloCafe runs this on push
+# and nightly; keep the FactorPOS trigger when merging upstream changes.
 on:
-  push:
-    branches: [main]
-    paths-ignore: ['**/*.md']
-  schedule:
-    - cron: '0 0 * * *' # Nightly
   workflow_dispatch:
 
 concurrency:

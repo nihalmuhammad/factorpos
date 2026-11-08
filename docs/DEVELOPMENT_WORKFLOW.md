@@ -78,14 +78,8 @@ release process established at that time.
 
 ## Upstream updates
 
-Fetch FloCafe updates without mixing them directly into production:
-
-```sh
-git fetch upstream
-git switch -c update/flocafe-version main
-```
-
-Merge or cherry-pick the reviewed upstream release on that update branch, run
-the full regression suite, then merge it into `main`. FactorPOS branding,
-Saudi digit rules, printing behavior, and data-directory isolation must be
-verified before accepting the update.
+FloCafe updates are proposed as a pull request for review when the owner runs
+the FactorPOS Upstream Sync workflow (on demand, no schedule), and FactorPOS
+customizations are pinned by `npm run test:factorpos-customizations`. The
+full process, including merging by hand when there are conflicts, is in
+[Taking FloCafe updates into FactorPOS](FACTORPOS_UPSTREAM_UPDATES.md).

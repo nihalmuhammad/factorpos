@@ -851,9 +851,8 @@ exit 1
 
   const matrixWorkflow = loadWorkflow('nightly-release.yml');
   const matrixTriggers = matrixWorkflow.on || matrixWorkflow['true'];
-  assert.deepEqual(matrixTriggers.push.branches, ['main']);
-  assert.deepEqual(matrixTriggers.push['paths-ignore'], ['**/*.md'], 'documentation-only pushes must not run the full package matrix');
-  assert.ok(matrixTriggers.workflow_dispatch !== undefined);
+  // FactorPOS: the full matrix is manual-only (Actions usage policy); no push or schedule triggers.
+  assert.deepEqual(Object.keys(matrixTriggers), ['workflow_dispatch'], 'the full package matrix runs only on manual dispatch');
   assert.equal(matrixTriggers.pull_request, undefined);
   assert.equal(matrixWorkflow.concurrency['cancel-in-progress'], false);
   const matrixJob = matrixWorkflow.jobs['build-matrix'];

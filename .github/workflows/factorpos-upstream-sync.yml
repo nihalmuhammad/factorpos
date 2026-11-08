@@ -1,0 +1,200 @@
+# ---------------------------------------------------------------
+# FactorPOS — FloCafe update for review (on demand)
+# ---------------------------------------------------------------
+# Run from Actions → FactorPOS Upstream Sync → Run workflow (owner decision,
+# 2026-11-09: no schedule). It merges the latest FloCafe `main` into a
+# new branch off FactorPOS `main`, runs the FactorPOS customization guard and
+# the full test suite, and opens a pull request for the owner to review.
+# Nothing reaches `main` (or the shops) until the owner merges that PR and tags
+# a release.
+#
+# If the merge has conflicts, no branch is pushed; an issue lists the
+# conflicting files so the merge can be done by hand (docs/FACTORPOS_UPSTREAM_UPDATES.md).
+#
+# Requires: Settings → Actions → General → Workflow permissions →
+# "Allow GitHub Actions to create and approve pull requests".
+# Pull requests opened with the workflow token don't start other workflows,
+# so the checks run here and their results are written into the PR.
+
+name: FactorPOS Upstream Sync
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: factorpos-upstream-sync
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+env:
+  UPSTREAM_URL: https://github.com/FreeOpenSourcePOS/FloCafe.git
+
+jobs:
+  sync:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Fetch FloCafe
+        id: upstream
+        run: |
+          git remote add upstream "$UPSTREAM_URL"
+          git fetch --no-tags upstream main
+          UPSTREAM_SHA=$(git rev-parse upstream/main)
+          SHORT=$(git rev-parse --short=8 upstream/main)
+          COUNT=$(git rev-list --count HEAD..upstream/main)
+          VERSION=$(git show upstream/main:package.json | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>console.log(JSON.parse(s).version))")
+          echo "sha=$UPSTREAM_SHA" >> "$GITHUB_OUTPUT"
+          echo "short=$SHORT" >> "$GITHUB_OUTPUT"
+          echo "count=$COUNT" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "branch=upstream-sync/$SHORT" >> "$GITHUB_OUTPUT"
+          echo "FloCafe main $SHORT (v$VERSION) is $COUNT commit(s) ahead of FactorPOS main"
+
+      - name: Skip if already up to date or already proposed
+        id: skip
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COUNT: ${{ steps.upstream.outputs.count }}
+          BRANCH: ${{ steps.upstream.outputs.branch }}
+          SHORT: ${{ steps.upstream.outputs.short }}
+        run: |
+          SKIP=false
+          if [ "$COUNT" = "0" ]; then
+            echo "FactorPOS already contains FloCafe main."; SKIP=true
+          elif git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
+            echo "Branch $BRANCH already exists; review its pull request."; SKIP=true
+          elif gh issue list --state open --search "FloCafe $SHORT in:title" --json number --jq 'length' | grep -qv '^0$'; then
+            echo "A conflict issue for $SHORT is already open."; SKIP=true
+          fi
+          echo "skip=$SKIP" >> "$GITHUB_OUTPUT"
+
+      - name: Merge FloCafe into a review branch
+        if: steps.skip.outputs.skip == 'false'
+        id: merge
+        env:
+          BRANCH: ${{ steps.upstream.outputs.branch }}
+          SHORT: ${{ steps.upstream.outputs.short }}
+          VERSION: ${{ steps.upstream.outputs.version }}
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git switch -c "$BRANCH"
+          if git merge --no-ff --no-edit -m "chore(upstream): merge FloCafe v$VERSION ($SHORT)" upstream/main; then
+            echo "conflicts=false" >> "$GITHUB_OUTPUT"
+          else
+            git diff --name-only --diff-filter=U > "$RUNNER_TEMP/conflicts.txt"
+            git merge --abort
+            echo "conflicts=true" >> "$GITHUB_OUTPUT"
+            echo "Merge has $(wc -l < "$RUNNER_TEMP/conflicts.txt") conflicting file(s)"
+          fi
+
+      - name: Open an issue for a conflicting merge
+        if: steps.skip.outputs.skip == 'false' && steps.merge.outputs.conflicts == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHORT: ${{ steps.upstream.outputs.short }}
+          VERSION: ${{ steps.upstream.outputs.version }}
+          COUNT: ${{ steps.upstream.outputs.count }}
+        run: |
+          {
+            echo "FloCafe \`main\` ($SHORT, v$VERSION) is **$COUNT commit(s)** ahead of FactorPOS and can't be merged automatically."
+            echo
+            echo "### Conflicting files"
+            sed 's/^/- `/; s/$/`/' "$RUNNER_TEMP/conflicts.txt"
+            echo
+            echo "### Merge by hand"
+            echo "Follow docs/FACTORPOS_UPSTREAM_UPDATES.md (\"When the merge has conflicts\"). Keep the FactorPOS side for branding, Saudi defaults, receipts and release settings; \`npm run test:factorpos-customizations\` must pass before the merge is committed."
+            echo
+            echo "### Newest FloCafe commits"
+            git log --no-merges --format='- %h %s' HEAD..upstream/main | head -60
+          } > "$RUNNER_TEMP/issue.md"
+          gh issue create --title "FloCafe $SHORT (v$VERSION) needs a manual merge" --body-file "$RUNNER_TEMP/issue.md"
+
+      - name: Set up Node.js 22
+        if: steps.skip.outputs.skip == 'false' && steps.merge.outputs.conflicts == 'false'
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            frontend/package-lock.json
+
+      - name: Install dependencies
+        if: steps.skip.outputs.skip == 'false' && steps.merge.outputs.conflicts == 'false'
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y xvfb
+          npm ci
+          npm --prefix frontend ci
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: false
+
+      - name: Check FactorPOS customizations
+        if: steps.skip.outputs.skip == 'false' && steps.merge.outputs.conflicts == 'false'
+        id: guard
+        run: |
+          set +e
+          npm run test:factorpos-customizations > "$RUNNER_TEMP/guard.log" 2>&1
+          echo "result=$([ $? -eq 0 ] && echo pass || echo fail)" >> "$GITHUB_OUTPUT"
+          tail -40 "$RUNNER_TEMP/guard.log"
+
+      - name: Lint, build and run the full test suite
+        if: steps.skip.outputs.skip == 'false' && steps.merge.outputs.conflicts == 'false'
+        id: tests
+        env:
+          NEXT_TELEMETRY_DISABLED: 1
+        run: |
+          set +e
+          {
+            npm run lint && npm run build:frontend && npm run build &&
+            xvfb-run -a --server-args='-screen 0 1280x800x24' npm test
+          } > "$RUNNER_TEMP/tests.log" 2>&1
+          echo "result=$([ $? -eq 0 ] && echo pass || echo fail)" >> "$GITHUB_OUTPUT"
+          tail -60 "$RUNNER_TEMP/tests.log"
+
+      - name: Push branch and open pull request
+        if: steps.skip.outputs.skip == 'false' && steps.merge.outputs.conflicts == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ steps.upstream.outputs.branch }}
+          SHORT: ${{ steps.upstream.outputs.short }}
+          VERSION: ${{ steps.upstream.outputs.version }}
+          COUNT: ${{ steps.upstream.outputs.count }}
+          GUARD: ${{ steps.guard.outputs.result }}
+          TESTS: ${{ steps.tests.outputs.result }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          git push origin "$BRANCH"
+          mark() { [ "$1" = pass ] && echo "✅ passed" || echo "❌ failed — see the [workflow log]($RUN_URL)"; }
+          {
+            echo "Merges FloCafe \`main\` $SHORT (v$VERSION): **$COUNT commit(s)**. Nothing ships until you merge this and tag a release."
+            echo
+            echo "| Check | Result |"
+            echo "|---|---|"
+            echo "| FactorPOS customizations | $(mark "$GUARD") |"
+            echo "| Lint, build, full test suite | $(mark "$TESTS") |"
+            echo
+            echo "### Review checklist"
+            echo "- [ ] Read the FloCafe changes below, especially anything touching receipts, KOT, payments, tax, the database or the updater."
+            echo "- [ ] No new FloCafe/FloPOS branding, URLs or cloud endpoints in what staff see."
+            echo "- [ ] Database migrations (\`main/db.ts\`, \`main/migrations/\`) look safe for live shop data."
+            echo "- [ ] Merge, then release a beta to the pilot PC before the other shops (docs/FACTORPOS_RELEASES.md)."
+            echo
+            echo "### Files changed by FloCafe"
+            git diff --stat=100 --stat-count=40 main...HEAD | tail -41
+            echo
+            echo "### FloCafe commits"
+            git log --no-merges --format='- %h %s' main..HEAD | head -100
+          } > "$RUNNER_TEMP/pr.md"
+          gh pr create --base main --head "$BRANCH" \
+            --title "FloCafe update v$VERSION ($SHORT) for review" \
+            --body-file "$RUNNER_TEMP/pr.md"
