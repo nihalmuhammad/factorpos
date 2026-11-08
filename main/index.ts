@@ -4,7 +4,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 
 import { Bonjour } from 'bonjour-service';
-import { getDatabase, initDatabase, closeDatabase, waitForDatabaseRequests, beginDatabaseShutdown, SchemaVersionMismatchError, now, withDatabaseRequest } from './db';
+import { getDatabase, initDatabase, closeDatabase, waitForDatabaseRequests, beginDatabaseShutdown, SchemaVersionMismatchError, now, withDatabaseRequest, createBackup } from './db';
 import { BETA_CHANNEL_SETTING_KEY, parseStoredBetaChannelEnabled, resolveUpdateChannel } from './update-channel';
 import { computeTaxPackUpdates, fetchRemoteTaxPackCatalog } from './tax-packs/catalog';
 import { startServer, stopServer, getLocalIP, isServerRunning, getServerPort } from './server';
@@ -1256,6 +1256,10 @@ async function initialize(): Promise<void> {
     ipcMain.handle('restart-and-install', createRestartAndInstallHandler({
       isInstallReady: () => isInstallReady(storedUpdateStatus, stagedUpdateReady),
       authorize: (pin) => authorizeMasterPin(pin, 'ipc:restart-and-install'),
+      backupBeforeInstall: async () => {
+        const backup = await createBackup();
+        log.info(`[Update] Pre-install database backup saved to ${backup.path} (schema v${backup.schemaVersion})`);
+      },
       runCleanup,
       quitAndInstall: (isSilent, isForceRunAfter) => autoUpdater.quitAndInstall(isSilent, isForceRunAfter),
       updateState: updateShutdownState,

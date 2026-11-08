@@ -20,6 +20,8 @@ type RestartAndInstallResult =
 type RestartAndInstallOptions = {
   isInstallReady: () => boolean;
   authorize: (pin: string | undefined) => UpdateAuthorizationResult;
+  /** FactorPOS: back up the live database before installing; a failure cancels the install. */
+  backupBeforeInstall?: () => Promise<void>;
   runCleanup: () => Promise<void>;
   quitAndInstall: (isSilent: boolean, isForceRunAfter: boolean) => void;
   updateState: UpdateShutdownState;
@@ -77,6 +79,7 @@ export function createAutoUpdaterErrorHandler(
 export function createRestartAndInstallHandler({
   isInstallReady,
   authorize,
+  backupBeforeInstall,
   runCleanup,
   quitAndInstall,
   updateState,
@@ -93,6 +96,15 @@ export function createRestartAndInstallHandler({
     if (!auth.ok) {
       warn(`[Update] Restart-to-install denied by Master PIN gate: ${auth.error}`);
       return { success: false, error: auth.error };
+    }
+    if (backupBeforeInstall) {
+      // Runs before shutdown starts, so a failed backup leaves the current version running.
+      try {
+        await backupBeforeInstall();
+      } catch (backupError) {
+        error('[Update] Pre-install database backup failed; update not installed:', backupError);
+        return { success: false, error: 'Could not back up the database, so the update was not installed. Please try again or contact support.' };
+      }
     }
     updateState.setInstallingUpdate(true);
     updateState.setQuitting(true);

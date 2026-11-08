@@ -920,6 +920,84 @@ async function testOwnedServerStopEntrypoints(): Promise<void> {
   }
 }
 
+// ── FactorPOS: database backup before installing an update ───────────────────
+// The backup must run after the Master PIN check and before any shutdown
+// step; if it fails the install is cancelled and the current version keeps
+// running, so shop data is never updated without a fresh backup.
+async function testBackupBeforeInstall(): Promise<void> {
+  // --- Backup succeeds: it runs first, then cleanup, then install ---
+  {
+    const order: string[] = [];
+    const handler = createRestartAndInstallHandler({
+      isInstallReady: () => true,
+      authorize: () => { order.push('authorize'); return { ok: true }; },
+      backupBeforeInstall: async () => { order.push('backup'); },
+      runCleanup: async () => { order.push('cleanup'); },
+      quitAndInstall: () => { order.push('install'); },
+      updateState: { setInstallingUpdate: () => { order.push('installing'); }, setQuitting: () => {} },
+      onInstallFailure: () => {},
+      warn: () => {},
+      error: () => {},
+    });
+    const result = await handler({}, '1234');
+    assert.deepEqual(result, { success: true });
+    assert.deepEqual(order, ['authorize', 'backup', 'installing', 'cleanup', 'install'],
+      'backup runs after authorization and before shutdown and install');
+  }
+
+  // --- Backup fails: install is cancelled and shutdown never starts ---
+  {
+    let isInstallingUpdate = false;
+    let isQuitting = false;
+    let cleanupCalls = 0;
+    let installCalls = 0;
+    let failureHandoffs = 0;
+    const loggedErrors: string[] = [];
+    const handler = createRestartAndInstallHandler({
+      isInstallReady: () => true,
+      authorize: () => ({ ok: true }),
+      backupBeforeInstall: async () => { throw new Error('disk full'); },
+      runCleanup: async () => { cleanupCalls++; },
+      quitAndInstall: () => { installCalls++; },
+      updateState: {
+        setInstallingUpdate: (value) => { isInstallingUpdate = value; },
+        setQuitting: (value) => { isQuitting = value; },
+      },
+      onInstallFailure: () => { failureHandoffs++; },
+      warn: () => {},
+      error: (message) => { loggedErrors.push(message); },
+    });
+    const result = await handler({}, '1234');
+    assert.equal(result.success, false, 'failed backup cancels the install');
+    assert.match(result.success ? '' : result.error, /back up the database/, 'operator sees why the update was not installed');
+    assert.equal(installCalls, 0, 'quitAndInstall never runs without a backup');
+    assert.equal(cleanupCalls, 0, 'shutdown cleanup never starts without a backup');
+    assert.equal(isInstallingUpdate, false, 'installing state stays off');
+    assert.equal(isQuitting, false, 'app keeps running the current version');
+    assert.equal(failureHandoffs, 0, 'no relaunch is requested');
+    assert.equal(loggedErrors.length, 1, 'backup failure is logged');
+  }
+
+  // --- Denied Master PIN never triggers a backup ---
+  {
+    let backupCalls = 0;
+    const handler = createRestartAndInstallHandler({
+      isInstallReady: () => true,
+      authorize: () => ({ ok: false, error: 'Invalid PIN' }),
+      backupBeforeInstall: async () => { backupCalls++; },
+      runCleanup: async () => {},
+      quitAndInstall: () => {},
+      updateState: { setInstallingUpdate: () => {}, setQuitting: () => {} },
+      onInstallFailure: () => {},
+      warn: () => {},
+      error: () => {},
+    });
+    const result = await handler({}, '0000');
+    assert.deepEqual(result, { success: false, error: 'Invalid PIN' });
+    assert.equal(backupCalls, 0, 'no backup is taken for a denied install');
+  }
+}
+
 // ── quitAndInstall ordering regression (#544) ────────────────────────────────
 // When restart-and-install is invoked, cleanup must run *before*
 // autoUpdater.quitAndInstall() calls app.quit(). If cleanup runs after, the
@@ -1255,6 +1333,7 @@ async function testQuitAndInstallCleanupOrdering(): Promise<void> {
   await testOwnedServerStopEntrypoints();
   console.log('phase update install ordering');
   await testQuitAndInstallCleanupOrdering();
+  await testBackupBeforeInstall();
   console.log('Shutdown lifecycle tests passed.');
 })().catch((error) => {
   console.error(error);
