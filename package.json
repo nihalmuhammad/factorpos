@@ -1,6 +1,6 @@
 {
   "name": "factorpos",
-  "version": "3.9.0",
+  "version": "3.9.1-beta.1",
   "description": "FactorPOS is an offline-first restaurant POS with KDS, SQLite, and thermal printer support.",
   "engines": {
     "node": ">=22.12.0"
