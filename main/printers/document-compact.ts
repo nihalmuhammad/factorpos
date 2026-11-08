@@ -195,13 +195,17 @@ export function renderBillDocumentToCompactLines(
     lines.push(normalize(labelOf(meta.billNumberLabel) + ': ' + meta.invoiceNumber.text));
     metaSourceLines.push(labelOf(meta.billNumberLabel) + ': ' + meta.invoiceNumber.text);
     const date = parseDbTimestamp(meta.timestamp.text);
-    const dateText = new Intl.DateTimeFormat('en-GB', {
-      ...tzOptions,
-      day: '2-digit', month: '2-digit', year: '2-digit',
-      hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
-    }).format(date);
-    lines.push(normalize(labelOf(meta.dateLabel) + ': ' + dateText));
-    metaSourceLines.push(labelOf(meta.dateLabel) + ': ' + dateText);
+    // Intl.DateTimeFormat.format throws on an invalid Date; a missing or
+    // unreadable timestamp must drop the date line, never block the print.
+    if (!Number.isNaN(date.getTime())) {
+      const dateText = new Intl.DateTimeFormat('en-GB', {
+        ...tzOptions,
+        day: '2-digit', month: '2-digit', year: '2-digit',
+        hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
+      }).format(date);
+      lines.push(normalize(labelOf(meta.dateLabel) + ': ' + dateText));
+      metaSourceLines.push(labelOf(meta.dateLabel) + ': ' + dateText);
+    }
     if (meta.table) {
       lines.push(truncateShapedLine(meta.table.label.primary.replace('{name}', meta.table.name.text), cols, options.arabicShaping, options.language, options.capabilities));
       metaSourceLines.push(meta.table.label.primary.replace('{name}', meta.table.name.text));

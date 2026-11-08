@@ -751,6 +751,22 @@ console.log('\n✅ Test 2: Compact receipt (80mm, 48 cols)');
   console.log(visiblePreview(buf, 48));
 }
 
+console.log('\n✅ Test 2b: Compact receipt with a missing or unreadable timestamp');
+for (const createdAt of [null, '', 'not-a-date']) {
+  let buf: Buffer | null = null;
+  let error: unknown = null;
+  try {
+    buf = formatReceipt({ ...fixtureOrder, created_at: createdAt }, fixtureBill, fixtureBusiness, 'compact', 48, true);
+  } catch (caught) {
+    error = caught;
+  }
+  const label = JSON.stringify(createdAt);
+  assert(`compact receipt still prints when created_at is ${label}`, error === null && buf !== null, error ? String(error) : undefined);
+  const text = buf?.toString('utf8') ?? '';
+  assert(`compact receipt keeps bill and total when created_at is ${label}`, text.includes('INV-20260421-0001') && text.includes('₹950.00'));
+  assert(`compact receipt omits the date line when created_at is ${label}`, !/Date:/.test(text) && !text.includes('Invalid Date'));
+}
+
 console.log('\n✅ Test 3: Compact receipt on 58mm paper (32 cols)');
 {
   const buf = formatReceipt(fixtureOrder, fixtureBill, fixtureBusiness, 'compact', 32, true);

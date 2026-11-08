@@ -114,18 +114,27 @@ async function run(): Promise<void> {
   }), false);
   const printDocument = buildBillDocument({
     isReprint: false,
-    order: { orderNumber: '', createdAt: '', tableName: '', onlinePlatform: '', externalOrderId: '', items: [] },
+    order: { orderNumber: '', tokenNumber: null, createdAt: '', tableName: '', onlinePlatform: '', externalOrderId: '', items: [] },
     bill: { billNumber: '', subtotal: 0, discountAmount: 0, taxAmount: 0, total: 0, taxComponents: [], payments: [], pointsEarned: 0, pointsRedeemed: 0, pointsBalance: null },
     business: { name: '', address: '', phone: '', taxRegistrationNumber: '', taxIdLabel: '', instagramHandle: '', footerNote: '', customerName: '', customerPhone: '', showName: true, showAddress: false, showPhone: false, showTaxId: 'never', showTaxBreakdown: false, showTableNumber: false, showCustomerName: false, showCustomerPhone: false },
   }, { columns: 42, languages: ['en'], baseDirection: 'ltr', locale: 'en-US', currency: 'USD', currencySymbol: '$', trimDecimals: false, resolveLabel: (conceptId) => conceptId });
   assert.equal(isPrintDocument(printDocument), true);
   assert.equal(isPrintDocument({ ...printDocument, blocks: printDocument.blocks.slice(0, -1) }), false);
   assert.equal(isPrintDocument({ ...printDocument, blocks: [...printDocument.blocks, printDocument.blocks[0]] }), false);
+  // Receipt tokens (FactorPOS day-close reset) must be null or a positive integer; a missing token is invalid.
+  const withToken = (tokenNumber: unknown) => ({
+    ...printDocument,
+    blocks: printDocument.blocks.map((block) => block.kind === 'document-meta' ? { ...block, tokenNumber } : block),
+  });
+  assert.equal(isPrintDocument(withToken(7)), true);
+  assert.equal(isPrintDocument(withToken(undefined)), false);
+  assert.equal(isPrintDocument(withToken(0)), false);
+  assert.equal(isPrintDocument(withToken(1.5)), false);
   const longAddon = 'ASCII addon content that must remain available to pixel wrapping';
   const longInstruction = 'ASCII instruction content that must remain available to pixel wrapping 2';
   const sourceDocument = buildBillDocument({
     isReprint: false,
-    order: { orderNumber: '', createdAt: '', tableName: '', onlinePlatform: '', externalOrderId: '', items: [{ productName: 'فارسی محصول', quantity: 1, unitPrice: 1, total: 1, addons: [{ name: longAddon, price: 1, quantity: 1 }], specialInstructions: longInstruction }] },
+    order: { orderNumber: '', tokenNumber: null, createdAt: '', tableName: '', onlinePlatform: '', externalOrderId: '', items: [{ productName: 'فارسی محصول', quantity: 1, unitPrice: 1, total: 1, addons: [{ name: longAddon, price: 1, quantity: 1 }], specialInstructions: longInstruction }] },
     bill: { billNumber: '', subtotal: 1, discountAmount: 0, taxAmount: 0, total: 1, taxComponents: [], payments: [], pointsEarned: 0, pointsRedeemed: 0, pointsBalance: null },
     business: { name: '', address: '', phone: '', taxRegistrationNumber: '', taxIdLabel: '', instagramHandle: '', footerNote: '', customerName: '', customerPhone: '', showName: true, showAddress: false, showPhone: false, showTaxId: 'never', showTaxBreakdown: false, showTableNumber: false, showCustomerName: false, showCustomerPhone: false },
   }, { columns: 42, languages: ['en'], baseDirection: 'ltr', locale: 'en-US', currency: 'USD', currencySymbol: '$', trimDecimals: false, resolveLabel: (conceptId) => conceptId });
@@ -157,7 +166,7 @@ async function run(): Promise<void> {
   assert.equal(sourceRequests.find((request) => request.text.includes(longInstruction))?.layout, undefined);
   const compactDocument = buildBillDocument({
     isReprint: true,
-    order: { orderNumber: '', createdAt: '', tableName: '', onlinePlatform: 'کافه', externalOrderId: 'K-7', items: [] },
+    order: { orderNumber: '', tokenNumber: null, createdAt: '', tableName: '', onlinePlatform: 'کافه', externalOrderId: 'K-7', items: [] },
     bill: { billNumber: '', subtotal: 0, discountAmount: 0, taxAmount: 0, total: 0, taxComponents: [], payments: [], pointsEarned: 0, pointsRedeemed: 0, pointsBalance: null },
     business: { name: 'فروشگاه فارسی', address: 'آدرس فارسی', phone: '', taxRegistrationNumber: '', taxIdLabel: '', instagramHandle: '', footerNote: 'پیام فارسی', customerName: '', customerPhone: '', showName: true, showAddress: true, showPhone: false, showTaxId: 'never', showTaxBreakdown: false, showTableNumber: false, showCustomerName: false, showCustomerPhone: false },
   }, { columns: 42, languages: ['en'], baseDirection: 'ltr', locale: 'en-US', currency: 'USD', currencySymbol: '$', trimDecimals: false, resolveLabel: (conceptId) => conceptId });
@@ -176,8 +185,10 @@ async function run(): Promise<void> {
   });
   const compactBusinessGroups = compactGroups.filter((group) => group.groupId === 'business-header');
   const compactMessageGroups = compactGroups.filter((group) => group.groupId === 'message');
-  assert.equal(compactBusinessGroups.length, 2);
-  assert.equal(compactBusinessGroups[0].lineIndex < compactBusinessGroups[1].lineIndex, true);
+  // The compact "order note" layout omits the business name; only the footer address remains.
+  assert.equal(compactBusinessGroups.length, 1);
+  assert.deepEqual(compactBusinessGroups[0].sourceLines, ['آدرس فارسی']);
+  assert.equal(compactGroups.some((group) => group.sourceLines.includes('فروشگاه فارسی')), false);
   assert.equal(compactMessageGroups.length, 2);
   assert.equal(compactMessageGroups[0].lineIndex < compactMessageGroups[1].lineIndex, true);
   const classicHeaderGroups: any[] = [];
