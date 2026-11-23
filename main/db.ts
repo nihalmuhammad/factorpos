@@ -4108,9 +4108,19 @@ export const MIGRATIONS: { version: number; name: string; up: () => void }[] = [
       addColumn('cash_movements_json', "cash_movements_json TEXT NOT NULL DEFAULT '[]'");
     },
   },
+];
+
+/**
+ * FactorPOS-owned migrations, tracked by id in `_factorpos_migrations` and run
+ * after the upstream numbered MIGRATIONS. Upstream FloCafe owns `user_version`;
+ * FactorPOS must never add numbered migrations, or an upstream merge would
+ * silently skip FloCafe migrations that share the same number.
+ * Every `up` must be idempotent: older FactorPOS builds may already have
+ * applied the same change under a numbered migration.
+ */
+export const FACTORPOS_MIGRATIONS: { id: string; up: () => void }[] = [
   {
-    version: 85,
-    name: 'add_daily_close_token_number',
+    id: '2026-09-28-add-daily-close-token-number',
     up: () => {
       const columns = new Set(
         (db.prepare(`PRAGMA table_info(orders)`).all() as { name: string }[]).map((column) => column.name),
@@ -4122,6 +4132,94 @@ export const MIGRATIONS: { version: number; name: string; up: () => void }[] = [
     },
   },
 ];
+
+/**
+ * FactorPOS 3.9.0–3.9.1-beta.1 stored its token migration as upstream number 85
+ * ('add_daily_close_token_number'). FloCafe's own v85 is 'add_inventory_movements'.
+ * Such databases are reset to v84 so FloCafe's v85+ still run, and the token
+ * change is recorded as an applied FactorPOS migration.
+ */
+const LEGACY_FACTORPOS_NUMBERED_MIGRATIONS: {
+  version: number;
+  id: string;
+  /** Column the FactorPOS migration added; proves it ran. */
+  appliedColumn: [string, string];
+  /** Table FloCafe's migration with the same number creates; proves upstream owns the number. */
+  upstreamTable: string;
+}[] = [
+  {
+    version: 85,
+    id: '2026-09-28-add-daily-close-token-number',
+    appliedColumn: ['orders', 'token_number'],
+    upstreamTable: 'inventory_movements',
+  },
+];
+
+function ensureFactorposMigrationTable(): void {
+  db.exec(`CREATE TABLE IF NOT EXISTS _factorpos_migrations (
+    id TEXT PRIMARY KEY,
+    applied_at TEXT NOT NULL
+  )`);
+}
+
+function getAppliedFactorposMigrationIds(): Set<string> {
+  ensureFactorposMigrationTable();
+  return new Set((db.prepare('SELECT id FROM _factorpos_migrations').all() as { id: string }[]).map((row) => row.id));
+}
+
+function hasColumn(table: string, column: string): boolean {
+  return (db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[]).some((row) => row.name === column);
+}
+
+/** Returns the legacy FactorPOS numbered migrations present at the top of this database's version. */
+function findLegacyFactorposVersions(current: number): typeof LEGACY_FACTORPOS_NUMBERED_MIGRATIONS {
+  const found: typeof LEGACY_FACTORPOS_NUMBERED_MIGRATIONS = [];
+  let version = current;
+  for (const legacy of [...LEGACY_FACTORPOS_NUMBERED_MIGRATIONS].sort((a, b) => b.version - a.version)) {
+    if (legacy.version !== version) continue;
+    const [table, column] = legacy.appliedColumn;
+    if (!hasColumn(table, column)) break;
+    if (getTables(db).includes(legacy.upstreamTable)) break;
+    found.push(legacy);
+    version -= 1;
+  }
+  return found;
+}
+
+/** Returns true when a repair ran (and therefore took a backup). */
+function repairLegacyFactorposVersions(): boolean {
+  const current = getCurrentSchemaVersion();
+  const legacy = findLegacyFactorposVersions(current);
+  if (legacy.length === 0) return false;
+  const repairedVersion = current - legacy.length;
+  console.log(`[DB] Moving FactorPOS migrations off upstream numbering: v${current} → v${repairedVersion}`);
+  syncBackupBeforeMigration(current, repairedVersion);
+  db.transaction(() => {
+    ensureFactorposMigrationTable();
+    const insert = db.prepare('INSERT OR IGNORE INTO _factorpos_migrations (id, applied_at) VALUES (?, ?)');
+    for (const entry of legacy) insert.run(entry.id, new Date().toISOString());
+    db.pragma(`user_version = ${repairedVersion}`);
+  })();
+  return true;
+}
+
+function runFactorposMigrations(alreadyBackedUp: boolean): void {
+  const applied = getAppliedFactorposMigrationIds();
+  const pending = FACTORPOS_MIGRATIONS.filter((migration) => !applied.has(migration.id));
+  if (pending.length === 0) return;
+  if (!alreadyBackedUp) {
+    const version = getCurrentSchemaVersion();
+    console.log(`[DB] Triggering auto-backup before ${pending.length} FactorPOS migration(s)...`);
+    syncBackupBeforeMigration(version, version);
+  }
+  const insert = db.prepare('INSERT INTO _factorpos_migrations (id, applied_at) VALUES (?, ?)');
+  for (const migration of pending) {
+    db.transaction(() => {
+      migration.up();
+      insert.run(migration.id, new Date().toISOString());
+    })();
+  }
+}
 
 function syncBackupBeforeMigration(fromVersion: number, toVersion: number): void {
   if (buildingIdealSchema) return;
@@ -4194,6 +4292,13 @@ export class SchemaVersionMismatchError extends Error {
 }
 
 function runMigrations(): void {
+  const repaired = buildingIdealSchema ? false : repairLegacyFactorposVersions();
+  const migrated = runUpstreamMigrations();
+  runFactorposMigrations(repaired || migrated);
+}
+
+/** Runs pending upstream numbered migrations; returns true when a pre-migration backup was taken. */
+function runUpstreamMigrations(): boolean {
   const current = getCurrentSchemaVersion();
   const target = MIGRATIONS.length > 0 ? MIGRATIONS[MIGRATIONS.length - 1].version : 0;
   const verboseMigrationLogs = process.env.FLOCAFE_TEST_VERBOSE === '1';
@@ -4205,7 +4310,7 @@ function runMigrations(): void {
 
   if (current === target) {
     console.log(`[DB] Schema up to date (v${current})`);
-    return;
+    return false;
   }
 
   console.log(`[DB] Schema: v${current} → v${target}`);
@@ -4228,6 +4333,7 @@ function runMigrations(): void {
       console.log(`[DB] Migration v${migration.version} complete`);
     }
   }
+  return true;
 }
 
 // Initial schema definition for brand-new installs (migration v1).

@@ -130,7 +130,7 @@ test('FactorPOS regression suites stay in npm test', () => {
     'test:printer',
     'test:raster',
     'test:shutdown-lifecycle',
-    'test:migration-v85-token-number',
+    'test:factorpos-migrations',
     'test:cash-closures',
     'test:country-localization',
     'test:currency',

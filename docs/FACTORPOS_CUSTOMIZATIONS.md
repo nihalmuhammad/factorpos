@@ -44,6 +44,19 @@ The shared source of truth for first-run defaults is
 consume it, and `tests/country-profile.test.ts` verifies Saudi currency,
 numbers, and dates do not emit Arabic-Indic digits.
 
+## Database migrations
+
+FloCafe owns the numbered `MIGRATIONS` list and SQLite `user_version`.
+FactorPOS schema changes go in `FACTORPOS_MIGRATIONS` in `main/db.ts`. They
+are tracked by id in the `_factorpos_migrations` table, run after the
+upstream list, and must be idempotent.
+
+FactorPOS 3.9.0 to 3.9.1-beta.1 shipped its token column as numbered
+migration 85, which is FloCafe's `add_inventory_movements`. On startup such a
+database is backed up and moved back to v84, and the token migration is
+recorded by id, so FloCafe's own 85 and later run after an upstream merge.
+Covered by `npm run test:factorpos-migrations`.
+
 ## Releases and updates
 
 - Shop PCs update from this repository's GitHub Releases, built by

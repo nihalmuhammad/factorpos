@@ -78,6 +78,7 @@ How to resolve the usual conflicts:
 | `main/index.ts`, `main/updater-shutdown.ts` | FloCafe's changes plus the FactorPOS app name, data folder and `backupBeforeInstall`. |
 | `main/printers/document-compact.ts`, `shared/print/document.ts` | The FactorPOS order-note layout and token; take FloCafe's fixes around them. |
 | `main/routes/settings.ts`, `main/routes/auth.ts`, `main/countries.ts` | Saudi defaults and Western digits. |
+| `main/db.ts` `MIGRATIONS` | FloCafe's numbered list exactly as upstream has it. FactorPOS schema changes live only in `FACTORPOS_MIGRATIONS` (tracked by id); never add or renumber a numbered migration for FactorPOS. |
 | `AGENTS.md`, `CLAUDE.md`, `frontend/AGENTS.md` | Keep them deleted (local files, not tracked in FactorPOS): `git rm` them. |
 | `.github/workflows/nightly-release.yml` | The FactorPOS manual-only trigger. |
 
