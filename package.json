@@ -85,7 +85,7 @@
     "test:daily-sales-export": "node tests/run-electron-node-test.cjs tests/daily-sales-export.test.ts",
     "test:daily-invoices-export": "node tests/run-electron-node-test.cjs tests/daily-invoices-export.test.ts",
     "test:customer-sales-export": "node tests/run-electron-node-test.cjs tests/customer-sales-export.test.ts",
-    "test:monthly-vat-export": "node tests/run-electron-node-test.cjs tests/monthly-vat-export.test.ts",
+    "test:monthly-vat-export": "node tests/run-electron-node-test.cjs tests/monthly-vat-export.test.ts && node tests/run-electron-node-test.cjs tests/monthly-vat-export-e2e.test.ts",
     "test:card-transaction-id": "node tests/run-electron-node-test.cjs tests/card-transaction-id.test.ts",
     "test:checkout-quick-tender-and-guards": "tsx --tsconfig tests/tsconfig.json -r ./tests/register-tsx.cjs tests/checkout-quick-tender-and-guards.test.ts",
     "test:reports-export": "node tests/run-electron-node-test.cjs tests/reports-export.test.ts",

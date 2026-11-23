@@ -106,7 +106,7 @@ See [API.md § GET `/api/reports/daily-sales/export`](api.md#get-apireportsdaily
 - **Sheets:** `Summary` (business name, VAT registration number, totals, net output VAT), `Invoices`, `Credit notes`, `Daily`. Every table has an English and an Arabic header row; money cells are numeric with the currency's decimals; invoice and order numbers are text.
 - **Filename:** `vat-invoices-YYYY-MM.xlsx`.
 - **Not yet ZATCA data:** columns for ICV, UUID and reporting status are added when FactorPOS signs invoices (see [ZATCA roadmap](../zatca-roadmap.md)).
-- **Code:** `main/services/monthly-vat-export.ts` builds and serializes; `main/routes/reports.ts` validates; the Dashboard export menu downloads the month of the selected period's start. Tests: `tests/monthly-vat-export.test.ts` (`npm run test:monthly-vat-export`).
+- **Code:** `main/services/monthly-vat-export.ts` builds and serializes; `main/routes/reports.ts` validates; the Dashboard export menu downloads the month of the selected period's start. Tests (`npm run test:monthly-vat-export`): `tests/monthly-vat-export.test.ts` (boundaries, round-off, refunds, layout) and `tests/monthly-vat-export-e2e.test.ts` (real order, bill, payment and refund API with the Saudi VAT pack, cross-checked against the daily sales export).
 
 ## Tests
 
