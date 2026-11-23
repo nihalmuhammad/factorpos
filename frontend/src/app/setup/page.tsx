@@ -37,6 +37,7 @@ import type { ProductAnalyticsLevel } from '@/components/analytics/ProductAnalyt
 import { CurrencySelect } from '@/components/CurrencySelect';
 import { useLocale, useTranslations, type AppConfig } from 'use-intl';
 import { FACTORPOS_DEFAULTS } from '@shared/factorpos-defaults';
+import { selectedCountryFirst } from '@/lib/factorpos-setup';
 import { LANGUAGES, getBrowserLanguage, type Language } from '@/lib/i18n';
 import { useConfirm } from '@/hooks/use-confirm';
 import { RESTORE_FROM_FILE_EVENT } from '@/components/layout/MenuActionHandler';
@@ -270,8 +271,13 @@ export default function SetupPage() {
   const languageOptions: Language[] = SELECTABLE_LANGUAGES.includes(browserLanguage)
     ? [browserLanguage, ...SELECTABLE_LANGUAGES.filter((l) => l !== browserLanguage)]
     : SELECTABLE_LANGUAGES;
-  const filteredCountries = sortCountriesByLocalizedName(COUNTRIES, resolvedCountryLocale).filter(
-    (c) => countryMatchesQuery(c, countryQuery, resolvedCountryLocale),
+  // FactorPOS: the selected country is listed first. FloCafe pins India and Argentina to the
+  // top, which left the preselected Saudi Arabia ticked far out of view and India one click away.
+  const filteredCountries = selectedCountryFirst(
+    sortCountriesByLocalizedName(COUNTRIES, resolvedCountryLocale).filter((c) =>
+      countryMatchesQuery(c, countryQuery, resolvedCountryLocale),
+    ),
+    country,
   );
 
   const completeSetup = () => {

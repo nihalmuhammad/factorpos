@@ -222,6 +222,28 @@ test('orders carry the day token and setup preselects Saudi Arabia', () => {
   );
 });
 
+test('setup lists the selected country first', () => {
+  const { selectedCountryFirst } = require('../frontend/src/lib/factorpos-setup');
+  const { COUNTRIES } = require('../main/countries');
+  const pinned = [...COUNTRIES].sort((a: { code: string }, b: { code: string }) =>
+    a.code === 'IN' ? -1 : b.code === 'IN' ? 1 : 0,
+  );
+  assert.equal(pinned[0].code, 'IN', 'fixture: FloCafe pins India first');
+  const listed = selectedCountryFirst(pinned, FACTORPOS_DEFAULTS.country);
+  assert.equal(listed[0].code, 'SA', 'the preselected Saudi Arabia is the first row, tick in view');
+  assert.equal(listed.length, pinned.length, 'no country is dropped');
+  assert.equal(
+    selectedCountryFirst(pinned, '').length,
+    pinned.length,
+    'no selection leaves the list alone',
+  );
+  assert.match(
+    read('frontend/src/app/setup/page.tsx'),
+    /selectedCountryFirst\(/,
+    'the setup screen uses the selected-country-first order',
+  );
+});
+
 test('FactorPOS regression suites stay in npm test', () => {
   const testChain: string = pkg.scripts.test;
   for (const script of [

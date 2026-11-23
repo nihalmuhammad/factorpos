@@ -83,7 +83,9 @@ Covered by `npm run test:factorpos-migrations`.
 - Customer day token: `generateTokenNumber()` in order creation
   (`main/routes/orders.ts`), reset by the day close (`main/routes/cash-closures.ts`),
   shown on the dashboard, order cards, the compact ORDER NOTE and browser receipts.
-- First-run setup preselects Saudi Arabia, SAR and Asia/Riyadh. FloCafe 3.14 no
+- First-run setup preselects Saudi Arabia, SAR and Asia/Riyadh, and lists the selected
+  country first (`frontend/src/lib/factorpos-setup.ts`); FloCafe pins India and Argentina
+  to the top, which hid the Saudi tick and made India a one-click mistake. FloCafe 3.14 no
   longer has a default country; FactorPOS keeps the preselection, and the owner
   still sees and can change it.
 - Email Error Log (Support): opens a local `.eml` draft with the recent log,
