@@ -9,7 +9,7 @@ a change appears to require deviating from an entry, confirm it rather than assu
 stale. If a decision genuinely changes, update this page in the same change that changes the
 behaviour.
 
-This page is a peer of the core invariants in [`AGENTS.md`](../../AGENTS.md), which carry the short
+This page is a peer of the core invariants in `AGENTS.md` (a local, untracked file in FactorPOS), which carry the short
 load-bearing list, not a replacement for it.
 
 ## How an entry is structured

@@ -79,7 +79,7 @@ Recheck the official pages before each phase; this is not tax advice.
 Can ship before signing exists, because it reads paid bills and refunds.
 Details: [monthly VAT invoice report](reference/daily-sales-export.md#monthly-vat-invoice-report-factorpos).
 
-- Owner/manager screen: pick a month, download `.xlsx`.
+- Owner screen (Dashboard export menu): download `.xlsx` for the month of the selected period.
 - Sheet "Invoices": one row per invoice. Columns: invoice number, date and time
   (Asia/Riyadh), order number and token, payment method, amount before VAT,
   VAT 15%, total with VAT, discount. Later columns, once ZATCA is on: ICV, UUID,

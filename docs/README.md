@@ -32,7 +32,6 @@ FactorPOS is a fork of FloCafe for Saudi restaurant shops. These pages cover wha
 | --- | --- |
 | [architecture/overview.md](architecture/overview.md) | You need the map: one process, three ports, three windows, and how they connect. |
 | [reference/product-invariants.md](reference/product-invariants.md) | You are about to change authorization, access control, defaults, refunds, or stock. Read this first. |
-| [AGENTS.md](../AGENTS.md) | You are an agent working in this repository. |
 
 ## Architecture
 
