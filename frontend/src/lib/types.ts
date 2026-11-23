@@ -1,10 +1,12 @@
 import type { Language } from '@/lib/i18n';
 import type { CurrencyDisplay, DigitMode, CalendarMode } from '@/lib/countries';
+import type { PermissionId } from '../../../shared/permissions';
 
 export interface User {
   id: number;
   name: string;
   email: string;
+  has_pin?: boolean;
   phone: string | null;
   country_code: string;
   is_active: boolean;
@@ -24,6 +26,8 @@ export interface Tenant {
   plan: string;
   status: string;
   role?: string;
+  permission_ids?: PermissionId[];
+  authorization_revision?: string;
   language?: Language;
   /** Raw backend-authoritative print policies included in auth bootstrap. */
   bill_language_policy?: string | null;
@@ -33,6 +37,13 @@ export interface Tenant {
   currency_display?: CurrencyDisplay;
   number_digits?: DigitMode;
   calendar?: CalendarMode;
+  // Regional snapshot fields (docs/architecture/regional-settings.md) — derived from
+  // country + currency by resolveRegionalSnapshot(), not independent state.
+  currency_symbol?: string;
+  currency_position?: 'prefix' | 'suffix';
+  currency_fraction_digits?: number;
+  decimal_separator?: string;
+  group_separator?: string;
 }
 
 export interface Category {
@@ -45,6 +56,7 @@ export interface Category {
   is_active: boolean;
   color: string | null;
   icon: string | null;
+  addon_group_ids?: string[];
   children?: Category[];
   products?: Product[];
 }
@@ -60,18 +72,40 @@ export interface LoyaltyLedger {
   created_at: string;
 }
 
+export interface ProductVariant {
+  id: string;
+  product_id: string;
+  name: string;
+  sku: string | null;
+  barcode: string | null;
+  price: number;
+  online_price: number | null;
+  cost_price: number | null;
+  track_inventory: boolean;
+  stock_quantity: number;
+  low_stock_threshold: number | null;
+  inventory_product_id: string | null;
+  inventory_deduction_quantity: number | null;
+  /** Portions of the product's own ingredient recipe this variant consumes. */
+  recipe_multiplier: number;
+  is_active: boolean;
+  sort_order: number;
+}
+
 export interface Product {
   id: string;
   category_id: string | null;
   name: string;
   sku: string | null;
   barcode: string | null;
-  sale_unit: 'each' | 'kg' | 'g' | 'lb';
+  sale_unit: 'each' | 'kg' | 'g' | 'lb' | 'ml' | 'cl' | 'l' | 'fl oz' | 'oz';
   allow_fractional_quantity: boolean;
   weight_precision: number;
+  inventory_product_id?: string | null;
+  inventory_deduction_quantity?: number | null;
   description: string | null;
   price: number;
-  cost_price: number | null;
+  cost: number | null;
   cb_percent?: number | null;
   tax_type: 'none' | 'inclusive' | 'exclusive';
   tax_rate: number;
@@ -85,11 +119,13 @@ export interface Product {
   has_image: boolean;
   updated_at: string;
   tags: string[] | null;
-  variants: Record<string, unknown>[] | null;
+  dietary_tags?: string[] | null;
+  variants?: ProductVariant[] | null;
   modifiers: Record<string, unknown>[] | null;
   sort_order: number;
   category?: Category;
   addon_groups?: AddonGroup[];
+  addon_group_ids?: string[];
 }
 
 export interface AddonGroup {
@@ -111,8 +147,15 @@ export interface Addon {
   name: string;
   price: number;
   quantity?: number;
+  // Always emitted by the addon serializer: never null, never absent.
+  track_inventory: boolean;
+  stock_quantity: number;
+  low_stock_threshold: number;
   is_active: boolean;
   sort_order: number;
+  tax_category_id?: string | null;
+  tax_behavior?: Product['tax_behavior'];
+  inherit_parent_tax_category?: boolean;
 }
 
 export interface Table {
@@ -129,7 +172,7 @@ export interface Table {
   activeOrder?: Order | null;
   current_order?: Order | null;
   seated_at?: string | null;
-  reservation_customer_id?: number | null;
+  reservation_customer_id?: string | null;
   reservation_customer_name?: string | null;
   reservation_customer_phone?: string | null;
 }
@@ -150,6 +193,7 @@ export interface Customer {
   favourite_dishes?: string[] | null;
   tag_counts?: Record<string, number> | null;
   address?: string | null;
+  notes?: string | null;
 }
 
 export interface Order {
@@ -158,6 +202,14 @@ export interface Order {
   token_number?: number | null;
   table_id: string | null;
   customer_id: number | string | null;
+  /** Address confirmed for this delivery; printed in full on the courier slip. */
+  delivery_address?: string | null;
+  /** Method the courier expects to collect; null is unknown. Not a payment record. */
+  expected_payment_method?: string | null;
+  /** Historical configured-method identity; null for built-ins, sentinels, and legacy orders. */
+  expected_payment_method_id?: number | null;
+  /** Courier-only note, printed on the delivery slip. */
+  delivery_note?: string | null;
   type: 'dine_in' | 'takeaway' | 'delivery' | 'online';
   status: 'pending' | 'preparing' | 'ready' | 'served' | 'completed' | 'cancelled';
   subtotal: number;
@@ -167,6 +219,7 @@ export interface Order {
   packaging_charge?: number;
   /** Server-validated explicit per-order amount; Settings only configures tax treatment. */
   service_charge: number;
+  charges_breakdown?: string | null;
   round_off?: number;
   tax_breakdown?: { title: string; rate: number; amount: number }[] | null;
   tax_snapshot?: TaxSnapshot[] | TaxSnapshot | null;
@@ -177,11 +230,20 @@ export interface Order {
   external_order_id?: string | null;
   created_by: number;
   created_at: string;
+  scheduled_for?: string | null;
+  release_status?: 'scheduled' | 'released' | 'blocked';
+  released_at?: string | null;
+  release_blocked_reason?: string | null;
+  checkout_stage?: 'building' | 'awaiting_payment' | 'paid';
+  dispatch_policy?: 'immediate' | 'on_payment';
+  cancelled_at?: string | null;
+  cancellation_reason?: string | null;
   items?: OrderItem[];
   table?: Table;
   customer?: Customer;
   bill?: Bill;
   bills?: Bill[];
+  whatsapp_receipt_status?: 'sent' | 'partial' | 'pending' | 'failed' | null;
 }
 
 export interface OrderItem {
@@ -190,6 +252,8 @@ export interface OrderItem {
   product_id: string;
   product_name: string;
   product_sku: string | null;
+  variant_id?: string | null;
+  variant_selection?: { id: string; name: string; price: number; sku?: string | null } | null;
   unit_price: number;
   quantity: number;
   subtotal: number;
@@ -200,6 +264,11 @@ export interface OrderItem {
   addons: { id?: number | string | null; name: string; price?: number; quantity?: number }[] | null;
   special_instructions: string | null;
   status: 'pending' | 'preparing' | 'ready' | 'served' | 'cancelled' | 'voided' | 'void_adjustment';
+  superseded?: boolean;
+  edit_version?: number;
+  price_overridden?: number | boolean;
+  original_unit_price?: number | null;
+  price_override_reason?: string | null;
 }
 
 export interface Bill {
@@ -220,10 +289,33 @@ export interface Bill {
   total: number;
   paid_amount: number;
   balance: number;
-  payment_status: 'unpaid' | 'partial' | 'paid' | 'refunded' | 'partially_refunded';
-  payment_details: { method: string; payment_method_id?: number; amount: number; timestamp: string }[] | null;
+  payment_status:
+    | 'unpaid'
+    | 'partial'
+    | 'partially_paid'
+    | 'paid'
+    | 'refunded'
+    | 'partially_refunded';
+  payment_details:
+    | {
+        method: string;
+        payment_method_id?: number;
+        amount: number;
+        timestamp: string;
+        tendered_amount?: number;
+        change_amount?: number;
+        transaction_id?: string;
+      }[]
+    | null;
+  payment_method_correction?: {
+    correctable: boolean;
+    reason: string | null;
+    lines: Array<{ index: number; correctable: boolean; reason: string | null }>;
+  };
   split_group_id?: string | null;
   split_label?: string | null;
+  /** Itemised unified engine charges; null on bills created before the engine. */
+  charges_breakdown?: string | null;
   tax_breakdown?: { title: string; rate: number; amount: number }[] | null;
   tax_snapshot?: TaxSnapshot[] | TaxSnapshot | null;
   order?: Order;
@@ -271,6 +363,99 @@ export interface KitchenStation {
   sort_order: number;
 }
 
+// ── Expenses ─────────────────────────────────────────────────────────────────
+// Mirrors main/services/expenses.ts. Amounts are integer minor units in each
+// record's own currency_code; the UI never converts between currencies.
+
+export type ExpenseStatus = 'active' | 'voided' | 'replaced';
+export type ExpenseStatusFilter = ExpenseStatus | 'all';
+export type ExpensePaymentMethod = 'cash' | 'card' | 'bank_transfer' | 'other';
+
+export interface ExpenseCategory {
+  id: string;
+  name: string;
+  is_active: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ExpenseRecord {
+  id: string;
+  category_id: string;
+  category_name: string;
+  description: string;
+  payee: string | null;
+  notes: string | null;
+  amount_minor: number | null;
+  currency_code: string;
+  incurred_on: string;
+  created_by: string;
+  created_at: string;
+  replaces_expense_id: string | null;
+  voided_at: string | null;
+  voided_by: string | null;
+  void_reason: string | null;
+  status: ExpenseStatus;
+  paid_minor: number;
+  due_minor: number | null;
+}
+
+export interface ExpensePaymentRecord {
+  id: string;
+  expense_id: string;
+  amount_minor: number;
+  method: ExpensePaymentMethod;
+  business_date: string;
+  reversal_of: string | null;
+  reason: string | null;
+  reference: string | null;
+  cash_movement_id: number | null;
+  created_by: string;
+  created_at: string;
+}
+
+export interface ExpenseSummaryGroup {
+  currency_code: string;
+  category_id: string;
+  category_name: string;
+  expense_count: number;
+  incurred_minor: number;
+  net_paid_minor: number;
+  due_minor: number;
+}
+
+export interface ExpenseSummaryTotals {
+  currency_code: string;
+  expense_count: number;
+  incurred_minor: number;
+  net_paid_minor: number;
+  due_minor: number;
+}
+
+export interface ExpenseSummary {
+  basis: 'active_expenses_incurred_in_range_paid_to_date';
+  filters: {
+    from: string | null;
+    to: string | null;
+    category_id: string | null;
+    currency_code: string | null;
+    status: 'active';
+  };
+  groups: ExpenseSummaryGroup[];
+  totals: ExpenseSummaryTotals[];
+}
+
+export interface ExpenseContext {
+  currency_code: string;
+  business_date: string;
+  cash_session_open: boolean;
+}
+
+export interface ExpenseDetail extends ExpenseRecord {
+  payments: ExpensePaymentRecord[];
+  paymentsNextCursor: string | null;
+}
+
 // Cart types for POS
 export interface CartItem {
   id: string;
@@ -278,4 +463,17 @@ export interface CartItem {
   quantity: number;
   addons: Addon[];
   special_instructions: string;
+  variant?: ProductVariant | null;
+  /** Owner-set selling price for this line, sent to the server when the order is placed. */
+  price_override?: { price: number; reason: string } | null;
+}
+
+export interface Counter {
+  id: string;
+  name: string;
+  role: 'ordering' | 'payment' | 'combined';
+  is_active: number | boolean;
+  sort_order: number;
+  created_at?: string;
+  updated_at?: string;
 }

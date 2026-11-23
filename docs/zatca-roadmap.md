@@ -61,12 +61,16 @@ Recheck the official pages before each phase; this is not tax advice.
   FloCafe's own migration 85 and later still run.
 - Earlier ZATCA fork history kept as local branch `archive/zatca-fork-3.9.0`.
 
-### 1. Catch up with FloCafe (3.9.0 → 3.13.x)
-- Merge upstream on an `update/flocafe-*` branch, following
-  [FACTORPOS_UPSTREAM_UPDATES.md](FACTORPOS_UPSTREAM_UPDATES.md).
-- Brings FloCafe's document-tax rounding fixes, delivery features and Excel
-  (`exceljs`) report exports, which the ZATCA work builds on.
-- Pilot test on one shop PC before the other shops.
+### 1. Catch up with FloCafe (3.9.0 → 3.14.0) — merged on branch, not released
+- Merged FloCafe 3.14.0 on branch `update/flocafe-3.14.0` (2026-11-24),
+  following [FACTORPOS_UPSTREAM_UPDATES.md](FACTORPOS_UPSTREAM_UPDATES.md).
+- Brings FloCafe's document-tax rounding fixes, delivery features, per-staff
+  cash sessions and Excel (`exceljs`) report exports (daily sales, daily
+  invoices, customer sales), which the ZATCA work builds on.
+- FloCafe now ships an Arabic translation (`ar`). FactorPOS keeps the UI picker
+  unchanged, but Arabic labels are available for the bilingual receipt (phase 7).
+- Still to do: pilot test on one shop PC (real printers, an upgrade of a real
+  v85 database copy) before the other shops.
 
 ### 2. Monthly VAT invoice report (Excel)
 Can ship before signing exists, because it reads paid bills and refunds.

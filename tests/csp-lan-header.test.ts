@@ -9,10 +9,12 @@ async function run() {
     }
   };
 
-  const makeReq = (host?: string) => ({ get: (name: string) => (name.toLowerCase() === 'host' ? host : undefined) } as any);
+  const makeReq = (host?: string) =>
+    ({ get: (name: string) => (name.toLowerCase() === 'host' ? host : undefined) }) as any;
 
   // The fixed directive block every policy shares.
-  const prefix = "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; ";
+  const prefix =
+    "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; ";
   const suffix = "; frame-ancestors 'none'";
   const expectedFor = (connectSrc: string) => `${prefix}connect-src ${connectSrc}${suffix}`;
 
@@ -62,6 +64,25 @@ async function run() {
     expectedFor("'self'"),
     'missing host must fall back to self only',
   );
+
+  // 7. Environment variables are not PostHog configuration. Without the settings rows,
+  // connect-src stays the page origin.
+  const previousToken = process.env.POSTHOG_PROJECT_TOKEN;
+  const previousHost = process.env.POSTHOG_HOST;
+  try {
+    process.env.POSTHOG_PROJECT_TOKEN = 'phc_test';
+    process.env.POSTHOG_HOST = 'https://us.i.posthog.com/e/?x=1';
+    assertEqual(
+      buildCspHeader(makeReq('localhost:3001')),
+      expectedFor("'self' http://localhost:3001 ws://localhost:3001 wss://localhost:3001"),
+      'environment variables do not add a PostHog origin',
+    );
+  } finally {
+    if (previousToken === undefined) delete process.env.POSTHOG_PROJECT_TOKEN;
+    else process.env.POSTHOG_PROJECT_TOKEN = previousToken;
+    if (previousHost === undefined) delete process.env.POSTHOG_HOST;
+    else process.env.POSTHOG_HOST = previousHost;
+  }
 
   console.log('✅ All dynamic CSP header tests passed!');
 }

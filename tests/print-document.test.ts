@@ -22,6 +22,9 @@ import {
   bilingualLabel,
   directionalText,
   getBlock,
+  optionalPaymentAmount,
+  paymentDisplayRows,
+  projectCashTender,
   type PrintContext,
   type PrintData,
 } from '../shared/print';
@@ -32,6 +35,8 @@ import {
   renderBillDocumentToClassicLines,
 } from '../main/printers/document-classic';
 import { renderBillDocumentToCompactLines } from '../main/printers/document-compact';
+import { receiptDocumentLines } from '../main/printers/thermal';
+import { GENERIC_THERMAL_CAPABILITIES } from '../shared/print/thermal-capabilities';
 import { buildParityFixtures } from './print-parity.test';
 
 // ---------------------------------------------------------------------------
@@ -58,11 +63,13 @@ function makeContext(overrides: Partial<PrintContext> = {}): PrintContext {
   };
 }
 
-function makePrintData(overrides: {
-  bill?: Partial<PrintData['bill']>;
-  business?: Partial<PrintData['business']>;
-  isReprint?: boolean;
-} = {}): PrintData {
+function makePrintData(
+  overrides: {
+    bill?: Partial<PrintData['bill']>;
+    business?: Partial<PrintData['business']>;
+    isReprint?: boolean;
+  } = {},
+): PrintData {
   const { order, bill, business } = buildParityFixtures();
   const base = buildBillPrintData(order, bill, business, overrides.isReprint ?? false);
   return {
@@ -72,7 +79,10 @@ function makePrintData(overrides: {
   };
 }
 
-function blockOf(document: ReturnType<typeof buildBillDocument>, kind: Parameters<typeof getBlock>[1]) {
+function blockOf(
+  document: ReturnType<typeof buildBillDocument>,
+  kind: Parameters<typeof getBlock>[1],
+) {
   const block = getBlock(document, kind);
   assert(block, `document carries a ${kind} block`);
   return block;
@@ -95,7 +105,16 @@ console.log('\n▶ Block construction (fixture bill)');
   assert.equal(document.version, 1, 'document version is 1');
   assert.deepEqual(
     document.blocks.map((block) => block.kind),
-    ['business-header', 'customer', 'document-meta', 'item-table', 'totals', 'tax-breakdown', 'payments', 'message'],
+    [
+      'business-header',
+      'customer',
+      'document-meta',
+      'item-table',
+      'totals',
+      'tax-breakdown',
+      'payments',
+      'message',
+    ],
     'canonical block order',
   );
   ok('canonical ordered blocks');
@@ -113,21 +132,29 @@ console.log('\n▶ Block construction (fixture bill)');
   assert.equal(meta.timestamp.text, '2026-08-21 18:42:00');
   assert.equal(meta.table?.name.text, '4');
   assert.equal(meta.table?.label.conceptId, 'pos.tableLabel');
-  assert.equal(meta.title.conceptId, 'print.invoiceTitle', 'zero-tax bill resolves the plain invoice title');
+  assert.equal(
+    meta.title.conceptId,
+    'print.invoiceTitle',
+    'zero-tax bill resolves the plain invoice title',
+  );
   ok('document meta block carries invoice identity');
 
-  const taxed = buildBillDocument(
-    makePrintData({ bill: { taxAmount: 90 } }),
-    makeContext(),
+  const taxed = buildBillDocument(makePrintData({ bill: { taxAmount: 90 } }), makeContext());
+  assert.equal(
+    blockOf(taxed, 'document-meta').title.conceptId,
+    'print.taxInvoiceTitle',
+    'tax-applicable bill resolves the tax invoice title',
   );
-  assert.equal(blockOf(taxed, 'document-meta').title.conceptId, 'print.taxInvoiceTitle', 'tax-applicable bill resolves the tax invoice title');
 
   const items = blockOf(document, 'item-table');
   assert.equal(items.rows.length, 3);
   assert.equal(items.rows[0].name.text, 'Espresso Doppio');
   assert.equal(items.rows[0].quantity, 2);
   assert.equal(items.rows[0].amount, 500);
-  assert.deepEqual(items.rows[0].addons.map((addon) => addon.name.text), ['Oat milk']);
+  assert.deepEqual(
+    items.rows[0].addons.map((addon) => addon.name.text),
+    ['Oat milk'],
+  );
   assert.equal(items.rows[0].specialInstructions?.text, 'Less sugar');
   assert.equal(items.rows[1].name.text, PERSIAN_ITEM);
   assert.equal(items.rows[2].addons[0].price, 0, 'unpriced addon keeps price 0');
@@ -137,14 +164,25 @@ console.log('\n▶ Block construction (fixture bill)');
   const totals = blockOf(document, 'totals');
   assert.equal(totals.subtotal.amount, 1220);
   assert.equal(totals.discount?.amount, 120);
-  assert.equal(totals.serviceCharge, null, 'backend fixture does not invent a service-charge bill field');
+  assert.equal(
+    totals.serviceCharge,
+    null,
+    'backend fixture does not invent a service-charge bill field',
+  );
   assert.equal(totals.deliveryCharge?.amount, 8);
   assert.equal(totals.packagingCharge?.amount, 9);
   assert.equal(totals.grandTotal.amount, 1117);
   assert.equal(totals.tax, null, 'no flat tax line when tax amount is zero');
-  assert.equal(blockOf(document, 'tax-breakdown').lines.length, 0, 'no breakdown lines when merchant hides them');
+  assert.equal(
+    blockOf(document, 'tax-breakdown').lines.length,
+    0,
+    'no breakdown lines when merchant hides them',
+  );
   const payments = blockOf(document, 'payments');
-  assert.deepEqual(payments.lines.map((line) => line.method), ['cash', 'card']);
+  assert.deepEqual(
+    payments.lines.map((line) => line.method),
+    ['cash', 'card'],
+  );
   assert.equal(payments.lines[0].label.conceptId, 'pos.methodCash');
   ok('totals/payments blocks copy printed truth verbatim');
 
@@ -153,13 +191,30 @@ console.log('\n▶ Block construction (fixture bill)');
     makeContext(),
   );
   const serviceTotals = blockOf(serviceDocument, 'totals');
-  assert.equal(serviceTotals.serviceCharge?.amount, 12, 'server-persisted service charge is rendered once');
-  assert.equal(serviceTotals.grandTotal.amount, 1129, 'receipt uses the authoritative total alongside service charge');
+  assert.equal(
+    serviceTotals.serviceCharge?.amount,
+    12,
+    'server-persisted service charge is rendered once',
+  );
+  assert.equal(
+    serviceTotals.grandTotal.amount,
+    1129,
+    'receipt uses the authoritative total alongside service charge',
+  );
   ok('service charge is present on the shared receipt surface when persisted');
 
   const { order, bill, business } = buildParityFixtures();
-  const serviceData = buildBillPrintData(order, { ...bill, service_charge: 12, total: 1129 }, business, false);
-  assert.equal(serviceData.bill.serviceCharge, 12, 'persisted service charge crosses the backend normalization boundary');
+  const serviceData = buildBillPrintData(
+    order,
+    { ...bill, service_charge: 12, total: 1129 },
+    business,
+    false,
+  );
+  assert.equal(
+    serviceData.bill.serviceCharge,
+    12,
+    'persisted service charge crosses the backend normalization boundary',
+  );
   const serviceContext = buildBillPrintContext({ columns: 42, language: 'en', business });
   const persistedServiceDocument = buildBillDocument(serviceData, serviceContext);
   const serviceOptions = {
@@ -176,11 +231,17 @@ console.log('\n▶ Block construction (fixture bill)');
     ['classic', renderBillDocumentToClassicLines(persistedServiceDocument, serviceOptions)],
     ['compact', renderBillDocumentToCompactLines(persistedServiceDocument, serviceOptions)],
   ] as const) {
-    assert(lines.some((line) => line.includes('Service Charge') && line.includes('₹12.00')),
-      `${renderer} renders the persisted service charge`);
+    assert(
+      lines.some((line) => line.includes('Service Charge') && line.includes('₹12.00')),
+      `${renderer} renders the persisted service charge`,
+    );
   }
 
-  assert.equal(blockOf(document, 'message').reprintBanner, null, 'no reprint banner on first print');
+  assert.equal(
+    blockOf(document, 'message').reprintBanner,
+    null,
+    'no reprint banner on first print',
+  );
 }
 
 console.log('\n▶ Show-flag and tax-presence decisions');
@@ -199,7 +260,10 @@ console.log('\n▶ Show-flag and tax-presence decisions');
     makePrintData({ bill: { taxAmount: 0, taxComponents: [] }, business: { showTaxId: 'force' } }),
     makeContext(),
   );
-  assert(blockOf(forced, 'business-header').taxId, 'showTaxId force keeps the line even without tax');
+  assert(
+    blockOf(forced, 'business-header').taxId,
+    'showTaxId force keeps the line even without tax',
+  );
 
   const breakdown = buildBillDocument(
     makePrintData({
@@ -216,8 +280,16 @@ console.log('\n▶ Show-flag and tax-presence decisions');
     makeContext(),
   );
   const breakdownBlock = blockOf(breakdown, 'tax-breakdown');
-  assert.deepEqual(breakdownBlock.lines.map((line) => line.label.primary), ['GST', 'VAT'], 'zero-amount components filtered');
-  assert.equal(blockOf(breakdown, 'totals').tax, null, 'flat tax line suppressed when breakdown shown');
+  assert.deepEqual(
+    breakdownBlock.lines.map((line) => line.label.primary),
+    ['GST', 'VAT'],
+    'zero-amount components filtered',
+  );
+  assert.equal(
+    blockOf(breakdown, 'totals').tax,
+    null,
+    'flat tax line suppressed when breakdown shown',
+  );
 
   const chargedBreakdown = buildBillDocument(
     makePrintData({
@@ -249,8 +321,13 @@ console.log('\n▶ Show-flag and tax-presence decisions');
     const deliveryIndex = lines.findIndex((line) => line.includes('pos.delivery[en]'));
     const packagingIndex = lines.findIndex((line) => line.includes('pos.packaging[en]'));
     const totalIndex = lines.findIndex((line) => line.includes('print.grandTotal[en]'));
-    assert(taxIndex >= 0 && taxIndex < deliveryIndex && deliveryIndex < packagingIndex && packagingIndex < totalIndex,
-      `${renderer} places tax breakdown before charges and grand total`);
+    assert(
+      taxIndex >= 0 &&
+        taxIndex < deliveryIndex &&
+        deliveryIndex < packagingIndex &&
+        packagingIndex < totalIndex,
+      `${renderer} places tax breakdown before charges and grand total`,
+    );
   }
   ok('tax breakdown vs flat tax line decision');
 
@@ -261,7 +338,11 @@ console.log('\n▶ Show-flag and tax-presence decisions');
     }),
     makeContext(),
   );
-  assert.equal(blockOf(noBreakdown, 'totals').tax?.amount, 90, 'flat tax line present when breakdown hidden');
+  assert.equal(
+    blockOf(noBreakdown, 'totals').tax?.amount,
+    90,
+    'flat tax line present when breakdown hidden',
+  );
 }
 
 console.log('\n▶ Printed truth is never recomputed');
@@ -283,9 +364,12 @@ console.log('\n▶ Printed truth is never recomputed');
 
 console.log('\n▶ Bilingual label resolution into TotalsBlock');
 {
-  const document = buildBillDocument(makePrintData(), makeContext({
-    languages: ['en', 'fa'],
-  }));
+  const document = buildBillDocument(
+    makePrintData(),
+    makeContext({
+      languages: ['en', 'fa'],
+    }),
+  );
   const totals = blockOf(document, 'totals');
   assert.equal(totals.subtotal.label.primary, 'pos.subtotal[en]');
   assert.equal(totals.subtotal.label.secondary, 'pos.subtotal[fa]');
@@ -315,7 +399,11 @@ console.log('\n▶ Bilingual label resolution into TotalsBlock');
 
   const single = buildBillDocument(makePrintData(), makeContext({ languages: ['en'] }));
   const singleTotals = blockOf(single, 'totals');
-  assert.equal(singleTotals.subtotal.label.secondary, undefined, 'single-language documents carry no secondary');
+  assert.equal(
+    singleTotals.subtotal.label.secondary,
+    undefined,
+    'single-language documents carry no secondary',
+  );
   ok('secondary absent for single-language documents');
 
   const explicit = bilingualLabel({ primary: 'Total', secondary: 'مجموع' }, 'print.grandTotal');
@@ -343,7 +431,11 @@ console.log('\n▶ Direction annotations (fa primary → RTL base, LTR islands)'
   assert.equal(document.direction.base, 'rtl');
   assert.equal(document.direction.document, 'rtl');
   for (const block of document.blocks) {
-    assert.equal((block as { direction: string }).direction, 'rtl', `${block.kind} carries rtl direction`);
+    assert.equal(
+      (block as { direction: string }).direction,
+      'rtl',
+      `${block.kind} carries rtl direction`,
+    );
   }
   ok('every block carries the rtl base direction');
 
@@ -356,14 +448,24 @@ console.log('\n▶ Direction annotations (fa primary → RTL base, LTR islands)'
 
   const items = blockOf(document, 'item-table');
   assert.equal(items.rows[1].name.direction, 'rtl', 'Persian item name follows base direction');
-  assert.equal(items.rows[0].name.direction, 'rtl', 'digitless latin item name follows base direction');
+  assert.equal(
+    items.rows[0].name.direction,
+    'rtl',
+    'digitless latin item name follows base direction',
+  );
   ok('item names annotated per direction kernel');
 
-  const ltrDoc = buildBillDocument(makePrintData(), makeContext({ languages: ['en'], baseDirection: 'ltr' }));
+  const ltrDoc = buildBillDocument(
+    makePrintData(),
+    makeContext({ languages: ['en'], baseDirection: 'ltr' }),
+  );
   assert.equal(blockOf(ltrDoc, 'document-meta').invoiceNumber.direction, 'ltr');
   ok('ltr base keeps values ltr');
 
-  assert.deepEqual(directionalText('ORD-2026-001', 'rtl'), { text: 'ORD-2026-001', direction: 'ltr' });
+  assert.deepEqual(directionalText('ORD-2026-001', 'rtl'), {
+    text: 'ORD-2026-001',
+    direction: 'ltr',
+  });
   ok('directionalText helper annotates islands');
 }
 
@@ -376,16 +478,28 @@ console.log('\n▶ Backend PrintData normalization (main layer)');
   const { order, bill, business } = buildParityFixtures();
   const rawBill = { ...bill, payment_details: JSON.stringify(bill.payment_details) };
   const printData = buildBillPrintData(order, rawBill, business, false);
-  assert.deepEqual(printData.bill.payments, [{ method: 'cash', amount: 600 }, { method: 'card', amount: 517 }]);
+  assert.deepEqual(printData.bill.payments, [
+    { method: 'cash', amount: 600 },
+    { method: 'card', amount: 517 },
+  ]);
   assert.equal(printData.bill.pointsEarned, 0);
   assert.equal(printData.business.showTaxId, 'force', 'fixture show_tax_id true maps to force');
-  const unsetFlags = buildBillPrintData(order, rawBill, { ...business, show_tax_id: undefined }, false);
+  const unsetFlags = buildBillPrintData(
+    order,
+    rawBill,
+    { ...business, show_tax_id: undefined },
+    false,
+  );
   assert.equal(unsetFlags.business.showTaxId, 'auto', 'unset show_tax_id maps to auto');
   ok('payment_details JSON string parsed; flags mapped');
 
   assert.equal(detectPrintLanguageDirection('en'), 'ltr');
   assert.equal(detectPrintLanguageDirection('fa'), 'rtl', 'fa labels carry RTL script');
-  assert.equal(detectPrintLanguageDirection('unknown-lang'), 'ltr', 'unregistered languages default ltr');
+  assert.equal(
+    detectPrintLanguageDirection('unknown-lang'),
+    'ltr',
+    'unregistered languages default ltr',
+  );
   ok('registry-derived language directions');
 
   const context = buildBillPrintContext({ columns: 48, language: 'en', business });
@@ -397,6 +511,375 @@ console.log('\n▶ Backend PrintData normalization (main layer)');
   assert.equal(context.trimDecimals, false);
   assert.equal(context.baseDirection, 'ltr');
   ok('print context derived from business snapshot');
+}
+
+// ---------------------------------------------------------------------------
+// 4a. Delivery customer-details block
+// ---------------------------------------------------------------------------
+
+console.log('\n▶ Delivery customer details (address present / absent)');
+{
+  const DELIVERY_ADDRESS = 'Flat 4B, 123A-Anecacuilco 04330, Colonia Naucalpan';
+
+  const withAddress = (deliveryAddress: string) => {
+    const { order, bill, business } = buildParityFixtures();
+    const deliveryOrder = { ...order, type: 'delivery', delivery_address: deliveryAddress };
+    const printData = buildBillPrintData(
+      deliveryOrder,
+      { ...bill, order: deliveryOrder },
+      {
+        ...business,
+        customer_name: 'Asha Kumar',
+        customer_phone: '+91 98765 43210',
+      },
+      false,
+    );
+    return buildBillDocument(printData, makeContext());
+  };
+
+  // Present: the order's own address, under a heading that names the block as
+  // the customer's, so it cannot read as a second business address.
+  const delivery = blockOf(withAddress(DELIVERY_ADDRESS), 'customer');
+  assert.equal(
+    delivery.address?.text,
+    DELIVERY_ADDRESS,
+    'the block carries the order delivery address',
+  );
+  assert.equal(delivery.heading?.conceptId, 'print.customerDetails', 'a delivery block is headed');
+  assert.equal(
+    delivery.addressLabel.conceptId,
+    'print.deliverySlip.address',
+    'the address line is labelled',
+  );
+  assert.equal(delivery.name?.text, 'Asha Kumar', 'the name stays in the same block');
+  assert.equal(
+    delivery.phone?.text,
+    '+91 98765 43210',
+    'the customer number stays in the same block',
+  );
+  ok('delivery order: address, heading and labels all land in one customer block');
+
+  // Absent: nothing about the delivery section changes the existing output.
+  const inStore = blockOf(withAddress(''), 'customer');
+  assert.equal(inStore.address, null, 'no address without a delivery address');
+  assert.equal(inStore.heading, null, 'no heading without a delivery address');
+  ok('no delivery address: no address and no heading');
+
+  // A whitespace-only address is no address.
+  assert.equal(
+    blockOf(withAddress('   '), 'customer').address,
+    null,
+    'a blank address is not an address',
+  );
+  ok('blank delivery address is treated as absent');
+
+  // Rendered lines: the heading precedes the address, on both backend layouts.
+  const deliveryLines = renderBillDocumentToClassicLines(withAddress(DELIVERY_ADDRESS), {
+    columns: 42,
+    language: 'en',
+    locale: 'en-IN',
+    currency: 'INR',
+    currencySymbol: '₹',
+    trimDecimals: false,
+    useUnicode: false,
+    arabicShaping: false,
+    cutMode: 'full',
+  });
+  const headingAt = deliveryLines.findIndex((line) => line.includes('print.customerDetails[en]'));
+  const addressAt = deliveryLines.findIndex((line) =>
+    line.includes('print.deliverySlip.address[en]'),
+  );
+  assert.ok(headingAt > 0, 'the classic layout renders the heading');
+  assert.ok(addressAt > headingAt, 'the heading comes before the address it labels');
+  ok('classic layout: heading, then the labelled address');
+
+  const compactLines = renderBillDocumentToCompactLines(withAddress(DELIVERY_ADDRESS), {
+    columns: 42,
+    language: 'en',
+    locale: 'en-IN',
+    currency: 'INR',
+    currencySymbol: '₹',
+    trimDecimals: false,
+    useUnicode: false,
+    arabicShaping: false,
+    cutMode: 'full',
+  });
+  assert.ok(
+    compactLines.findIndex((line) => line.includes('print.customerDetails[en]')) > 0,
+    'the compact layout renders the heading',
+  );
+  assert.ok(
+    compactLines.some((line) => line.includes('print.deliverySlip.address[en]')),
+    'the compact layout renders the address',
+  );
+  ok('compact layout: heading and address');
+}
+
+// ---------------------------------------------------------------------------
+// 4b. Cash tendered & change projection (#770)
+// ---------------------------------------------------------------------------
+
+console.log('\n▶ Cash tendered and change projection');
+{
+  const { order, bill, business } = buildParityFixtures();
+  const rawBill = {
+    ...bill,
+    payment_details: JSON.stringify([
+      {
+        method: 'cash',
+        amount: 150,
+        requested_amount: 200,
+        tendered_amount: 200,
+        change_amount: 50,
+      },
+      { method: 'card', amount: 467, requested_amount: 467 },
+      { method: 'cash', amount: 10, tendered_amount: 'not-a-number' },
+    ]),
+  };
+  const printData = buildBillPrintData(order, rawBill, business, false);
+  assert.deepEqual(printData.bill.payments, [
+    { method: 'cash', amount: 150, tendered: 200, change: 50 },
+    { method: 'card', amount: 467 },
+    { method: 'cash', amount: 10 },
+  ]);
+  ok('backend normalizer preserves tendered/change and drops malformed optional amounts');
+
+  const context = buildBillPrintContext({ columns: 42, language: 'en', business });
+  const overpaidDocument = buildBillDocument(printData, context);
+  const payments = blockOf(overpaidDocument, 'payments');
+  assert.equal(
+    payments.lines[0].amount,
+    150,
+    'applied amount stays the authoritative payment amount',
+  );
+  assert.equal(payments.lines[0].tendered?.amount, 200);
+  assert.equal(payments.lines[0].tendered?.label.conceptId, 'receipt.cashReceived');
+  assert.equal(payments.lines[0].change?.amount, 50);
+  assert.equal(payments.lines[0].change?.label.conceptId, 'pos.changeReturned');
+  assert.equal(payments.lines[1].tendered, undefined, 'non-cash line exposes no tendered value');
+  assert.equal(payments.lines[1].change, undefined, 'non-cash line exposes no change value');
+  assert.equal(payments.lines[2].tendered, undefined, 'malformed tendered value exposes no row');
+  ok('overpaid cash line projects cash-received and change rows');
+
+  const nonCash = buildBillDocument(
+    makePrintData({
+      bill: { payments: [{ method: 'card', amount: 150, tendered: 200, change: 50 }] },
+    }),
+    makeContext(),
+  );
+  assert.deepEqual(
+    paymentDisplayRows(blockOf(nonCash, 'payments').lines[0]).map((row) => row.amount),
+    [150],
+    'non-cash payments never expose tender or change rows',
+  );
+  ok('non-cash payments do not project tender or change rows');
+
+  assert.deepEqual(
+    paymentDisplayRows(payments.lines[0]).map((row) => [row.label.primary, row.amount]),
+    [
+      ['Cash', 150],
+      ['Cash Received', 200],
+      ['Change Returned', 50],
+    ],
+  );
+  ok('payment rows print applied amount first, then cash received, then change');
+
+  const bilingualPayments = blockOf(
+    buildBillDocument(printData, makeContext({ languages: ['fa', 'en'], baseDirection: 'rtl' })),
+    'payments',
+  );
+  assert.deepEqual(
+    {
+      tendered: bilingualPayments.lines[0].tendered?.label,
+      change: bilingualPayments.lines[0].change?.label,
+    },
+    {
+      tendered: {
+        conceptId: 'receipt.cashReceived',
+        primary: 'receipt.cashReceived[fa]',
+        secondary: 'receipt.cashReceived[en]',
+      },
+      change: {
+        conceptId: 'pos.changeReturned',
+        primary: 'pos.changeReturned[fa]',
+        secondary: 'pos.changeReturned[en]',
+      },
+    },
+  );
+  ok('cash rows preserve bilingual semantic labels and RTL block direction');
+
+  const renderOptions = {
+    columns: 42,
+    language: 'en',
+    locale: context.locale,
+    currency: context.currency,
+    currencySymbol: '₹',
+    trimDecimals: false,
+    useUnicode: true,
+    arabicShaping: false,
+    cutMode: 'full' as const,
+  };
+  for (const [renderer, lines] of [
+    ['classic', renderBillDocumentToClassicLines(overpaidDocument, renderOptions)],
+    ['compact', renderBillDocumentToCompactLines(overpaidDocument, renderOptions)],
+  ] as const) {
+    assert(
+      lines.some((line) => line.includes('Cash') && line.includes('₹150.00')),
+      `${renderer} keeps the applied cash row`,
+    );
+    assert(
+      lines.some((line) => line.includes('Cash Received') && line.includes('₹200.00')),
+      `${renderer} renders the cash received row`,
+    );
+    assert(
+      lines.some((line) => line.includes('Change Returned') && line.includes('₹50.00')),
+      `${renderer} renders the change row`,
+    );
+  }
+  ok('classic and compact render the tendered/change rows');
+
+  const zeroDecimalContext = makeContext({ locale: 'ja-JP', currency: 'JPY', currencySymbol: '¥' });
+  const zeroDecimalDocument = buildBillDocument(
+    makePrintData({
+      bill: { payments: [{ method: 'cash', amount: 150, tendered: 200, change: 50 }] },
+    }),
+    zeroDecimalContext,
+  );
+  const zeroDecimalOptions = {
+    ...renderOptions,
+    locale: zeroDecimalContext.locale,
+    currency: zeroDecimalContext.currency,
+    currencySymbol: zeroDecimalContext.currencySymbol,
+  };
+  for (const [renderer, lines] of [
+    ['classic', renderBillDocumentToClassicLines(zeroDecimalDocument, zeroDecimalOptions)],
+    ['compact', renderBillDocumentToCompactLines(zeroDecimalDocument, zeroDecimalOptions)],
+  ] as const) {
+    for (const amount of ['¥150', '¥200', '¥50']) {
+      assert(
+        lines.some((line) => line.includes(amount)),
+        `${renderer} preserves the JPY zero-decimal amount ${amount}`,
+      );
+    }
+    assert(
+      !lines.some((line) => /¥(?:150|200|50)\.00/.test(line)),
+      `${renderer} does not add decimal digits to JPY cash rows`,
+    );
+  }
+  ok('cash rows follow zero-decimal currency formatting');
+
+  const exact = buildBillDocument(
+    makePrintData({
+      bill: { payments: [{ method: 'cash', amount: 150, tendered: 150, change: 0 }] },
+    }),
+    makeContext(),
+  );
+  assert.deepEqual(
+    paymentDisplayRows(blockOf(exact, 'payments').lines[0]).map((row) => row.amount),
+    [150],
+  );
+  ok('exact cash payment prints no tendered or change row');
+
+  const legacy = buildBillDocument(
+    makePrintData({ bill: { payments: [{ method: 'cash', amount: 150 }] } }),
+    makeContext(),
+  );
+  assert.equal(blockOf(legacy, 'payments').lines[0].tendered, undefined);
+  assert.equal(blockOf(legacy, 'payments').lines[0].change, undefined);
+  ok('legacy payments without optional fields keep their current output');
+
+  const fallback = buildBillDocument(
+    makePrintData({ bill: { payments: [{ method: 'cash', amount: 150, change: 50 }] } }),
+    makeContext(),
+  );
+  assert.deepEqual(
+    paymentDisplayRows(blockOf(fallback, 'payments').lines[0]).map((row) => row.amount),
+    [150, 150, 50],
+    'a positive change without tendered data falls back to applied cash',
+  );
+  ok('missing tendered data falls back to applied cash');
+
+  assert.equal(
+    projectCashTender({ method: 'cash', amount: 150, tendered: 200, change: 50 })?.tendered,
+    200,
+  );
+  assert.equal(
+    projectCashTender({ method: 'cash', amount: 150, tendered: 200, change: 0 })?.change,
+    0,
+    'over-tender with no persisted change still projects the tendered row',
+  );
+  assert.equal(projectCashTender({ method: 'cash', amount: 150, tendered: 150, change: 0 }), null);
+  assert.equal(projectCashTender({ method: 'cash', amount: 150 }), null);
+  assert.equal(projectCashTender({ method: 'card', amount: 150, tendered: 200, change: 50 }), null);
+  assert.equal(optionalPaymentAmount(undefined), undefined);
+  assert.equal(optionalPaymentAmount(null), undefined);
+  assert.equal(optionalPaymentAmount(''), undefined);
+  assert.equal(optionalPaymentAmount('   '), undefined);
+  assert.equal(optionalPaymentAmount(false), undefined);
+  assert.equal(optionalPaymentAmount([]), undefined);
+  assert.equal(optionalPaymentAmount('200'), 200);
+  assert.equal(optionalPaymentAmount('abc'), undefined);
+  ok('projection and optional-amount coercion reject absent or malformed values');
+}
+
+console.log('\n▶ Customer phone unmasked on document render path (#1035)');
+{
+  const { order, bill, business } = buildParityFixtures();
+  const rawBusiness = {
+    ...business,
+    customer_phone: '+1 555 123 4567',
+    show_customer_phone: true,
+  };
+  const unmaskedClassic = receiptDocumentLines(
+    order,
+    bill,
+    rawBusiness,
+    'classic',
+    42,
+    false,
+    false,
+    false,
+    'en',
+    undefined,
+    'full',
+    GENERIC_THERMAL_CAPABILITIES,
+  );
+  assert.ok(unmaskedClassic, 'classic thermal receipt uses document rendering');
+  assert.ok(
+    unmaskedClassic.lines.some((line) => line.includes('+1 555 123 4567')),
+    'classic receipt lines contain unmasked customer phone when maskCustomerPhone is false',
+  );
+  assert.ok(
+    !unmaskedClassic.lines.some((line) => line.includes('xxxxxxx')),
+    'classic receipt lines do not contain masked customer phone when maskCustomerPhone is false',
+  );
+
+  const unmaskedCompact = receiptDocumentLines(
+    order,
+    bill,
+    rawBusiness,
+    'compact',
+    42,
+    false,
+    false,
+    false,
+    'en',
+    undefined,
+    'full',
+    GENERIC_THERMAL_CAPABILITIES,
+  );
+  assert.ok(unmaskedCompact, 'compact thermal receipt uses document rendering');
+  assert.ok(
+    unmaskedCompact.lines.some((line) => line.includes('+1 555 123 4567')),
+    'compact receipt lines contain unmasked customer phone when maskCustomerPhone is false',
+  );
+  assert.ok(
+    !unmaskedCompact.lines.some((line) => line.includes('xxxxxxx')),
+    'compact receipt lines do not contain masked customer phone when maskCustomerPhone is false',
+  );
+  ok(
+    'customer phone stays unmasked across classic and compact document lines when maskCustomerPhone is false',
+  );
 }
 
 console.log('\n▶ Add-on quantity and charge financial parity');
@@ -411,16 +894,18 @@ console.log('\n▶ Add-on quantity and charge financial parity');
     const order = {
       order_number: 'ORD-ADDON-PARITY',
       created_at: '2026-08-21 18:42:00',
-      items: [{
-        product_name: 'Tea',
-        quantity: testCase.itemQuantity,
-        unit_price: 10,
-        total: 20,
-        addons: [
-          { name: 'Extra shot', price: testCase.addonPrice, quantity: testCase.addonQuantity },
-          { name: 'Vanilla syrup', price: 2, quantity: 2 },
-        ],
-      }],
+      items: [
+        {
+          product_name: 'Tea',
+          quantity: testCase.itemQuantity,
+          unit_price: 10,
+          total: 20,
+          addons: [
+            { name: 'Extra shot', price: testCase.addonPrice, quantity: testCase.addonQuantity },
+            { name: 'Vanilla syrup', price: 2, quantity: 2 },
+          ],
+        },
+      ],
     };
     const bill = {
       bill_number: 'INV-ADDON-PARITY',
@@ -435,11 +920,21 @@ console.log('\n▶ Add-on quantity and charge financial parity');
     const printData = buildBillPrintData(order, bill, business, false);
     assert.equal(printData.order.items[0].quantity, testCase.itemQuantity);
     assert.equal(printData.order.items[0].addons[0].quantity, testCase.addonQuantity);
-    assert.equal(printData.order.items[0].addons[0].price, testCase.expected,
-      `addon extension ${testCase.itemQuantity}x item × ${testCase.addonQuantity}x addon`);
-    assert.equal(printData.order.items[0].addons[1].price, testCase.itemQuantity * 2 * 2,
-      'multiple add-ons retain independent extensions');
-    assert.equal(printData.bill.serviceCharge, undefined, 'backend normalization does not invent service-charge storage');
+    assert.equal(
+      printData.order.items[0].addons[0].price,
+      testCase.expected,
+      `addon extension ${testCase.itemQuantity}x item × ${testCase.addonQuantity}x addon`,
+    );
+    assert.equal(
+      printData.order.items[0].addons[1].price,
+      testCase.itemQuantity * 2 * 2,
+      'multiple add-ons retain independent extensions',
+    );
+    assert.equal(
+      printData.bill.serviceCharge,
+      undefined,
+      'backend normalization does not invent service-charge storage',
+    );
     assert.equal(printData.bill.deliveryCharge, 8);
     assert.equal(printData.bill.packagingCharge, 9);
 
@@ -459,37 +954,56 @@ console.log('\n▶ Add-on quantity and charge financial parity');
       ['classic', renderBillDocumentToClassicLines(document, options)],
       ['compact', renderBillDocumentToCompactLines(document, options)],
     ] as const) {
-      assert(lines.some((line) => line.includes('Extra shot') && line.includes(`₹${testCase.expected.toFixed(2)}`)),
-        `${renderer} renders extended add-on amount`);
-      assert(lines.some((line) => line.includes('Delivery') && line.includes('₹8.00')),
-        `${renderer} renders delivery charge`);
-      assert(lines.some((line) => line.includes('Packaging') && line.includes('₹9.00')),
-        `${renderer} renders packaging charge`);
+      assert(
+        lines.some(
+          (line) =>
+            line.includes('Extra shot') && line.includes(`₹${testCase.expected.toFixed(2)}`),
+        ),
+        `${renderer} renders extended add-on amount`,
+      );
+      assert(
+        lines.some((line) => line.includes('Delivery') && line.includes('₹8.00')),
+        `${renderer} renders delivery charge`,
+      );
+      assert(
+        lines.some((line) => line.includes('Packaging') && line.includes('₹9.00')),
+        `${renderer} renders packaging charge`,
+      );
     }
   }
 
   const malformedOrder = {
     order_number: 'ORD-ADDON-MALFORMED',
     created_at: '2026-08-21 18:42:00',
-    items: [{
-      product_name: 'Tea',
-      quantity: 2,
-      unit_price: 10,
-      total: 20,
-      addons: [null, 'legacy-addon', { name: 'Safe extra', price: 4, quantity: 2 }],
-    }],
+    items: [
+      {
+        product_name: 'Tea',
+        quantity: 2,
+        unit_price: 10,
+        total: 20,
+        addons: [null, 'legacy-addon', { name: 'Safe extra', price: 4, quantity: 2 }],
+      },
+    ],
   };
-  const malformedData = buildBillPrintData(malformedOrder, {
-    bill_number: 'INV-ADDON-MALFORMED',
-    subtotal: 20,
-    discount_amount: 0,
-    tax_amount: 0,
-    total: 20,
-  }, { country: 'IN', currency_symbol: '₹' }, false);
+  const malformedData = buildBillPrintData(
+    malformedOrder,
+    {
+      bill_number: 'INV-ADDON-MALFORMED',
+      subtotal: 20,
+      discount_amount: 0,
+      tax_amount: 0,
+      total: 20,
+    },
+    { country: 'IN', currency_symbol: '₹' },
+    false,
+  );
   assert.equal(malformedData.order.items[0].addons[0].price, 0);
   assert.equal(malformedData.order.items[0].addons[1].price, 0);
-  assert.equal(malformedData.order.items[0].addons[2].price, 16,
-    'object add-on quantity still uses the extended amount after malformed entries');
+  assert.equal(
+    malformedData.order.items[0].addons[2].price,
+    16,
+    'object add-on quantity still uses the extended amount after malformed entries',
+  );
   ok('malformed add-on entries do not break normalization');
 }
 
@@ -497,10 +1011,7 @@ console.log('\n▶ Add-on quantity and charge financial parity');
 // 5. KOT document variant (#443)
 // ---------------------------------------------------------------------------
 
-import {
-  buildKotDocument,
-  type KotPrintData,
-} from '../shared/print';
+import { buildKotDocument, type KotPrintData } from '../shared/print';
 
 console.log('\n▶ KOT document builder (#443)');
 {
@@ -529,7 +1040,10 @@ console.log('\n▶ KOT document builder (#443)');
     ],
   };
 
-  const document = buildKotDocument(kotData, makeContext({ languages: ['en'], baseDirection: 'ltr' }));
+  const document = buildKotDocument(
+    kotData,
+    makeContext({ languages: ['en'], baseDirection: 'ltr' }),
+  );
   assert.equal(document.version, 1, 'KOT document version is 1');
   assert.deepEqual(
     document.blocks.map((block) => block.kind),
@@ -537,7 +1051,9 @@ console.log('\n▶ KOT document builder (#443)');
     'KOT canonical block order',
   );
 
-  const header = getBlock(document as any, 'kot-header' as any) as ReturnType<typeof document.blocks.find> | undefined;
+  const header = getBlock(document as any, 'kot-header' as any) as
+    | ReturnType<typeof document.blocks.find>
+    | undefined;
   assert(header, 'kot-header block present');
   assert.equal(header.banner.conceptId, 'print.kot.banner');
   assert.equal(header.stationName.text, 'Main Kitchen');
@@ -556,7 +1072,11 @@ console.log('\n▶ KOT document builder (#443)');
     { ...kotData, order: { ...kotData.order, tableName: '' } },
     makeContext(),
   );
-  assert.equal((getBlock(noTable as any, 'kot-header' as any) as any)?.table, null, 'empty table name omits the table reference');
+  assert.equal(
+    (getBlock(noTable as any, 'kot-header' as any) as any)?.table,
+    null,
+    'empty table name omits the table reference',
+  );
   ok('table block presence follows snapshot data');
 
   const items = getBlock(document as any, 'kot-items' as any) as any;
@@ -564,18 +1084,29 @@ console.log('\n▶ KOT document builder (#443)');
   assert.equal(items.rows.length, 2);
   assert.equal(items.rows[0].quantity, 2);
   assert.equal(items.rows[0].name.text, 'Espresso Doppio');
-  assert.deepEqual(items.rows[0].addons.map((addon) => addon.text), ['Oat milk'], 'blank addon names are dropped');
+  assert.deepEqual(
+    items.rows[0].addons.map((addon) => addon.text),
+    ['Oat milk'],
+    'blank addon names are dropped',
+  );
   assert.equal(items.rows[0].addons[0].quantity, 3, 'KOT add-on quantity is retained');
   assert.equal(items.rows[0].specialInstructions?.text, 'Less sugar');
   assert.equal(items.rows[1].specialInstructions, null);
   ok('KOT item rows carry quantity/name/addons/instructions');
 
   // Direction annotations follow the injected base direction.
-  const rtlDoc = buildKotDocument(kotData, makeContext({ languages: ['fa'], baseDirection: 'rtl' }));
+  const rtlDoc = buildKotDocument(
+    kotData,
+    makeContext({ languages: ['fa'], baseDirection: 'rtl' }),
+  );
   assert.equal(rtlDoc.direction.base, 'rtl');
   const rtlItems = getBlock(rtlDoc as any, 'kot-items' as any) as any;
   assert.equal(rtlItems?.rows[1].name.direction, 'rtl', 'Persian item name follows rtl base');
-  assert.equal((getBlock(rtlDoc as any, 'kot-header' as any) as any)?.orderNumber.direction, 'ltr', 'order number stays an LTR island in rtl tickets');
+  assert.equal(
+    (getBlock(rtlDoc as any, 'kot-header' as any) as any)?.orderNumber.direction,
+    'ltr',
+    'order number stays an LTR island in rtl tickets',
+  );
   ok('direction-aware annotations for RTL-primary kitchen tickets');
 
   // Single-language policy shape (kernel kot_language_policy).
@@ -591,19 +1122,361 @@ console.log('\n▶ Kernel purity (static import audit)');
 {
   const kernelDir = path.resolve(__dirname, '../shared/print');
   const allowedPrefixes = ['./', '../'];
-  const forbidden = /\b(node:|require\(|electron|better-sqlite3|express|\.\.\/\.\.\/(main|frontend))/;
+  const forbidden =
+    /\b(node:|require\(|electron|better-sqlite3|express|\.\.\/\.\.\/(main|frontend))/;
   for (const file of ['document.ts', 'direction.ts', 'bilingual.ts', 'types.ts', 'policy.ts']) {
     const source = fs.readFileSync(path.join(kernelDir, file), 'utf8');
     const imports = [...source.matchAll(/from\s+'([^']+)'/g)].map((match) => match[1]);
     for (const importPath of imports) {
       assert(
-        allowedPrefixes.some((prefix) => importPath.startsWith(prefix)) && !forbidden.test(importPath),
+        allowedPrefixes.some((prefix) => importPath.startsWith(prefix)) &&
+          !forbidden.test(importPath),
         `${file} imports only kernel-relative modules (found "${importPath}")`,
       );
     }
-    assert(!/\b(fetch|XMLHttpRequest|localStorage|process\.)/.test(source), `${file} has no IO calls`);
+    assert(
+      !/\b(fetch|XMLHttpRequest|localStorage|process\.)/.test(source),
+      `${file} has no IO calls`,
+    );
   }
   ok('shared/print/document.ts imports only kernel-relative modules');
+}
+
+// ---------------------------------------------------------------------------
+// Cancelled, voided, and void_adjustment items never print on a bill, while
+// refunded sale rows remain on historical bill copies whose totals include them
+// ---------------------------------------------------------------------------
+
+{
+  const { order, bill, business } = buildParityFixtures();
+  const live = order.items.length;
+  assert(live > 0, 'fixture has items');
+  const excludedStatuses = ['cancelled', 'voided', 'void_adjustment'];
+  const withTerminal = {
+    ...order,
+    items: [
+      ...order.items,
+      ...excludedStatuses.map((status, index) => ({
+        ...order.items[0],
+        id: 9000 + index,
+        product_name: `Removed ${status}`,
+        status,
+      })),
+      {
+        ...order.items[0],
+        id: 9099,
+        product_name: 'Historical refunded sale',
+        status: 'refunded',
+      },
+    ],
+  };
+  const printData = buildBillPrintData(withTerminal, bill, business, false);
+  assert.equal(
+    printData.order.items.length,
+    live + 1,
+    'excluded terminal items are dropped while refunded sale row remains',
+  );
+  assert(
+    printData.order.items.every((item) => !item.productName.startsWith('Removed')),
+    'removed item names never reach the bill',
+  );
+  assert(
+    printData.order.items.some((item) => item.productName === 'Historical refunded sale'),
+    'refunded historical sale item remains on bill receipt',
+  );
+  ok(
+    'cancelled, voided, and void_adjustment items are excluded while refunded sale rows remain on the bill',
+  );
+}
+
+// ---------------------------------------------------------------------------
+// 7. Large bold Order Number banner on customer receipts (thermal & HTML)
+// ---------------------------------------------------------------------------
+
+console.log('\n▶ Large bold Order Number banner on customer receipts');
+{
+  const Module = require('node:module') as { _resolveFilename: (...args: any[]) => string };
+  const originalResolve = Module._resolveFilename;
+  Module._resolveFilename = function (
+    request: string,
+    parent: any,
+    isMain: boolean,
+    options?: any,
+  ) {
+    let resolvedRequest = request;
+    if (request === '@countries') {
+      resolvedRequest = path.resolve(__dirname, '../main/countries.ts');
+    } else if (request.startsWith('@/')) {
+      resolvedRequest = path.resolve(__dirname, '../frontend/src', request.slice(2));
+    } else if (request.startsWith('@print/')) {
+      resolvedRequest = path.resolve(__dirname, '../shared/print', request.slice('@print/'.length));
+    } else if (request.startsWith('@shared/')) {
+      resolvedRequest = path.resolve(__dirname, '../shared', request.slice('@shared/'.length));
+    }
+    return originalResolve.call(this, resolvedRequest, parent, isMain, options);
+  };
+
+  let receiptEncoder: typeof import('../frontend/src/lib/printer/receipt-encoder');
+  let taxBillEncoder: typeof import('../frontend/src/lib/printer/tax-bill-encoder');
+  let webPrint: typeof import('../frontend/src/lib/printer/web-print');
+  try {
+    receiptEncoder = require('../frontend/src/lib/printer/receipt-encoder');
+    taxBillEncoder = require('../frontend/src/lib/printer/tax-bill-encoder');
+    webPrint = require('../frontend/src/lib/printer/web-print');
+  } finally {
+    Module._resolveFilename = originalResolve;
+  }
+
+  const { escPosToText } =
+    require('../main/printers/thermal') as typeof import('../main/printers/thermal');
+  const { order, bill, business } = buildParityFixtures();
+
+  // Even when bill.bill_number is INV-PARITY-001, meta.orderNumber preserves ORD-PARITY-001.
+  const defaultData = buildBillPrintData(order, bill, business, false);
+  assert.equal(
+    defaultData.business.showLargeOrderNumber,
+    undefined,
+    'omitted show_large_order_number stays undefined for golden fixture compatibility',
+  );
+  const defaultDoc = buildBillDocument(defaultData, makeContext());
+  const defaultMeta = getBlock(defaultDoc, 'document-meta');
+  assert.equal(defaultMeta?.invoiceNumber.text, 'INV-PARITY-001');
+  assert.equal(
+    defaultMeta !== undefined && 'orderNumberLabel' in defaultMeta,
+    false,
+    'DocumentMetaBlock does not carry unused orderNumberLabel',
+  );
+  assert.equal(
+    defaultMeta?.orderNumber?.text,
+    'ORD-PARITY-001',
+    'meta.orderNumber preserves order.orderNumber alongside INV-... invoiceNumber',
+  );
+  assert.equal(defaultMeta?.showLargeOrderNumber, false);
+
+  const renderOpts = {
+    columns: 48,
+    language: 'en',
+    locale: 'en-IN',
+    currency: 'INR',
+    currencySymbol: '₹',
+    trimDecimals: false,
+    useUnicode: true,
+    arabicShaping: false,
+    cutMode: 'full' as const,
+  };
+
+  // Omitted / false showLargeOrderNumber omits the large # banner.
+  const enabledData = buildBillPrintData(
+    { ...order, order_number: '0012' },
+    bill,
+    { ...business, show_large_order_number: true },
+    false,
+  );
+  const disabledData = buildBillPrintData(
+    { ...order, order_number: '0012' },
+    bill,
+    { ...business, show_large_order_number: false },
+    false,
+  );
+  assert.equal(enabledData.business.showLargeOrderNumber, true);
+  assert.equal(disabledData.business.showLargeOrderNumber, false);
+
+  const enabledDoc = buildBillDocument(enabledData, makeContext({ columns: 48 }));
+  const disabledDoc = buildBillDocument(disabledData, makeContext({ columns: 48 }));
+
+  const classicEnabled = renderBillDocumentToClassicLines(enabledDoc, renderOpts);
+  const classicDisabled = renderBillDocumentToClassicLines(disabledDoc, renderOpts);
+  assert(
+    classicEnabled.some((line) =>
+      line.includes(
+        '{CENTER}{BOLD}{DOUBLE_HEIGHT}{DOUBLE_WIDTH}#0012{/DOUBLE_WIDTH}{/DOUBLE_HEIGHT}{/BOLD}{/CENTER}',
+      ),
+    ),
+    'classic thermal receipt emits centered bold double-size #0012 banner when enabled',
+  );
+  assert(
+    !classicEnabled.some((line) => line.includes('ORDER #')),
+    'classic thermal receipt uses language-neutral # banner without hardcoded English ORDER #',
+  );
+  assert(
+    classicEnabled.some((line) => line.includes('INV-PARITY-001')),
+    'classic thermal receipt keeps INV-PARITY-001 invoice line alongside #0012 banner',
+  );
+  assert(
+    !classicDisabled.some((line) => line.includes('{DOUBLE_HEIGHT}{DOUBLE_WIDTH}#0012')),
+    'classic thermal receipt omits # banner when showLargeOrderNumber is false',
+  );
+
+  const classicGermanEnabled = renderBillDocumentToClassicLines(enabledDoc, {
+    ...renderOpts,
+    language: 'de',
+    locale: 'de-DE',
+  });
+  assert(
+    classicGermanEnabled.some((line) =>
+      line.includes(
+        '{CENTER}{BOLD}{DOUBLE_HEIGHT}{DOUBLE_WIDTH}#0012{/DOUBLE_WIDTH}{/DOUBLE_HEIGHT}{/BOLD}{/CENTER}',
+      ),
+    ) && !classicGermanEnabled.some((line) => line.includes('ORDER #')),
+    'classic German thermal receipt emits language-neutral #0012 banner without English ORDER #',
+  );
+
+  const compactEnabled = renderBillDocumentToCompactLines(enabledDoc, renderOpts);
+  const compactDisabled = renderBillDocumentToCompactLines(disabledDoc, renderOpts);
+  assert(
+    compactEnabled.some((line) =>
+      line.includes(
+        '{CENTER}{BOLD}{DOUBLE_HEIGHT}{DOUBLE_WIDTH}#0012{/DOUBLE_WIDTH}{/DOUBLE_HEIGHT}{/BOLD}{/CENTER}',
+      ),
+    ),
+    'compact thermal receipt emits centered bold double-size #0012 banner when enabled',
+  );
+  assert(
+    !compactEnabled.some((line) => line.includes('ORDER #')),
+    'compact thermal receipt uses language-neutral # banner without hardcoded English ORDER #',
+  );
+  assert(
+    !compactDisabled.some((line) => line.includes('{DOUBLE_HEIGHT}{DOUBLE_WIDTH}#0012')),
+    'compact thermal receipt omits # banner when showLargeOrderNumber is false',
+  );
+  ok('backend document-classic and document-compact render/omit large bold # banner');
+
+  // Frontend ESC/POS encoders (classic, compact, detailed, tax-bill) and HTML web-print.
+  const feBill: any = {
+    id: 1,
+    bill_number: 'INV-20261109-0012',
+    subtotal: 200,
+    discount_amount: 0,
+    tax_amount: 10,
+    total_amount: 210,
+    payment_method: 'cash',
+    payment_status: 'paid',
+    created_at: '2026-11-09 12:00:00',
+    order: {
+      id: 1,
+      order_number: 'ORD-20261109-0012',
+      type: 'takeaway',
+      created_at: '2026-11-09 12:00:00',
+      items: [
+        {
+          id: 1,
+          product_name: 'Cappuccino',
+          quantity: 1,
+          unit_price: 200,
+          total: 200,
+          status: 'served',
+        },
+      ],
+    },
+  };
+  const feTenant: any = {
+    id: 1,
+    business_name: 'FloCafe Test',
+    country: 'IN',
+    currency: 'INR',
+    timezone: 'Asia/Kolkata',
+  };
+
+  for (const [label, buildFn] of [
+    ['classic encoder', receiptEncoder.buildClassicReceiptBytes],
+    ['compact encoder', receiptEncoder.buildCompactReceiptBytes],
+    ['detailed encoder', receiptEncoder.buildDetailedReceiptBytes],
+    ['tax-bill encoder', taxBillEncoder.buildTaxBillBytes],
+  ] as const) {
+    const onText = escPosToText(
+      buildFn(feBill, feTenant, { columns: 48, showLargeOrderNumber: true } as any),
+    );
+    const offText = escPosToText(
+      buildFn(feBill, feTenant, { columns: 48, showLargeOrderNumber: false } as any),
+    );
+    assert(
+      onText.includes('#ORD-20261109-0012') && !onText.includes('ORDER #'),
+      `${label} emits language-neutral #ORD-20261109-0012 when showLargeOrderNumber is true`,
+    );
+    assert(
+      !offText.includes('#ORD-20261109-0012') && !offText.includes('ORDER #'),
+      `${label} omits #ORD-20261109-0012 when showLargeOrderNumber is false`,
+    );
+    const onGermanText = escPosToText(
+      buildFn(feBill, feTenant, {
+        columns: 48,
+        languages: ['de'],
+        showLargeOrderNumber: true,
+      } as any),
+    );
+    assert(
+      onGermanText.includes('#ORD-20261109-0012') && !onGermanText.includes('ORDER #'),
+      `${label} emits #ORD-20261109-0012 without English ORDER # in German receipts`,
+    );
+    const warnings58: any[] = [];
+    const on58Text = escPosToText(
+      buildFn(
+        feBill,
+        feTenant,
+        { paperWidth: 58, columns: 32, showLargeOrderNumber: true } as any,
+        warnings58,
+      ),
+    );
+    assert(
+      on58Text.includes('#ORD-20261109-0012') && !on58Text.includes('ORDER #'),
+      `${label} preserves full #ORD-20261109-0012 on 58mm (32 columns)`,
+    );
+    assert.equal(
+      warnings58.length,
+      0,
+      `${label} emits no false skipped-line warnings when downgrading double-width banner on 58mm`,
+    );
+  }
+
+  const htmlOn = webPrint.generateBillHtml(feBill, feTenant, {
+    paperSize: 'thermal80',
+    columns: 48,
+    languages: ['en'],
+    showLargeOrderNumber: true,
+  });
+  const htmlOff = webPrint.generateBillHtml(feBill, feTenant, {
+    paperSize: 'thermal80',
+    columns: 48,
+    languages: ['en'],
+    showLargeOrderNumber: false,
+  });
+  const htmlRtl = webPrint.generateBillHtml(feBill, feTenant, {
+    paperSize: 'thermal58',
+    columns: 32,
+    languages: ['ar'],
+    showLargeOrderNumber: true,
+  });
+  const htmlDe = webPrint.generateBillHtml(feBill, feTenant, {
+    paperSize: 'thermal80',
+    columns: 48,
+    languages: ['de'],
+    showLargeOrderNumber: true,
+  });
+  assert(
+    htmlOn.includes('class="order-number-banner"') &&
+      htmlOn.includes('>#ORD-20261109-0012</div>') &&
+      !htmlOn.includes('ORDER #'),
+    'generateBillHtml renders .order-number-banner with #ORD-20261109-0012 when enabled',
+  );
+  assert(
+    htmlRtl.includes('dir="rtl"') &&
+      /<div class="order-number-banner" dir="ltr" style="direction: ltr; unicode-bidi: isolate;[^"]*">#ORD-20261109-0012<\/div>/.test(
+        htmlRtl,
+      ) &&
+      !htmlRtl.includes('ORDER #'),
+    'generateBillHtml isolates .order-number-banner as dir="ltr" inside RTL receipts without English ORDER #',
+  );
+  assert(
+    htmlDe.includes('>#ORD-20261109-0012</div>') && !htmlDe.includes('ORDER #'),
+    'generateBillHtml renders #ORD-20261109-0012 without English ORDER # in German receipts',
+  );
+  assert(
+    !htmlOff.includes('class="order-number-banner"') &&
+      !htmlOff.includes('#ORD-20261109-0012') &&
+      !htmlOff.includes('ORDER #'),
+    'generateBillHtml omits .order-number-banner when showLargeOrderNumber is false',
+  );
+  ok('frontend thermal encoders and browser HTML receipt render/omit large bold # banner');
 }
 
 console.log(`\nPrintDocument unit tests: ${passed} checks passed.`);

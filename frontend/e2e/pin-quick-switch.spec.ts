@@ -1,0 +1,306 @@
+import { test, expect } from '@playwright/test';
+import { E2E_BASE_URL as BASE, E2E_KDS_BASE_URL, E2E_SERVER_APP_BASE_URL } from './helpers/urls';
+import { E2E_PASSWORD, getE2eToken, setLanguage } from './helpers/test-auth';
+import { captureSettings, restoreSettings } from './helpers/kitchen-fixture';
+
+const SETTINGS_TO_RESTORE = [
+  'billing_type',
+  'auto_lock_minutes',
+  'kds_enabled',
+  'server_app_enabled',
+];
+
+test.describe('PIN Quick User Switch and Lock Flow (#1338 / #1516)', () => {
+  let ownerToken: string;
+  let ownerHeaders: Record<string, string>;
+  let cashierId: string;
+  let tableId: string;
+  let settingsBefore: Map<string, string | undefined>;
+  let createdOrderIds: string[] = [];
+
+  test.beforeAll(async ({ request }) => {
+    ownerToken = getE2eToken('e2e-owner', 'owner@flo.local', 'owner');
+    ownerHeaders = {
+      Authorization: `Bearer ${ownerToken}`,
+      'Content-Type': 'application/json',
+    };
+    settingsBefore = await captureSettings(request, SETTINGS_TO_RESTORE);
+
+    // Ensure owner has a PIN and create/update a cashier with a PIN (4321)
+    const ownerPinRes = await request.put(`${BASE}/api/staff/e2e-owner`, {
+      headers: ownerHeaders,
+      data: { pin: '1111' },
+    });
+    expect(ownerPinRes.ok()).toBeTruthy();
+    ownerToken = getE2eToken('e2e-owner', 'owner@flo.local', 'owner');
+    ownerHeaders = {
+      Authorization: `Bearer ${ownerToken}`,
+      'Content-Type': 'application/json',
+    };
+
+    const tableRes = await request.post(`${BASE}/api/tables`, {
+      headers: ownerHeaders,
+      data: { number: `PinSwitch ${Date.now()}`, capacity: 2 },
+    });
+    expect(tableRes.ok()).toBeTruthy();
+    const tableBody = await tableRes.json();
+    tableId = tableBody.table.id;
+
+    const staffRes = await request.get(`${BASE}/api/staff`, { headers: ownerHeaders });
+    expect(staffRes.ok()).toBeTruthy();
+    const { staff } = await staffRes.json();
+    const existingCashier = staff.find(
+      (member: { email?: string; id?: string; is_active?: number | boolean }) =>
+        member.email === 'pin-cashier@flo.local',
+    );
+    if (existingCashier) {
+      cashierId = existingCashier.id;
+      if (!existingCashier.is_active) {
+        const reactivateRes = await request.post(`${BASE}/api/staff/${cashierId}/reactivate`, {
+          headers: ownerHeaders,
+        });
+        expect(reactivateRes.ok()).toBeTruthy();
+      }
+      const updateRes = await request.put(`${BASE}/api/staff/${cashierId}`, {
+        headers: ownerHeaders,
+        data: { role: 'cashier', pin: '4321' },
+      });
+      expect(updateRes.ok()).toBeTruthy();
+    } else {
+      const createRes = await request.post(`${BASE}/api/staff`, {
+        headers: ownerHeaders,
+        data: {
+          name: 'QuickSwitch Cashier',
+          email: 'pin-cashier@flo.local',
+          password: E2E_PASSWORD,
+          role: 'cashier',
+          pin: '4321',
+        },
+      });
+      expect(createRes.ok()).toBeTruthy();
+      const body = await createRes.json();
+      cashierId = body.staff.id;
+    }
+  });
+
+  test.afterAll(async ({ request }) => {
+    const freshOwnerAuth = () => ({
+      Authorization: `Bearer ${getE2eToken('e2e-owner', 'owner@flo.local', 'owner')}`,
+      'Content-Type': 'application/json',
+    });
+    try {
+      if (cashierId) {
+        await request.put(`${BASE}/api/staff/${cashierId}`, {
+          headers: freshOwnerAuth(),
+          data: { pin: null },
+        });
+        await request.post(`${BASE}/api/staff/${cashierId}/deactivate`, {
+          headers: freshOwnerAuth(),
+        });
+      }
+      if (tableId) {
+        await request.delete(`${BASE}/api/tables/${tableId}`, {
+          headers: freshOwnerAuth(),
+        });
+      }
+      await request.put(`${BASE}/api/staff/e2e-owner`, {
+        headers: freshOwnerAuth(),
+        data: { pin: null },
+      });
+    } catch {
+      // Ignore cleanup errors
+    }
+  });
+
+  test.beforeEach(async ({ request }) => {
+    createdOrderIds = [];
+    await request.put(`${BASE}/api/settings/billing_type`, {
+      headers: ownerHeaders,
+      data: { value: 'prepaid' },
+    });
+    await request.put(`${BASE}/api/settings/auto_lock_minutes`, {
+      headers: ownerHeaders,
+      data: { value: '0' },
+    });
+    await request.put(`${BASE}/api/settings/kds_enabled`, {
+      headers: ownerHeaders,
+      data: { value: 'true' },
+    });
+    await request.put(`${BASE}/api/settings/server_app_enabled`, {
+      headers: ownerHeaders,
+      data: { value: 'true' },
+    });
+  });
+
+  test.afterEach(async ({ request }) => {
+    if (settingsBefore) {
+      await restoreSettings(request, settingsBefore);
+    }
+    for (const orderId of createdOrderIds) {
+      try {
+        await request.patch(`${BASE}/api/orders/${orderId}/status`, {
+          headers: ownerHeaders,
+          data: {
+            status: 'cancelled',
+            override_pin: '1111',
+            approver_id: 'e2e-owner',
+          },
+        });
+      } catch {
+        // Ignore if already completed/cancelled
+      }
+    }
+  });
+
+  test('locks POS from topbar, quick-switches to cashier via PIN tile picker, preserves cart, and completes payment', async ({
+    page,
+  }) => {
+    await page.goto(`${BASE}/auth/login`);
+    // When PIN users exist, compact mode toggle defaults to Quick Sign-In ('pin') and hides the password form
+    await expect(page.getByTestId('signin-mode-toggle')).toBeVisible();
+    await expect(page.getByTestId('pin-user-picker')).toBeVisible();
+    await expect(page.locator('#email')).toBeHidden();
+
+    // Switch to Email & Password mode via the toggle to sign in as owner
+    await page.getByTestId('signin-mode-password').click();
+    await expect(page.getByTestId('pin-user-picker')).toBeHidden();
+    await expect(page.locator('#email')).toBeVisible();
+
+    await page.locator('#email').fill('owner@flo.local');
+    await page.locator('#password').fill(E2E_PASSWORD);
+    await page.locator('button[type="submit"]').click();
+    await page.waitForURL('**/pos/**', { timeout: 20000 });
+    await setLanguage(page, 'en');
+    await page.goto(`${BASE}/pos`);
+
+    await expect(page.getByTestId('pos-product-grid')).toBeVisible();
+    await page.getByTestId('pos-product-card').first().click();
+    await expect(page.getByTestId('cart-item')).toHaveCount(1);
+
+    // Click Lock in the POS topbar and verify POST /api/auth/logout succeeds with 200
+    const logoutResponse = page.waitForResponse((response) => {
+      const url = new URL(response.url());
+      return response.request().method() === 'POST' && url.pathname === '/api/auth/logout';
+    });
+    await page.getByTestId('pos-lock-button').click();
+    expect((await logoutResponse).status()).toBe(200);
+    await page.waitForURL('**/auth/login**', { timeout: 15000 });
+
+    // Verify user tile picker is visible and shows our PIN-enabled cashier
+    const picker = page.getByTestId('pin-user-picker');
+    await expect(picker).toBeVisible();
+    const cashierTile = page.getByTestId(`pin-user-tile-${cashierId}`);
+    await expect(cashierTile).toBeVisible();
+    await expect(cashierTile).toContainText('QuickSwitch Cashier');
+
+    // Tap the cashier tile and enter PIN 4321 using the keypad
+    await cashierTile.click();
+    await expect(page.getByTestId('pin-login-form')).toBeVisible();
+    await page.getByTestId('pin-pad-digit-4').click();
+    await page.getByTestId('pin-pad-digit-3').click();
+    await page.getByTestId('pin-pad-digit-2').click();
+    await page.getByTestId('pin-pad-digit-1').click();
+    await page.getByTestId('pin-login-submit').click();
+
+    // Verify redirect to POS, active user switched to cashier, and unfinished cart preserved
+    await page.waitForURL('**/pos/**', { timeout: 20000 });
+    await expect(page.getByTestId('cart-item')).toHaveCount(1);
+
+    // Complete payment as the cashier
+    await page.getByRole('button', { name: 'Place Order' }).click();
+    await expect(page.getByRole('button', { name: 'Confirm Payment · ฿64.20' })).toBeVisible();
+    await page.getByRole('button', { name: 'Cash', exact: true }).click();
+    await expect(page.getByRole('button', { name: 'Confirm Payment · ฿64.20' })).toBeEnabled();
+
+    const orderResponse = page.waitForResponse((response) => {
+      const url = new URL(response.url());
+      return response.request().method() === 'POST' && url.pathname === '/api/orders';
+    });
+    const paymentResponse = page.waitForResponse((response) => {
+      const url = new URL(response.url());
+      return (
+        response.request().method() === 'POST' &&
+        /^\/api\/bills\/[^/]+\/payments$/.test(url.pathname)
+      );
+    });
+
+    await page.getByRole('button', { name: 'Confirm Payment · ฿64.20' }).click();
+
+    const orderPayload = await (await orderResponse).json();
+    if (orderPayload?.order?.id) {
+      createdOrderIds.push(String(orderPayload.order.id));
+    }
+    const paymentPayload = await (await paymentResponse).json();
+    expect(paymentPayload.bill.payment_status).toBe('paid');
+    await expect(page.getByText(/Order #ORD-\d+-\d+ paid!/)).toBeVisible();
+  });
+
+  test('supports Quick Sign-In and mode toggle on KDS and Server App', async ({ page }) => {
+    // 1. Standalone KDS Quick Sign-In + mode toggle
+    await page.goto(`${E2E_KDS_BASE_URL}/kds-standalone`);
+    await expect(page.getByTestId('signin-mode-toggle')).toBeVisible();
+    await expect(page.getByTestId('pin-user-picker')).toBeVisible();
+    // Cashier lacks kitchen.use, so only kitchen-authorized PIN users appear on KDS
+    await expect(page.getByTestId(`pin-user-tile-${cashierId}`)).toHaveCount(0);
+    const kdsOwnerTile = page.getByTestId('pin-user-tile-e2e-owner');
+    await expect(kdsOwnerTile).toBeVisible();
+
+    // Toggle to password mode and back to PIN mode
+    await page.getByTestId('signin-mode-password').click();
+    await expect(page.getByTestId('kds-login-form')).toBeVisible();
+    await expect(page.getByTestId('pin-user-picker')).toBeHidden();
+    await page.getByTestId('signin-mode-pin').click();
+    await expect(page.getByTestId('pin-user-picker')).toBeVisible();
+
+    await kdsOwnerTile.click();
+    await expect(page.getByTestId('pin-login-form')).toBeVisible();
+    // Wrong PIN attempt surfaces inline error and clears the PIN input
+    await page.getByTestId('pin-pad-digit-9').click();
+    await page.getByTestId('pin-pad-digit-9').click();
+    await page.getByTestId('pin-pad-digit-9').click();
+    await page.getByTestId('pin-pad-digit-9').click();
+    await page.getByTestId('pin-login-submit').click();
+    await expect(page.getByTestId('pin-login-error')).toBeVisible();
+    await expect(page.getByTestId('pin-login-input')).toHaveValue('');
+
+    await page.getByTestId('pin-pad-digit-1').click();
+    await page.getByTestId('pin-pad-digit-1').click();
+    await page.getByTestId('pin-pad-digit-1').click();
+    await page.getByTestId('pin-pad-digit-1').click();
+    await page.getByTestId('pin-login-submit').click();
+    await expect(page.getByTestId('kds-workspace')).toBeVisible();
+
+    // 2. Server App Quick Sign-In + mode toggle
+    await page.goto(`${E2E_SERVER_APP_BASE_URL}/server-standalone`);
+    await expect(page.getByTestId('signin-mode-toggle')).toBeVisible();
+    await expect(page.getByTestId('pin-user-picker')).toBeVisible();
+    // Cashier lacks server-app.use, so cashier tile is omitted on Server App
+    await expect(page.getByTestId(`pin-user-tile-${cashierId}`)).toHaveCount(0);
+    const serverAppOwnerTile = page.getByTestId('pin-user-tile-e2e-owner');
+    await expect(serverAppOwnerTile).toBeVisible();
+
+    // Toggle to password mode and back to PIN mode
+    await page.getByTestId('signin-mode-password').click();
+    await expect(page.getByTestId('pin-user-picker')).toBeHidden();
+    await page.getByTestId('signin-mode-pin').click();
+    await expect(page.getByTestId('pin-user-picker')).toBeVisible();
+
+    await serverAppOwnerTile.click();
+    await expect(page.getByTestId('pin-login-form')).toBeVisible();
+    // Wrong PIN attempt surfaces inline error and clears the PIN input
+    await page.getByTestId('pin-pad-digit-9').click();
+    await page.getByTestId('pin-pad-digit-9').click();
+    await page.getByTestId('pin-pad-digit-9').click();
+    await page.getByTestId('pin-pad-digit-9').click();
+    await page.getByTestId('pin-login-submit').click();
+    await expect(page.getByTestId('pin-login-error')).toBeVisible();
+    await expect(page.getByTestId('pin-login-input')).toHaveValue('');
+
+    await page.getByTestId('pin-pad-digit-1').click();
+    await page.getByTestId('pin-pad-digit-1').click();
+    await page.getByTestId('pin-pad-digit-1').click();
+    await page.getByTestId('pin-pad-digit-1').click();
+    await page.getByTestId('pin-login-submit').click();
+    await expect(page.getByTestId('pos-product-grid')).toBeVisible();
+  });
+});

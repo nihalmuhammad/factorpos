@@ -1,6 +1,6 @@
 /** Shared logic to skip unsupported characters and preserve printing on ESC/POS encoders. */
 import { createTranslator } from 'use-intl/core';
-import { CURRENCY_ASCII_MAP, normalizeCurrencyToAscii, normalizeThermalText } from './unicode';
+import { normalizeCurrencyToAscii, normalizeThermalText, stripCurrencyTokens } from './unicode';
 import {
   isArabicShapingSafeLine as isCapabilityArabicShapingSafeLine,
   isThermalTextRepresentable,
@@ -8,23 +8,35 @@ import {
   selectThermalCodePage,
   type ThermalPrinterCapabilities,
 } from '@print/thermal-capabilities';
+import { containsRtlScript } from '@print/direction';
+import {
+  encodeRasterUnits,
+  rasterCapabilityEnabled,
+  type RasterStyle,
+  type RasterTextLayout,
+} from '@print/raster';
+import { paintRasterRequest, type RasterCanvas } from '@print/raster-canvas';
 import type { PrintWarning } from '@print/warnings';
+import { displayCellWidth, wrapToDisplayCells } from '@print/width';
 import { getCachedMessages } from '@/lib/i18n/loader';
 import { LANGUAGES } from '@/lib/i18n/languages';
+import { sanitizePrinterErrorDetail } from '../operation-failure';
+import { currentHintPlatform, printFailureHint } from './print-failure-help';
+
+export interface PrintErrorToastOptions {
+  /** `failure_class` from the printer error. */
+  failureClass?: string | null;
+  /** Live cause read from the printer; wins over `failureClass`. */
+  cause?: string | null;
+  /** `connection_type` from the printer error. */
+  connectionType?: string | null;
+}
 import { usePosSettingsStore } from '@/store/pos-settings';
 
 export type { PrintWarning } from '@print/warnings';
 
-const SUPPORTED_CURRENCY_SYMBOLS = new RegExp(
-  Object.keys(CURRENCY_ASCII_MAP)
-    .sort((left, right) => right.length - left.length)
-    .map((value) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
-    .join('|'),
-  'g',
-);
-
 export function hasUnsupportedPrinterChars(text: string): boolean {
-  return /[^\x00-\x7F]/.test(text.replace(SUPPORTED_CURRENCY_SYMBOLS, ''));
+  return /[^\x00-\x7F]/.test(stripCurrencyTokens(text));
 }
 
 const ARABIC_SCRIPT_RE = /[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF]/;
@@ -50,7 +62,11 @@ function billTemplateSource(value: unknown): 'core' | 'non-core' {
   if (typeof selection === 'string') {
     const trimmed = selection.trim();
     if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
-      try { selection = JSON.parse(trimmed); } catch { selection = trimmed; }
+      try {
+        selection = JSON.parse(trimmed);
+      } catch {
+        selection = trimmed;
+      }
     } else {
       selection = trimmed.toLowerCase();
     }
@@ -62,14 +78,7 @@ function billTemplateSource(value: unknown): 'core' | 'non-core' {
   return selection === 'classic' || selection === 'compact' ? 'core' : 'non-core';
 }
 
-export function hasFinancialPrintWarning(warnings: readonly PrintWarning[]): boolean {
-  return warnings.some((warning) => warning.kind === 'financial');
-}
-
-export function makeFinancialPrintRefusalMessage(warnings: readonly PrintWarning[]): string {
-  const row = warnings.find((warning) => warning.kind === 'financial');
-  return `Receipt not printed: a financial row contains unsupported printer text${row?.text ? `: ${row.text}` : '.'} Use a supported printer profile or system/browser printing.`;
-}
+export { hasFinancialPrintWarning, makeFinancialPrintRefusalMessage } from '@print/warnings';
 
 export function makeBillTemplateFallbackWarning(value: unknown): PrintWarning | null {
   if (billTemplateSource(value) === 'core') return null;
@@ -77,34 +86,98 @@ export function makeBillTemplateFallbackWarning(value: unknown): PrintWarning | 
   return {
     field: 'bill_template',
     text: text || 'unknown',
-    message: 'The selected bill template is not supported on this print path, so the built-in receipt layout was used.',
+    message:
+      'The selected bill template is not supported on this print path, so the built-in receipt layout was used.',
     kind: 'configuration',
   };
 }
 
 /** C0 controls and DEL must never reach raw ESC/POS output (#437 review). */
 const ESCPOS_TEXT_CONTROL_RE = /[\x00-\x1F\x7F]/g;
-/** Arabic combining marks and bidi/format controls consume no print column. */
-const SHAPING_ZERO_WIDTH_RE = /[\u0610-\u061A\u064B-\u065F\u0670\u06D6-\u06ED\u200B-\u200F]/g;
 
-function shapedDisplayWidth(text: string): number {
-  return [...text.replace(SHAPING_ZERO_WIDTH_RE, '')].length;
+type BrowserRasterCanvasFactory = (() => RasterCanvas) | null;
+let customBrowserRasterCanvasFactory: BrowserRasterCanvasFactory | undefined;
+
+export function setBrowserRasterCanvasFactory(
+  factory: BrowserRasterCanvasFactory | undefined,
+): void {
+  customBrowserRasterCanvasFactory = factory;
+}
+
+function resolveBrowserRasterCanvasFactory(): BrowserRasterCanvasFactory {
+  if (customBrowserRasterCanvasFactory !== undefined) return customBrowserRasterCanvasFactory;
+  if (typeof document !== 'undefined' && typeof document.createElement === 'function') {
+    const probe = document.createElement('canvas') as unknown as Partial<RasterCanvas> | null;
+    if (probe && typeof probe.getContext === 'function') {
+      return () => document.createElement('canvas') as unknown as RasterCanvas;
+    }
+  }
+  const GlobalOffscreenCanvas = (
+    globalThis as { OffscreenCanvas?: new (width: number, height: number) => RasterCanvas }
+  ).OffscreenCanvas;
+  if (typeof GlobalOffscreenCanvas === 'function') {
+    return () => new GlobalOffscreenCanvas(1, 1);
+  }
+  return null;
+}
+
+function resolveFinancialRasterLayout(sanitized: string): RasterTextLayout | undefined {
+  const stackedMatch = sanitized.match(/^([^\n]*\S[^\n]*)\n\s*(\S[^\n]*)$/);
+  if (stackedMatch) {
+    return {
+      kind: 'financial-summary',
+      columns: [
+        { text: stackedMatch[1].trimEnd(), align: 'left' },
+        { text: stackedMatch[2].trim(), align: 'right' },
+      ],
+    };
+  }
+  const multiSpaceMatch = sanitized.match(/^(\s*\S+(?:\s\S+)*?)\s{2,}(\S.*)$/);
+  if (multiSpaceMatch) {
+    return {
+      kind: 'financial-summary',
+      columns: [
+        { text: multiSpaceMatch[1], align: 'left' },
+        { text: multiSpaceMatch[2].trim(), align: 'right' },
+      ],
+    };
+  }
+  const singleSpaceAmountMatch = sanitized.match(/^(.*\S)\s+(\S*\d\S*)$/);
+  if (singleSpaceAmountMatch) {
+    return {
+      kind: 'financial-summary',
+      columns: [
+        { text: singleSpaceAmountMatch[1], align: 'left' },
+        { text: singleSpaceAmountMatch[2], align: 'right' },
+      ],
+    };
+  }
+  return undefined;
 }
 
 function boundShapedText(text: string, maxCols?: number): string {
-  if (!maxCols || maxCols <= 0 || shapedDisplayWidth(text) <= maxCols) return text;
+  if (!maxCols || maxCols <= 0 || displayCellWidth(text) <= maxCols) return text;
 
   const ellipsis = '…';
-  const targetCols = Math.max(0, maxCols - shapedDisplayWidth(ellipsis));
+  const targetCols = Math.max(0, maxCols - displayCellWidth(ellipsis));
   let bounded = '';
   let width = 0;
   for (const character of text) {
-    const characterWidth = shapedDisplayWidth(character);
+    const characterWidth = displayCellWidth(character);
     if (width + characterWidth > targetCols) break;
     bounded += character;
     width += characterWidth;
   }
   return bounded + ellipsis;
+}
+
+/**
+ * Rows of at most `maxCols` display cells. A shaped printer never wraps
+ * its own raw bytes, so an over-wide line must become rows here or be cut.
+ */
+export function wrapPrinterText(text: string, maxCols: number): string[] {
+  if (maxCols <= 0) return [text];
+  return wrapToDisplayCells(text, maxCols);
 }
 
 /** Writes value to an encoder if characters are representable, recording a warning otherwise. */
@@ -125,13 +198,20 @@ export function safePrinterText<T extends { text(value: string): T }>(
   const thermalCapabilities = mergeThermalCapabilities(capabilities, arabicShaping);
   const useLegacyUnicode = capabilities === undefined && useUnicode;
   const printableValue = normalizeThermalText(value, thermalCapabilities);
-  const hasNativeCodePage = thermalCapabilities.encoding.codePages.some((codePage) => codePage !== 'ascii');
-  const printerValue = (!useLegacyUnicode && !hasNativeCodePage
-    ? normalizeCurrencyToAscii(printableValue)
-    : printableValue).replace(/\u2026/g, useUnicode && arabicShaping ? '\u2026' : '.');
+  const hasNativeCodePage = thermalCapabilities.encoding.codePages.some(
+    (codePage) => codePage !== 'ascii',
+  );
+  const printerValue = (
+    !useLegacyUnicode && !hasNativeCodePage
+      ? normalizeCurrencyToAscii(printableValue)
+      : printableValue
+  ).replace(/\u2026/g, useUnicode && arabicShaping ? '\u2026' : '.');
   const hasUnsupported = hasUnsupportedPrinterChars(printerValue);
-  const shapingSafe = thermalCapabilities.shaping.arabic && isCapabilityArabicShapingSafeLine(printerValue);
-  const representable = !hasUnsupported || (isThermalTextRepresentable(printerValue, thermalCapabilities) && !shapingSafe);
+  const shapingSafe =
+    thermalCapabilities.shaping.arabic && isCapabilityArabicShapingSafeLine(printerValue);
+  const representable =
+    !hasUnsupported ||
+    (isThermalTextRepresentable(printerValue, thermalCapabilities) && !shapingSafe);
   if (hasUnsupported) {
     if (shapingSafe) {
       const sanitized = printerValue.replace(ESCPOS_TEXT_CONTROL_RE, '');
@@ -144,14 +224,17 @@ export function safePrinterText<T extends { text(value: string): T }>(
       if ('raw' in enc && typeof (enc as { raw?: (data: Uint8Array) => T }).raw === 'function') {
         let payloadText = boundShapedText(sanitized, maxCols ?? centerCols);
         const alignableEnc = enc as T & { align?: (alignment: 'left' | 'center') => T };
-        const centerRawLine = centerCols !== undefined && centerCols > 0 && typeof alignableEnc.align === 'function';
+        const centerRawLine =
+          centerCols !== undefined && centerCols > 0 && typeof alignableEnc.align === 'function';
         if (centerRawLine) {
-          const pad = Math.max(0, Math.floor((centerCols - shapedDisplayWidth(payloadText)) / 2));
+          const pad = Math.max(0, Math.floor((centerCols - displayCellWidth(payloadText)) / 2));
           payloadText = ' '.repeat(pad) + payloadText;
           alignableEnc.align?.('left');
         }
         try {
-          return (enc as { raw: (data: Uint8Array) => T }).raw(new TextEncoder().encode(payloadText));
+          return (enc as { raw: (data: Uint8Array) => T }).raw(
+            new TextEncoder().encode(payloadText),
+          );
         } finally {
           if (centerRawLine) alignableEnc.align?.('center');
         }
@@ -159,6 +242,69 @@ export function safePrinterText<T extends { text(value: string): T }>(
       return enc.text(boundShapedText(sanitized, maxCols));
     }
     if (!representable) {
+      const sanitized = value.replace(/\r\n?/g, '\n').replace(/[\x00-\x09\x0B-\x1F\x7F]/g, '');
+      const canvasFactory = resolveBrowserRasterCanvasFactory();
+      if (
+        sanitized &&
+        rasterCapabilityEnabled(thermalCapabilities, 'mixed') &&
+        canvasFactory &&
+        'raw' in enc &&
+        typeof (enc as { raw?: (data: Uint8Array) => T }).raw === 'function'
+      ) {
+        const align: 'left' | 'center' =
+          centerCols !== undefined && centerCols > 0 ? 'center' : 'left';
+        const textSize = thermalCapabilities.textSize ?? 'normal';
+        const styles: RasterStyle[] = isStoreName
+          ? ['bold', 'double-height', 'double-width']
+          : textSize === 'extra_large'
+            ? ['double-height', 'double-width']
+            : textSize === 'large'
+              ? ['double-height']
+              : ['normal'];
+        const layout = financial ? resolveFinancialRasterLayout(sanitized) : undefined;
+        const rasterResult = paintRasterRequest(
+          {
+            version: 1,
+            requestId: 'webusb-line',
+            text: sanitized,
+            widthDots: thermalCapabilities.raster.widthDots,
+            maxBandHeight: thermalCapabilities.raster.maxBandHeight,
+            direction: containsRtlScript(sanitized) ? 'rtl' : 'ltr',
+            align,
+            ...(layout ? { layout } : {}),
+            style: styles[0],
+            styles,
+            financial,
+            maxLines: 16,
+            ...(thermalCapabilities.raster.font
+              ? { bundledFont: thermalCapabilities.raster.font }
+              : {}),
+          },
+          canvasFactory,
+        );
+        if (rasterResult.ok) {
+          try {
+            const rasterBytes = encodeRasterUnits([rasterResult.unit], thermalCapabilities);
+            return (enc as { raw: (data: Uint8Array) => T }).raw(rasterBytes);
+          } catch (error) {
+            const detail = error instanceof Error ? error.message : String(error);
+            warnings?.push({
+              field: financial ? 'financial row' : isStoreName ? 'store name' : 'receipt line',
+              text: value.trim(),
+              message: `Raster rendering failed: ${detail}`,
+              kind: financial ? 'financial' : 'line',
+            });
+            return enc;
+          }
+        }
+        warnings?.push({
+          field: financial ? 'financial row' : isStoreName ? 'store name' : 'receipt line',
+          text: value.trim(),
+          message: `Raster rendering failed (${rasterResult.code}): ${rasterResult.detail}`,
+          kind: financial ? 'financial' : 'line',
+        });
+        return enc;
+      }
       const warning = makePrintWarning(value, isStoreName);
       if (financial) warning.kind = 'financial';
       warnings?.push(warning);
@@ -167,15 +313,20 @@ export function safePrinterText<T extends { text(value: string): T }>(
   }
   const codePage = selectThermalCodePage(printerValue, thermalCapabilities);
   if (
-    thermalCapabilities.shaping.arabic
-    && !hasNativeCodePage
-    && 'raw' in enc
-    && typeof (enc as { raw?: (data: Uint8Array) => T }).raw === 'function'
+    thermalCapabilities.shaping.arabic &&
+    !hasNativeCodePage &&
+    'raw' in enc &&
+    typeof (enc as { raw?: (data: Uint8Array) => T }).raw === 'function'
   ) {
     const sanitized = printerValue.replace(ESCPOS_TEXT_CONTROL_RE, '');
     return (enc as { raw: (data: Uint8Array) => T }).raw(new TextEncoder().encode(sanitized));
   }
-  if (codePage && codePage !== 'ascii' && 'codepage' in enc && typeof (enc as { codepage?: (value: string) => T }).codepage === 'function') {
+  if (
+    codePage &&
+    codePage !== 'ascii' &&
+    'codepage' in enc &&
+    typeof (enc as { codepage?: (value: string) => T }).codepage === 'function'
+  ) {
     (enc as { codepage: (value: string) => T }).codepage(codePage);
   }
   return enc.text(printerValue);
@@ -184,48 +335,96 @@ export function safePrinterText<T extends { text(value: string): T }>(
 /** Extracts error string from an unknown error or API Axios response. */
 export function extractPrinterErrorMessage(err: unknown): string {
   if (!err) return '';
-  const maybeAxios = err as { response?: { data?: { detail?: unknown; error?: unknown } }; message?: unknown };
+  const maybeAxios = err as {
+    response?: { data?: { detail?: unknown; error?: unknown } };
+    detail?: unknown;
+    message?: unknown;
+  };
   const detail = maybeAxios.response?.data?.detail;
-  if (typeof detail === 'string' && detail.trim()) return detail.trim();
+  if (typeof detail === 'string' && detail.trim()) return sanitizePrinterErrorDetail(detail.trim());
   const error = maybeAxios.response?.data?.error;
-  if (typeof error === 'string' && error.trim()) return error.trim();
-  if (err instanceof Error && typeof err.message === 'string' && err.message.trim()) {
-    return err.message.trim();
+  if (typeof error === 'string' && error.trim()) return sanitizePrinterErrorDetail(error.trim());
+  if (typeof maybeAxios.detail === 'string' && maybeAxios.detail.trim()) {
+    return sanitizePrinterErrorDetail(maybeAxios.detail.trim());
   }
-  return typeof err === 'string' ? err.trim() : '';
+  if (err instanceof Error && typeof err.message === 'string' && err.message.trim()) {
+    return sanitizePrinterErrorDetail(err.message.trim());
+  }
+  return typeof err === 'string' ? sanitizePrinterErrorDetail(err.trim()) : '';
+}
+
+type PrintErrorFields = { failure_class?: unknown; cause?: unknown; connection_type?: unknown };
+
+/**
+ * Reads `failure_class` and `cause` from a printer API error (`response.data`) or a
+ * `PrinterOperationError` (own fields), so the toast can name the fix.
+ */
+export function extractPrintErrorToastOptions(err: unknown): PrintErrorToastOptions {
+  const error = err as (PrintErrorFields & { response?: { data?: PrintErrorFields } }) | null;
+  const data = error?.response?.data ?? error;
+  return {
+    failureClass: typeof data?.failure_class === 'string' ? data.failure_class : null,
+    cause: typeof data?.cause === 'string' ? data.cause : null,
+    connectionType: typeof data?.connection_type === 'string' ? data.connection_type : null,
+  };
 }
 
 /** Matches only the Windows PRINTER_ATTRIBUTE_WORK_OFFLINE message (main/printers/thermal.ts), not generic offline/disconnected statuses. */
 const PRINTER_OFFLINE_DETAIL_RE = /\buse printer offline\b/i;
 
 /** Translator bootstrap outside React, matching the pattern in warnings-toast.ts / kot-web-print.ts. */
-function printerOfflineFixHint(): string {
+function bootstrapPrinterTranslator(): ((key: string) => string) | null {
   try {
     const lang = usePosSettingsStore.getState().language ?? 'en';
     const locale = LANGUAGES[lang]?.locale ?? 'en';
     const messages = getCachedMessages(lang) ?? getCachedMessages('en') ?? {};
-    const t = createTranslator({ locale, messages }) as unknown as (key: string) => string;
-    return t('printWarnings.printerOfflineHint');
+    return createTranslator({ locale, messages }) as unknown as (key: string) => string;
   } catch {
-    return "Printer isn't responding. Make sure it's powered on and connected, then check Windows: open the printer's queue and turn off \"Use Printer Offline\" if it's checked.";
+    return null;
   }
 }
 
+function printerOfflineFixHint(): string {
+  return (
+    bootstrapPrinterTranslator()?.('printWarnings.printerOfflineHint') ??
+    "Printer isn't responding. Make sure it's powered on and connected, then check Windows: open the printer's queue and turn off \"Use Printer Offline\" if it's checked."
+  );
+}
+
+/** The fix step for the reported cause or failure class, or null when the detail alone reads fine. */
+function failureFixHint(detail?: string, options?: PrintErrorToastOptions): string | null {
+  if (!detail && !options?.failureClass && !options?.cause) return null;
+  const t = bootstrapPrinterTranslator();
+  if (!t) return null;
+  return printFailureHint({ ...options, detail, platform: currentHintPlatform() }, t);
+}
+
 /** Formats a user-facing receipt print error message with operational detail when available. */
-export function formatReceiptErrorToast(detail?: string, fallbackTranslation = 'Receipt print failed'): string {
-  const msg = String(detail || '').trim();
-  if (PRINTER_OFFLINE_DETAIL_RE.test(msg)) return printerOfflineFixHint();
+export function formatReceiptErrorToast(
+  detail?: string,
+  fallbackTranslation = 'Receipt print failed',
+  options?: PrintErrorToastOptions,
+): string {
+  const msg = sanitizePrinterErrorDetail(detail);
   if (msg.startsWith('Receipt not printed:')) return msg;
+  const fixHint = failureFixHint(msg, options);
+  if (fixHint) return fixHint;
+  if (PRINTER_OFFLINE_DETAIL_RE.test(msg)) return printerOfflineFixHint();
   if (msg && msg !== 'print failed' && msg !== 'Print failed') {
     return `${fallbackTranslation} (${msg})`;
   }
   return fallbackTranslation;
 }
 
-
 /** Formats a user-facing KOT print error message with operational detail when available. */
-export function formatKotErrorToast(detail?: string, fallbackTranslation = 'KOT print failed'): string {
-  const msg = String(detail || '').trim();
+export function formatKotErrorToast(
+  detail?: string,
+  fallbackTranslation = 'KOT print failed',
+  options?: PrintErrorToastOptions,
+): string {
+  const msg = sanitizePrinterErrorDetail(detail);
+  const fixHint = failureFixHint(msg, options);
+  if (fixHint) return fixHint;
   if (PRINTER_OFFLINE_DETAIL_RE.test(msg)) return printerOfflineFixHint();
   if (msg && msg !== 'print failed' && msg !== 'KOT print failed') {
     return `${fallbackTranslation}: ${msg}`;

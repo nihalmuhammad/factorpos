@@ -12,7 +12,22 @@ import { SHUTDOWN_TIMEOUT_MS } from './shutdown';
 import { resolveContainedPath } from './lib/path-containment';
 import { serializeMerchantTemplatePayload, validateMerchantTemplateText } from '../shared/print';
 import { ROLE_KEYS } from '../shared/role-permissions';
-import { getCurrencyFractionDigits } from './countries';
+import {
+  businessDateForInstant,
+  dateTimeFormat,
+  dayBoundsInTimezone,
+  normalizeBusinessDayStartTime,
+  utcDayBounds,
+} from '../shared/business-date';
+import {
+  getCurrencyFractionDigits,
+  getCurrencyMinorUnitFactor,
+  resolveRegionalSnapshot,
+  resolveTenantCurrency,
+} from './countries';
+import { clearInMemoryRevokedTokens, clearUserAuthCache } from './middleware/security';
+import { clearJWTSecretCache } from './security/jwt-secret';
+import { instrumentDatabase } from './services/db-timing';
 
 const USER_ROLE_SQL_CHECK = `CHECK (role IN (${ROLE_KEYS.map((role) => `'${role}'`).join(', ')}))`;
 
@@ -41,21 +56,25 @@ function releaseMaintenanceDrainWaiters(): void {
 }
 
 function releaseMaintenanceRequestWaiters(): void {
-  if (activeDatabaseRequests !== 0 || databaseMaintenanceActive || databaseMaintenancePending !== 0) return;
+  if (activeDatabaseRequests !== 0 || databaseMaintenanceActive || databaseMaintenancePending !== 0)
+    return;
   const waiters = maintenanceRequestWaiters;
   maintenanceRequestWaiters = [];
   waiters.forEach((resolve) => resolve());
 }
 
 function releaseDatabaseIdleWaiters(): void {
-  if (activeDatabaseRequests !== 0 || databaseMaintenanceActive || databaseMaintenancePending !== 0) return;
+  if (activeDatabaseRequests !== 0 || databaseMaintenanceActive || databaseMaintenancePending !== 0)
+    return;
   const waiters = databaseIdleWaiters;
   databaseIdleWaiters = [];
   waiters.forEach((resolve) => resolve());
 }
 
 function createMaintenanceAbortError(): Error & { code: string } {
-  const error = new Error('Database maintenance cancelled during shutdown') as Error & { code: string };
+  const error = new Error('Database maintenance cancelled during shutdown') as Error & {
+    code: string;
+  };
   error.code = 'ERR_SHUTDOWN_ABORTED';
   return error;
 }
@@ -71,7 +90,9 @@ function createDatabaseShutdownError(): Error & { code: string } {
 }
 
 function createDatabaseShutdownTimeoutError(): Error & { code: string } {
-  const error = new Error(`Database shutdown timed out after ${SHUTDOWN_TIMEOUT_MS}ms`) as Error & { code: string };
+  const error = new Error(`Database shutdown timed out after ${SHUTDOWN_TIMEOUT_MS}ms`) as Error & {
+    code: string;
+  };
   error.code = 'ERR_SHUTDOWN_TIMEOUT';
   return error;
 }
@@ -80,8 +101,8 @@ function createDatabaseShutdownTimeoutError(): Error & { code: string } {
 function createDatabaseMissingError(dbPath: string): Error & { code: string } {
   const error = new Error(
     `Database file is missing at ${dbPath}, but this install was previously initialized. ` +
-    'Refusing to start with a new, empty database to avoid silently losing existing data. ' +
-    'Restore from a backup (Settings → Backup & Restore, or the backups folder) and restart Flo Cafe.'
+      'Refusing to start with a new, empty database to avoid silently losing existing data. ' +
+      'Restore from a backup (Settings → Backup & Restore, or the backups folder) and restart Flo Cafe.',
   ) as Error & { code: string };
   error.code = 'ERR_DATABASE_MISSING';
   return error;
@@ -91,7 +112,9 @@ function createDatabaseMissingError(dbPath: string): Error & { code: string } {
 export const MAINTENANCE_DRAIN_TIMEOUT_MS = SHUTDOWN_TIMEOUT_MS;
 
 function createMaintenanceDrainTimeoutError(timeoutMs: number): Error & { code: string } {
-  const error = new Error(`Database maintenance timed out after ${timeoutMs}ms waiting for active requests to drain`) as Error & { code: string };
+  const error = new Error(
+    `Database maintenance timed out after ${timeoutMs}ms waiting for active requests to drain`,
+  ) as Error & { code: string };
   error.code = 'ERR_MAINTENANCE_DRAIN_TIMEOUT';
   return error;
 }
@@ -102,7 +125,9 @@ export function beginDatabaseShutdown(): void {
 }
 
 function getMaintenanceSignal(signal?: AbortSignal): AbortSignal {
-  return signal ? AbortSignal.any([signal, databaseShutdownController.signal]) : databaseShutdownController.signal;
+  return signal
+    ? AbortSignal.any([signal, databaseShutdownController.signal])
+    : databaseShutdownController.signal;
 }
 
 function waitForActiveDatabaseRequests(signal: AbortSignal, timeoutMs?: number): Promise<void> {
@@ -147,18 +172,24 @@ function waitForActiveDatabaseRequests(signal: AbortSignal, timeoutMs?: number):
   });
 }
 
-export function withDatabaseRequest<T>(operation: () => T | Promise<T>, signal?: AbortSignal): Promise<T> {
-  if (databaseShutdownRequested || signal?.aborted) return Promise.reject(createDatabaseShutdownError());
+export function withDatabaseRequest<T>(
+  operation: () => T | Promise<T>,
+  signal?: AbortSignal,
+): Promise<T> {
+  if (databaseShutdownRequested || signal?.aborted)
+    return Promise.reject(createDatabaseShutdownError());
   const run = (): Promise<T> => {
     // Reserve the request synchronously. A maintenance lock scheduled in the
     // same turn must observe this request before it starts replacing the DB.
     activeDatabaseRequests += 1;
-    return Promise.resolve().then(operation).finally(() => {
-      activeDatabaseRequests = Math.max(0, activeDatabaseRequests - 1);
-      releaseMaintenanceDrainWaiters();
-      releaseMaintenanceRequestWaiters();
-      releaseDatabaseIdleWaiters();
-    });
+    return Promise.resolve()
+      .then(operation)
+      .finally(() => {
+        activeDatabaseRequests = Math.max(0, activeDatabaseRequests - 1);
+        releaseMaintenanceDrainWaiters();
+        releaseMaintenanceRequestWaiters();
+        releaseDatabaseIdleWaiters();
+      });
   };
   if (!databaseMaintenanceActive) return run();
   return new Promise<T>((resolve, reject) => {
@@ -207,82 +238,238 @@ export function isDatabaseMaintenanceActive(): boolean {
 const DATABASE_MAINTENANCE_ROUTES = new Set([
   'POST /api/db/import',
   'POST /api/db/backup',
+  'POST /api/db/restore',
+  'POST /api/auth/setup/restore',
   'GET /api/db/download',
   'POST /api/db-tools/initialize',
+  'POST /api/db-tools/currency-reset',
 ]);
 
 function isDatabaseMaintenanceRoute(req: Request): boolean {
-  return DATABASE_MAINTENANCE_ROUTES.has(`${req.method} ${req.path}`);
+  // Lowercased for the same reason as requireAuth: the mount is case-insensitive,
+  // so an exact-match lookup on the raw spelling misses case variants.
+  // Trailing slash is normalized to match Express route handling.
+  const rawPath = ((req.baseUrl || '') + (req.path || '')).toLowerCase();
+  const fullPath =
+    rawPath.length > 1 && rawPath.endsWith('/') ? rawPath.replace(/\/+$/, '') : rawPath;
+  const method = String(req.method || '').toUpperCase();
+  return DATABASE_MAINTENANCE_ROUTES.has(`${method} ${fullPath}`);
 }
 
-export function databaseMaintenanceMiddleware(req: Request, res: Response, next: NextFunction): void {
+export interface DatabaseAdmissionReservation {
+  retain(): boolean;
+  release(): void;
+  isReleased(): boolean;
+}
+
+class DatabaseAdmissionReservationImpl implements DatabaseAdmissionReservation {
+  private refCount = 1;
+  private released = false;
+
+  retain(): boolean {
+    if (this.released) return false;
+    this.refCount += 1;
+    return true;
+  }
+
+  isReleased(): boolean {
+    return this.released;
+  }
+
+  release(): void {
+    if (this.released) return;
+    this.refCount -= 1;
+    if (this.refCount <= 0) {
+      this.released = true;
+      activeDatabaseRequests = Math.max(0, activeDatabaseRequests - 1);
+      releaseMaintenanceDrainWaiters();
+      releaseMaintenanceRequestWaiters();
+      releaseDatabaseIdleWaiters();
+    }
+  }
+}
+
+function isLoopbackAddress(ip: string | undefined): boolean {
+  if (!ip) return false;
+  const normalized = ip.startsWith('::ffff:') ? ip.substring(7) : ip;
+  return normalized === '127.0.0.1' || normalized === '::1' || normalized.startsWith('127.');
+}
+
+const MAINTENANCE_HANDOFF_TTL_MS = 15_000;
+
+interface MaintenanceHandoffEntry {
+  reservation: DatabaseAdmissionReservation;
+  expiresAt: number;
+}
+
+const activeMaintenanceHandoffs = new Map<string, MaintenanceHandoffEntry>();
+
+function sweepExpiredMaintenanceHandoffs(): void {
+  const now = Date.now();
+  for (const [token, entry] of activeMaintenanceHandoffs.entries()) {
+    if (entry.expiresAt <= now) {
+      activeMaintenanceHandoffs.delete(token);
+      entry.reservation.release();
+    }
+  }
+}
+
+export function createDatabaseMaintenanceHandoff(
+  reservation: DatabaseAdmissionReservation,
+): string | null {
+  if (reservation.isReleased()) return null;
+  if (!reservation.retain()) return null;
+  sweepExpiredMaintenanceHandoffs();
+  const token = crypto.randomUUID();
+  activeMaintenanceHandoffs.set(token, {
+    reservation,
+    expiresAt: Date.now() + MAINTENANCE_HANDOFF_TTL_MS,
+  });
+  return token;
+}
+
+export function consumeDatabaseMaintenanceHandoff(
+  token: string,
+): DatabaseAdmissionReservation | null {
+  const entry = activeMaintenanceHandoffs.get(token);
+  if (!entry) return null;
+  activeMaintenanceHandoffs.delete(token);
+  if (Date.now() > entry.expiresAt || entry.reservation.isReleased()) {
+    entry.reservation.release();
+    return null;
+  }
+  return entry.reservation;
+}
+
+export function revokeDatabaseMaintenanceHandoff(token: string): void {
+  const entry = activeMaintenanceHandoffs.get(token);
+  if (entry) {
+    activeMaintenanceHandoffs.delete(token);
+    entry.reservation.release();
+  }
+}
+
+export function getActiveDatabaseRequestsCount(): number {
+  return activeDatabaseRequests;
+}
+
+export function databaseMaintenanceMiddleware(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): void {
+  const fullPath = ((req.baseUrl || '') + req.path).toLowerCase();
+  if (!fullPath.startsWith('/api')) {
+    next();
+    return;
+  }
+
   if (databaseShutdownRequested) {
     res.status(503).json({ error: 'Database is shutting down' });
     return;
   }
-  // Reject requests while maintenance is active before middleware can touch database handle.
-  if (databaseMaintenanceActive) {
+
+  // Trusted internal loopback handoff from Server App (:3003) to Main API (:3001)
+  const rawHandoffHeader = req.headers?.['x-flo-maintenance-handoff'];
+  let handoffReservation: DatabaseAdmissionReservation | null = null;
+  if (typeof rawHandoffHeader === 'string' && isLoopbackAddress(req.socket?.remoteAddress)) {
+    handoffReservation = consumeDatabaseMaintenanceHandoff(rawHandoffHeader);
+  }
+
+  // Reject requests while maintenance is active unless already admitted via trusted handoff.
+  if (!handoffReservation && databaseMaintenanceActive) {
     res.status(503).json({ error: 'Database maintenance in progress' });
     return;
   }
 
   // Maintenance route handlers acquire the FIFO lock themselves; exclude from active count.
   if (isDatabaseMaintenanceRoute(req)) {
+    if (handoffReservation) {
+      handoffReservation.release();
+    }
     next();
     return;
   }
 
-  activeDatabaseRequests += 1;
+  let reservation: DatabaseAdmissionReservation;
+  if (handoffReservation) {
+    // Ticket hold transferred to this inner request — no extra retain or activeDatabaseRequests increment needed.
+    reservation = handoffReservation;
+  } else {
+    activeDatabaseRequests += 1;
+    reservation = new DatabaseAdmissionReservationImpl();
+  }
+
+  (req as any).databaseAdmissionReservation = reservation;
+
   let released = false;
   const release = () => {
     if (released) return;
     released = true;
-    activeDatabaseRequests = Math.max(0, activeDatabaseRequests - 1);
-    releaseMaintenanceDrainWaiters();
-    releaseMaintenanceRequestWaiters();
-    releaseDatabaseIdleWaiters();
+    reservation.release();
   };
   res.once('finish', release);
   res.once('close', release);
   next();
 }
 
-export function withDatabaseMaintenanceLock<T>(operation: (signal: AbortSignal) => T | Promise<T>, signal?: AbortSignal, timeoutMs?: number): Promise<T> {
+export function withDatabaseMaintenanceLock<T>(
+  operation: (signal: AbortSignal) => T | Promise<T>,
+  signal?: AbortSignal,
+  timeoutMs?: number,
+): Promise<T> {
   if (databaseShutdownRequested) return Promise.reject(createMaintenanceAbortError());
   const maintenanceSignal = getMaintenanceSignal(signal);
   const previous = databaseMaintenanceTail;
   databaseMaintenancePending += 1;
   let started = false;
   let release!: () => void;
-  databaseMaintenanceTail = new Promise<void>((resolve) => { release = resolve; });
-  const queued = previous.then(async () => {
-    if (maintenanceSignal.aborted || databaseShutdownRequested) throw createMaintenanceAbortError();
-    started = true;
-    databaseMaintenanceActive = true;
-    for (const listener of databaseMaintenanceStartListeners) {
-      try { listener(); } catch (error) { console.error('[DB] Maintenance listener failed:', error); }
-    }
-    try {
-      // Drain requests in flight before maintenance started.
-      if (activeDatabaseRequests > 0) {
-        await waitForActiveDatabaseRequests(maintenanceSignal, timeoutMs ?? MAINTENANCE_DRAIN_TIMEOUT_MS);
+  databaseMaintenanceTail = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const queued = previous
+    .then(async () => {
+      if (maintenanceSignal.aborted || databaseShutdownRequested)
+        throw createMaintenanceAbortError();
+      started = true;
+      databaseMaintenanceActive = true;
+      for (const listener of databaseMaintenanceStartListeners) {
+        try {
+          listener();
+        } catch (error) {
+          console.error('[DB] Maintenance listener failed:', error);
+        }
       }
-      if (maintenanceSignal.aborted || databaseShutdownRequested) throw createMaintenanceAbortError();
-      return await operation(maintenanceSignal);
-    } finally {
-      databaseMaintenanceActive = false;
-      for (const listener of databaseMaintenanceEndListeners) {
-        try { listener(); } catch (error) { console.error('[DB] Maintenance end listener failed:', error); }
+      try {
+        // Drain requests in flight before maintenance started.
+        if (activeDatabaseRequests > 0) {
+          await waitForActiveDatabaseRequests(
+            maintenanceSignal,
+            timeoutMs ?? MAINTENANCE_DRAIN_TIMEOUT_MS,
+          );
+        }
+        if (maintenanceSignal.aborted || databaseShutdownRequested)
+          throw createMaintenanceAbortError();
+        return await operation(maintenanceSignal);
+      } finally {
+        databaseMaintenanceActive = false;
+        for (const listener of databaseMaintenanceEndListeners) {
+          try {
+            listener();
+          } catch (error) {
+            console.error('[DB] Maintenance end listener failed:', error);
+          }
+        }
+        releaseMaintenanceRequestWaiters();
+        releaseDatabaseIdleWaiters();
       }
+    })
+    .finally(() => {
+      databaseMaintenancePending = Math.max(0, databaseMaintenancePending - 1);
+      release();
       releaseMaintenanceRequestWaiters();
       releaseDatabaseIdleWaiters();
-    }
-  }).finally(() => {
-    databaseMaintenancePending = Math.max(0, databaseMaintenancePending - 1);
-    release();
-    releaseMaintenanceRequestWaiters();
-    releaseDatabaseIdleWaiters();
-  });
+    });
   return new Promise<T>((resolve, reject) => {
     let settled = false;
     const onAbort = (): void => {
@@ -313,7 +500,9 @@ export function withDatabaseMaintenanceLock<T>(operation: (signal: AbortSignal) 
 const DEFAULT_CLOUD_SERVER_URL = 'https://blue.flopos.com/';
 
 function randomSecret(): string {
-  return crypto.randomBytes(32).toString('base64')
+  return crypto
+    .randomBytes(32)
+    .toString('base64')
     .replace(/\+/g, '-')
     .replace(/\//g, '_')
     .replace(/=+$/g, '');
@@ -324,19 +513,29 @@ function sha256Hex(value: string): string {
 }
 
 export function getSettingValue(key: string): string | null {
-  const row = db.prepare('SELECT value FROM settings WHERE key = ?').get(key) as { value: string | null } | undefined;
+  const row = db.prepare('SELECT value FROM settings WHERE key = ?').get(key) as
+    | { value: string | null }
+    | undefined;
   return row?.value ?? null;
 }
 
-/** Resolves the tenant's configured business day start time ('HH:mm', 00:00 to 11:59). */
+/** Resolves the tenant's configured business day start time, holding it to the
+ *  `00:00`-`11:59` contract the settings endpoint enforces. */
 export function tenantBusinessDayStartTime(customDb?: ReturnType<typeof getDatabase>): string {
   const raw = customDb
-    ? (customDb.prepare("SELECT value FROM settings WHERE key = 'business_day_start_time'").get() as { value?: unknown } | undefined)?.value
+    ? (
+        customDb
+          .prepare("SELECT value FROM settings WHERE key = 'business_day_start_time'")
+          .get() as { value?: unknown } | undefined
+      )?.value
     : getSettingValue('business_day_start_time');
-  if (typeof raw === 'string' && /^(?:0\d|1[01]):[0-5]\d$/.test(raw.trim())) {
-    return raw.trim();
-  }
-  return '00:00';
+  return normalizeBusinessDayStartTime(typeof raw === 'string' ? raw : null);
+}
+
+let settingsRevision = 0;
+
+export function getSettingsRevision(): number {
+  return settingsRevision;
 }
 
 export function upsertSettings(entries: Record<string, string | undefined | null>): void {
@@ -347,6 +546,45 @@ export function upsertSettings(entries: Record<string, string | undefined | null
   for (const [key, val] of Object.entries(entries)) {
     if (val !== undefined) stmt.run(key, val ?? '', now());
   }
+  settingsRevision += 1;
+}
+
+export const GOOGLE_DRIVE_PRIVATE_SETTING_KEYS = [
+  'google_drive_account_subject',
+  'google_drive_account_email',
+  'google_drive_destination_folder_id',
+  'google_drive_destination_folder_name',
+  'google_drive_folder_id',
+  'google_drive_owned_destinations',
+  'google_drive_last_backup_at',
+  'google_drive_last_backup_status',
+  'google_drive_last_automatic_backup_at',
+  'google_drive_last_attempt_at',
+  'google_drive_last_success_at',
+  'google_drive_last_success_kind',
+  'google_drive_next_retry_at',
+  'google_drive_retention_status',
+  'google_drive_retention_retry_count',
+  'google_drive_last_error_code',
+  'google_drive_pending_upload',
+  'google_drive_job',
+  'google_drive_revoke_status',
+  'google_drive_revoke_cleanup_pending',
+  'google_drive_menu_folder_id',
+  'google_drive_menu_file_id',
+  'google_drive_menu_sharing_enabled',
+  'google_drive_menu_source',
+  'google_drive_menu_updated_at',
+  'google_drive_menu_file_name',
+  'google_drive_menu_web_view_link',
+];
+
+export function clearGoogleDriveRestoreBinding(dbInstance: Database.Database = db): void {
+  const placeholders = GOOGLE_DRIVE_PRIVATE_SETTING_KEYS.map(() => '?').join(', ');
+  dbInstance
+    .prepare(`DELETE FROM settings WHERE key IN (${placeholders})`)
+    .run(...GOOGLE_DRIVE_PRIVATE_SETTING_KEYS);
+  settingsRevision += 1;
 }
 
 function upsertSetting(key: string, value: string): void {
@@ -354,11 +592,16 @@ function upsertSetting(key: string, value: string): void {
     INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?)
     ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
   `).run(key, value, now());
+  settingsRevision += 1;
 }
 
 function insertSettingIfMissing(key: string, value: string): void {
-  db.prepare('INSERT OR IGNORE INTO settings (key, value, updated_at) VALUES (?, ?, ?)')
-    .run(key, value, now());
+  db.prepare('INSERT OR IGNORE INTO settings (key, value, updated_at) VALUES (?, ?, ?)').run(
+    key,
+    value,
+    now(),
+  );
+  settingsRevision += 1;
 }
 
 export function getDbHealth(): { ok: boolean; error?: string } {
@@ -371,14 +614,15 @@ export function getDbPath(): string {
   // Native Playwright owns this path for its disposable local Electron run.
   // It is intentionally opt-in and has no effect on normal desktop installs.
   if (process.env.FLO_E2E_DB_PATH) return path.resolve(process.env.FLO_E2E_DB_PATH);
-  const projectRoot = path.basename(path.dirname(__dirname)) === 'dist'
-    ? path.resolve(__dirname, '../..')
-    : path.resolve(__dirname, '..');
+  const projectRoot =
+    path.basename(path.dirname(__dirname)) === 'dist'
+      ? path.resolve(__dirname, '../..')
+      : path.resolve(__dirname, '..');
   const userDataPath = app.isPackaged ? app.getPath('userData') : projectRoot;
   return path.join(userDataPath, 'flo.db');
 }
 
-function getBackupDir(): string {
+export function getBackupDir(): string {
   const userDataPath = app.getPath('userData');
   return path.join(userDataPath, 'backups');
 }
@@ -389,17 +633,33 @@ function getDbInitializedMarkerPath(): string {
   return path.join(userDataPath, '.flo-db-initialized');
 }
 
+type ReplacementJournalSidecar = '-wal' | '-shm';
+
 type ReplacementJournal = {
   phase: 'prepared' | 'committed';
   recoveryPath: string;
   dbPath: string;
   baselineForeignKeyViolations?: string[];
+  driveInvalidationRequired?: boolean;
+  downgradeRecovery?: boolean;
+  recoverySidecars?: ReplacementJournalSidecar[];
+};
+
+export type DatabaseReplacementJournalHandle = {
+  phase: 'prepared' | 'committed';
+  journalPath: string;
+  recoveryPath: string;
+  dbPath: string;
 };
 
 function syncFile(filePath: string): void {
   // Use writable handle for portable fsync across Windows and POSIX.
   const fd = fs.openSync(filePath, 'r+');
-  try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+  try {
+    fs.fsyncSync(fd);
+  } finally {
+    fs.closeSync(fd);
+  }
 }
 
 function writeReplacementJournal(journalPath: string, journal: ReplacementJournal): void {
@@ -412,16 +672,35 @@ function writeReplacementJournal(journalPath: string, journal: ReplacementJourna
   }
 }
 
+function isSameBigIntStatFile(candidateStat: fs.BigIntStats, targetStat: fs.BigIntStats): boolean {
+  if (candidateStat.dev !== targetStat.dev) return false;
+  if (candidateStat.ino !== 0n || targetStat.ino !== 0n) {
+    return candidateStat.ino !== 0n && candidateStat.ino === targetStat.ino;
+  }
+  return (
+    candidateStat.nlink > 1n &&
+    targetStat.nlink > 1n &&
+    candidateStat.size === targetStat.size &&
+    candidateStat.mtimeNs === targetStat.mtimeNs
+  );
+}
+
 function isLiveDatabaseTarget(candidatePath: string, dbPath: string): boolean {
-  const normalize = (value: string) => process.platform === 'win32' || process.platform === 'darwin' ? value.toLowerCase() : value;
+  const normalize = (value: string) =>
+    process.platform === 'win32' || process.platform === 'darwin' ? value.toLowerCase() : value;
   if (normalize(path.resolve(candidatePath)) === normalize(path.resolve(dbPath))) return true;
   try {
-    const candidateStat = fs.statSync(candidatePath);
-    const dbStat = fs.statSync(dbPath);
-    if (candidateStat.dev === dbStat.dev && candidateStat.ino === dbStat.ino) return true;
-  } catch { }
+    const candidateStat = fs.statSync(candidatePath, { bigint: true });
+    const dbStat = fs.statSync(dbPath, { bigint: true });
+    if (isSameBigIntStatFile(candidateStat, dbStat)) {
+      return true;
+    }
+  } catch {}
   try {
-    const candidateReal = path.join(fs.realpathSync(path.dirname(candidatePath)), path.basename(candidatePath));
+    const candidateReal = path.join(
+      fs.realpathSync(path.dirname(candidatePath)),
+      path.basename(candidatePath),
+    );
     return normalize(candidateReal) === normalize(fs.realpathSync(dbPath));
   } catch {
     return false;
@@ -429,13 +708,22 @@ function isLiveDatabaseTarget(candidatePath: string, dbPath: string): boolean {
 }
 
 function pathEntryExists(filePath: string): boolean {
-  try { fs.lstatSync(filePath); return true; } catch { return false; }
+  try {
+    fs.lstatSync(filePath);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function syncDirectory(directoryPath: string): boolean {
   try {
     const fd = fs.openSync(directoryPath, 'r');
-    try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+    try {
+      fs.fsyncSync(fd);
+    } finally {
+      fs.closeSync(fd);
+    }
     return true;
   } catch {
     // Directory fsync is unavailable on some Windows filesystems.
@@ -443,145 +731,1338 @@ function syncDirectory(directoryPath: string): boolean {
   }
 }
 
-function removeReplacementArtifacts(journalPath: string, recoveryPath: string): void {
-  for (const filePath of [journalPath, `${journalPath}.tmp`, recoveryPath, `${recoveryPath}-wal`, `${recoveryPath}-shm`]) {
-    try { if (pathEntryExists(filePath)) fs.unlinkSync(filePath); } catch { }
+function removeReplacementArtifactsDurably(journalPath: string, recoveryPath: string): void {
+  const directoryPath = path.dirname(journalPath);
+  const artifactPaths = [
+    journalPath,
+    `${journalPath}.tmp`,
+    recoveryPath,
+    `${recoveryPath}-wal`,
+    `${recoveryPath}-shm`,
+  ];
+  const cleanupId = crypto.randomBytes(8).toString('hex');
+  const backups: { originalPath: string; backupPath: string }[] = [];
+  let restorationFailed = false;
+  try {
+    for (const originalPath of artifactPaths) {
+      if (!pathEntryExists(originalPath)) continue;
+      const backupPath = `${originalPath}.cleanup-${cleanupId}`;
+      fs.copyFileSync(originalPath, backupPath);
+      syncFile(backupPath);
+      backups.push({ originalPath, backupPath });
+    }
+    if (!syncDirectory(directoryPath) && process.platform !== 'win32')
+      throw new Error('Could not durably prepare database replacement cleanup');
+    for (const filePath of [recoveryPath, `${recoveryPath}-wal`, `${recoveryPath}-shm`]) {
+      if (pathEntryExists(filePath)) fs.unlinkSync(filePath);
+    }
+    if (!syncDirectory(directoryPath) && process.platform !== 'win32')
+      throw new Error('Could not durably remove database replacement artifacts');
+    for (const filePath of [`${journalPath}.tmp`, journalPath]) {
+      if (pathEntryExists(filePath)) fs.unlinkSync(filePath);
+    }
+    if (!syncDirectory(directoryPath) && process.platform !== 'win32')
+      throw new Error('Could not durably remove database replacement journal');
+    for (const { backupPath } of backups) {
+      if (pathEntryExists(backupPath)) fs.unlinkSync(backupPath);
+    }
+    if (!syncDirectory(directoryPath) && process.platform !== 'win32')
+      throw new Error('Could not durably remove database replacement cleanup copies');
+  } catch (error) {
+    for (const { originalPath, backupPath } of backups) {
+      try {
+        if (!pathEntryExists(originalPath) && pathEntryExists(backupPath)) {
+          fs.copyFileSync(backupPath, originalPath);
+          syncFile(originalPath);
+        }
+      } catch {
+        restorationFailed = true;
+      }
+    }
+    if (!syncDirectory(directoryPath)) restorationFailed = true;
+    if (!restorationFailed) {
+      for (const { backupPath } of backups) {
+        try {
+          if (pathEntryExists(backupPath)) fs.unlinkSync(backupPath);
+        } catch {
+          restorationFailed = true;
+        }
+      }
+      if (!syncDirectory(directoryPath)) restorationFailed = true;
+    }
+    if (restorationFailed) {
+      throw new Error(
+        `Database replacement cleanup failed and recovery evidence was retained: ${error instanceof Error ? error.message : 'unknown error'}`,
+        { cause: error },
+      );
+    }
+    throw error;
   }
-  syncDirectory(path.dirname(journalPath));
 }
 
-let recoverySchemaReference: Map<string, string[]> | null = null;
+function restoreReplacementCleanupEvidence(backupDir: string, dbPath: string): void {
+  let names: string[];
+  try {
+    names = fs.readdirSync(backupDir);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+    throw error;
+  }
+  const groups = new Map<string, Map<string, string>>();
+  for (const name of names) {
+    const markerIndex = name.lastIndexOf('.cleanup-');
+    if (markerIndex < 0) continue;
+    const originalName = name.slice(0, markerIndex);
+    const cleanupId = name.slice(markerIndex + '.cleanup-'.length);
+    if (!/^[a-f0-9]{16}$/.test(cleanupId)) continue;
+    if (
+      !/^(?:flo-restore|flo-reset)-recovery-.+\.(?:json|json\.tmp|db(?:-(?:wal|shm))?)$/.test(
+        originalName,
+      )
+    )
+      continue;
+    const canonicalName = originalName.endsWith('.json.tmp')
+      ? originalName.slice(0, -'.tmp'.length)
+      : originalName;
+    const canonicalBase = canonicalName.replace(/(?:\.json|\.db(?:-(?:wal|shm))?)$/, '');
+    const groupKey = `${canonicalBase}:${cleanupId}`;
+    const group = groups.get(groupKey) || new Map<string, string>();
+    group.set(canonicalName, name);
+    groups.set(groupKey, group);
+  }
+  for (const [groupKey, group] of groups) {
+    const separator = groupKey.lastIndexOf(':');
+    const canonicalBase = groupKey.slice(0, separator);
+    const journalName = `${canonicalBase}.json`;
+    const recoveryName = `${canonicalBase}.db`;
+    const journalPath = path.join(backupDir, journalName);
+    const recoveryPath = path.join(backupDir, recoveryName);
+    const journalEvidence = group.get(journalName) || group.get(`${journalName}.tmp`);
+    const recoveryEvidence = group.get(recoveryName);
+    if (!journalEvidence || !recoveryEvidence) {
+      if (pathEntryExists(journalPath) || pathEntryExists(recoveryPath))
+        throw new Error(`Incomplete database replacement cleanup evidence: ${canonicalBase}`);
+      for (const evidenceName of new Set(group.values())) {
+        const evidencePath = path.join(backupDir, evidenceName);
+        if (pathEntryExists(evidencePath)) fs.unlinkSync(evidencePath);
+      }
+      if (!syncDirectory(backupDir) && process.platform !== 'win32')
+        throw new Error(
+          'Could not durably remove incomplete database replacement cleanup evidence',
+        );
+      continue;
+    }
+    const evidencePairs: [string, string | undefined][] = [
+      [journalPath, journalEvidence],
+      [recoveryPath, recoveryEvidence],
+      [`${recoveryPath}-wal`, group.get(`${recoveryName}-wal`)],
+      [`${recoveryPath}-shm`, group.get(`${recoveryName}-shm`)],
+    ];
+    for (const [canonicalPath, evidenceName] of evidencePairs) {
+      if (!evidenceName || pathEntryExists(canonicalPath)) continue;
+      const evidencePath = path.join(backupDir, evidenceName);
+      const evidenceStat = fs.lstatSync(evidencePath);
+      if (evidenceStat.isSymbolicLink() || !evidenceStat.isFile())
+        throw new Error(`Invalid database replacement cleanup evidence: ${evidenceName}`);
+      if (canonicalPath === journalPath) {
+        const journal = JSON.parse(
+          fs.readFileSync(evidencePath, 'utf8'),
+        ) as Partial<ReplacementJournal>;
+        if (journal.dbPath !== dbPath || journal.recoveryPath !== recoveryPath)
+          throw new Error(`Invalid database replacement cleanup journal: ${evidenceName}`);
+      }
+      fs.copyFileSync(evidencePath, canonicalPath);
+      syncFile(canonicalPath);
+    }
+    for (const evidenceName of new Set(group.values())) {
+      const evidencePath = path.join(backupDir, evidenceName);
+      if (pathEntryExists(evidencePath)) fs.unlinkSync(evidencePath);
+    }
+    if (!syncDirectory(backupDir) && process.platform !== 'win32')
+      throw new Error('Could not durably restore database replacement cleanup evidence');
+  }
+}
+
+function replacementJournalPath(kind: 'restore' | 'reset'): string {
+  const recoveryPath = path.join(
+    getBackupDir(),
+    `flo-${kind}-recovery-${crypto.randomBytes(8).toString('hex')}.db`,
+  );
+  return recoveryPath.replace(/\.db$/, '.json');
+}
+
+function isValidReplacementSidecarList(
+  value: unknown,
+): value is ReplacementJournalSidecar[] | undefined {
+  if (value === undefined) return true;
+  if (!Array.isArray(value)) return false;
+  const seen = new Set<string>();
+  for (const entry of value) {
+    if ((entry !== '-wal' && entry !== '-shm') || seen.has(entry)) return false;
+    seen.add(entry);
+  }
+  return true;
+}
+
+function readReplacementJournal(journalPath: string): ReplacementJournal | null {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(journalPath, 'utf8')) as Partial<ReplacementJournal>;
+    if (
+      (parsed.phase !== 'prepared' && parsed.phase !== 'committed') ||
+      typeof parsed.recoveryPath !== 'string' ||
+      typeof parsed.dbPath !== 'string' ||
+      !path.isAbsolute(parsed.recoveryPath) ||
+      !path.isAbsolute(parsed.dbPath) ||
+      parsed.driveInvalidationRequired !== true ||
+      (parsed.downgradeRecovery !== undefined && typeof parsed.downgradeRecovery !== 'boolean') ||
+      !isValidReplacementSidecarList(parsed.recoverySidecars) ||
+      parsed.dbPath !== getDbPath() ||
+      path.dirname(parsed.recoveryPath) !== path.resolve(getBackupDir()) ||
+      `${path.basename(journalPath, '.json')}.db` !== path.basename(parsed.recoveryPath)
+    )
+      return null;
+    return parsed as ReplacementJournal;
+  } catch {
+    return null;
+  }
+}
+
+export function getDatabaseReplacementJournal(): DatabaseReplacementJournalHandle | null {
+  restoreReplacementCleanupEvidence(getBackupDir(), getDbPath());
+  let journals: string[];
+  try {
+    journals = fs
+      .readdirSync(getBackupDir())
+      .filter((name) => /^(?:flo-restore|flo-reset)-recovery-.+\.json$/.test(name))
+      .map((name) => path.join(getBackupDir(), name))
+      .sort((a, b) => fs.lstatSync(b).mtimeMs - fs.lstatSync(a).mtimeMs);
+  } catch {
+    return null;
+  }
+  const journalPath = journals[0];
+  if (!journalPath) return null;
+  const journal = readReplacementJournal(journalPath);
+  if (!journal) return null;
+  return {
+    phase: journal.phase,
+    journalPath,
+    recoveryPath: journal.recoveryPath,
+    dbPath: journal.dbPath,
+  };
+}
+
+export function beginDatabaseReplacementJournal(
+  recoverySourcePath: string,
+  kind: 'restore' | 'reset',
+): DatabaseReplacementJournalHandle {
+  const dbPath = getDbPath();
+  const journalPath = replacementJournalPath(kind);
+  const recoveryPath = journalPath.replace(/\.json$/, '.db');
+  try {
+    fs.copyFileSync(recoverySourcePath, recoveryPath);
+    syncFile(recoveryPath);
+    writeReplacementJournal(journalPath, {
+      phase: 'prepared',
+      recoveryPath,
+      dbPath,
+      driveInvalidationRequired: true,
+    });
+    return { phase: 'prepared', journalPath, recoveryPath, dbPath };
+  } catch (error) {
+    removeReplacementArtifactsDurably(journalPath, recoveryPath);
+    throw error;
+  }
+}
+
+export function commitDatabaseReplacementJournal(handle: DatabaseReplacementJournalHandle): void {
+  getDatabase().pragma('wal_checkpoint(TRUNCATE)');
+  syncFile(handle.dbPath);
+  if (!syncDirectory(path.dirname(handle.dbPath)) && process.platform !== 'win32') {
+    throw new Error('Could not durably commit database replacement');
+  }
+  try {
+    writeReplacementJournal(handle.journalPath, {
+      phase: 'committed',
+      recoveryPath: handle.recoveryPath,
+      dbPath: handle.dbPath,
+      driveInvalidationRequired: true,
+    });
+  } catch (error) {
+    if (readReplacementJournal(handle.journalPath)?.phase === 'committed')
+      handle.phase = 'committed';
+    throw error;
+  }
+  handle.phase = 'committed';
+}
+
+export function abortDatabaseReplacementJournal(handle: DatabaseReplacementJournalHandle): void {
+  const journal = readReplacementJournal(handle.journalPath);
+  if (!journal || journal.phase === 'committed') return;
+  removeReplacementArtifactsDurably(handle.journalPath, handle.recoveryPath);
+}
+
+export function finalizeDatabaseReplacementJournal(handle: DatabaseReplacementJournalHandle): void {
+  const journal = readReplacementJournal(handle.journalPath);
+  if (journal?.phase !== 'committed') throw new Error('Database replacement is not committed');
+  removeReplacementArtifactsDurably(handle.journalPath, handle.recoveryPath);
+}
+
+const SQLITE_HEADER_MAGIC = Buffer.from('SQLite format 3\0', 'utf8');
+const SQLITE_PROBE_SIDECAR_SUFFIXES = ['-wal', '-shm', '-journal'] as const;
+type SqliteProbeSidecar = (typeof SQLITE_PROBE_SIDECAR_SUFFIXES)[number];
+const INTERNAL_DB_STAGE_DIR_PREFIX = '.flo-db-stage-';
+
+function cleanupStaleDatabaseStageDirectories(directoryPaths: readonly string[]): void {
+  const seen = new Set<string>();
+  for (const rawDir of directoryPaths) {
+    const resolvedDir = path.resolve(rawDir);
+    if (seen.has(resolvedDir)) continue;
+    seen.add(resolvedDir);
+    let entries: string[];
+    try {
+      entries = fs.readdirSync(resolvedDir);
+    } catch {
+      continue;
+    }
+    for (const entryName of entries) {
+      if (!entryName.startsWith(INTERNAL_DB_STAGE_DIR_PREFIX)) continue;
+      const entryPath = path.join(resolvedDir, entryName);
+      try {
+        const stat = fs.lstatSync(entryPath);
+        if (!stat.isSymbolicLink() && stat.isDirectory()) {
+          fs.rmSync(entryPath, { recursive: true, force: true });
+        }
+      } catch {}
+    }
+  }
+}
+
+function stageDatabaseCopyInDirectory(
+  parentDir: string,
+  dirPrefix: string,
+  targetFileName: string,
+  sourceDbPath: string,
+  sidecars: readonly SqliteProbeSidecar[],
+): { tempDir: string; tempDbPath: string } {
+  let tempDir: string | null = null;
+  try {
+    tempDir = fs.mkdtempSync(path.join(parentDir, dirPrefix));
+    const tempDbPath = path.join(tempDir, targetFileName);
+    fs.copyFileSync(sourceDbPath, tempDbPath, fs.constants.COPYFILE_EXCL);
+    for (const suffix of sidecars) {
+      fs.copyFileSync(
+        `${sourceDbPath}${suffix}`,
+        `${tempDbPath}${suffix}`,
+        fs.constants.COPYFILE_EXCL,
+      );
+    }
+    return { tempDir, tempDbPath };
+  } catch (error) {
+    if (tempDir) {
+      try {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      } catch {}
+    }
+    throw error;
+  }
+}
+
+function isShutdownOrMaintenanceAbortError(error: unknown): boolean {
+  let current: unknown = error;
+  for (let depth = 0; depth < 10 && current && typeof current === 'object'; depth++) {
+    const code = (current as { code?: unknown; cause?: unknown }).code;
+    if (code === 'ERR_SHUTDOWN_ABORTED' || code === 'ABORT_ERR') return true;
+    current = (current as { cause?: unknown }).cause;
+  }
+  return false;
+}
+
+export function isSqliteStorageOrOpenError(error: unknown): boolean {
+  let current: unknown = error;
+  for (let depth = 0; depth < 10 && current && typeof current === 'object'; depth++) {
+    if (
+      current instanceof TypeError &&
+      current.message.includes('Cannot open database because the directory does not exist')
+    ) {
+      return true;
+    }
+    const err = current as { code?: unknown; errno?: unknown; cause?: unknown };
+    if (typeof err.errno === 'number') return true;
+    if (typeof err.code === 'string') {
+      const code = err.code;
+      if (code !== 'SQLITE_IOERR_SHORT_READ') {
+        if (
+          code === 'SQLITE_IOERR' ||
+          code.startsWith('SQLITE_IOERR_') ||
+          code === 'SQLITE_FULL' ||
+          code.startsWith('SQLITE_FULL_') ||
+          code === 'SQLITE_CANTOPEN' ||
+          code.startsWith('SQLITE_CANTOPEN_') ||
+          code === 'SQLITE_NOMEM' ||
+          code.startsWith('SQLITE_NOMEM_') ||
+          code === 'SQLITE_BUSY' ||
+          code.startsWith('SQLITE_BUSY_') ||
+          code === 'SQLITE_LOCKED' ||
+          code.startsWith('SQLITE_LOCKED_') ||
+          code === 'SQLITE_PERM' ||
+          code.startsWith('SQLITE_PERM_') ||
+          code === 'SQLITE_READONLY' ||
+          code.startsWith('SQLITE_READONLY_') ||
+          code === 'SQLITE_PROTOCOL' ||
+          code.startsWith('SQLITE_PROTOCOL_') ||
+          code === 'SQLITE_NOLFS'
+        ) {
+          return true;
+        }
+        if (
+          /^(?:ENOSPC|EDQUOT|EIO|EACCES|EPERM|EROFS|EMFILE|ENFILE|ENOMEM|EBUSY|EAGAIN|EXDEV|ENOENT|ENOTDIR)$/.test(
+            code,
+          )
+        ) {
+          return true;
+        }
+      }
+    }
+    current = err.cause;
+  }
+  return false;
+}
+
+function runStagedDatabaseProbeInDirectory<T>(
+  parentDir: string,
+  dirPrefix: string,
+  targetFileName: string,
+  sourceDbPath: string,
+  sidecars: readonly SqliteProbeSidecar[],
+  probeFn: (probeDb: Database.Database) => T,
+): { kind: 'ok'; value: T } | { kind: 'corrupt'; error: unknown } {
+  let tempDir: string | null = null;
+  let probeDb: Database.Database | undefined;
+  try {
+    const staged = stageDatabaseCopyInDirectory(
+      parentDir,
+      dirPrefix,
+      targetFileName,
+      sourceDbPath,
+      sidecars,
+    );
+    tempDir = staged.tempDir;
+    try {
+      probeDb = new Database(staged.tempDbPath, { fileMustExist: true });
+      probeDb.pragma('temp_store = MEMORY');
+      return { kind: 'ok', value: probeFn(probeDb) };
+    } catch (probeError) {
+      if (isShutdownOrMaintenanceAbortError(probeError) || isSqliteStorageOrOpenError(probeError)) {
+        throw probeError;
+      }
+      return { kind: 'corrupt', error: probeError };
+    }
+  } finally {
+    try {
+      probeDb?.close();
+    } catch {}
+    if (tempDir) {
+      try {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      } catch {}
+    }
+  }
+}
+
+function probeStagedDatabaseWithFallback<T>(
+  sourceDbPath: string,
+  sidecars: readonly SqliteProbeSidecar[],
+  options: {
+    tmpPrefix: string;
+    fallbackSubprefix: string;
+    targetFileName: string;
+    purposeLabel: string;
+  },
+  probeFn: (probeDb: Database.Database) => T,
+): { kind: 'ok'; value: T } | { kind: 'corrupt'; error: unknown } {
+  try {
+    return runStagedDatabaseProbeInDirectory(
+      os.tmpdir(),
+      options.tmpPrefix,
+      options.targetFileName,
+      sourceDbPath,
+      sidecars,
+      probeFn,
+    );
+  } catch (primaryError) {
+    if (
+      isShutdownOrMaintenanceAbortError(primaryError) ||
+      !isSqliteStorageOrOpenError(primaryError)
+    ) {
+      throw primaryError;
+    }
+    const fallbackParentDir = path.dirname(path.resolve(sourceDbPath));
+    try {
+      return runStagedDatabaseProbeInDirectory(
+        fallbackParentDir,
+        `${INTERNAL_DB_STAGE_DIR_PREFIX}${options.fallbackSubprefix}`,
+        options.targetFileName,
+        sourceDbPath,
+        sidecars,
+        probeFn,
+      );
+    } catch (fallbackError) {
+      if (
+        isShutdownOrMaintenanceAbortError(fallbackError) ||
+        !isSqliteStorageOrOpenError(fallbackError)
+      ) {
+        throw fallbackError;
+      }
+      const primaryMessage = primaryError instanceof Error ? primaryError.message : 'unknown error';
+      const fallbackMessage =
+        fallbackError instanceof Error ? fallbackError.message : 'unknown error';
+      throw new Error(
+        `Could not stage ${options.purposeLabel} in system temp (${primaryMessage}) or on the database volume at ${fallbackParentDir} (${fallbackMessage}). Free disk space and try again.`,
+        { cause: fallbackError },
+      );
+    }
+  }
+}
+
+interface SqliteHeaderInfo {
+  headerVersion: number;
+  isLegacyRollbackFormat: boolean;
+  pageSize: number;
+}
+
+function readSqliteHeaderInfo(filePath: string, throwOnReadError = false): SqliteHeaderInfo | null {
+  let stat: fs.Stats;
+  try {
+    stat = fs.lstatSync(filePath);
+  } catch (statError) {
+    const code = (statError as NodeJS.ErrnoException | null)?.code;
+    if (code === 'ENOENT' || code === 'ENOTDIR') return null;
+    if (throwOnReadError) {
+      throw new Error(
+        `Could not inspect database file ${filePath}: ${statError instanceof Error ? statError.message : 'unknown error'}`,
+        { cause: statError },
+      );
+    }
+    return null;
+  }
+  if (stat.isSymbolicLink() || !stat.isFile() || stat.size < 100) return null;
+
+  const header = Buffer.alloc(100);
+  let headerBytesRead = 0;
+  let fd: number | null = null;
+  try {
+    fd = fs.openSync(filePath, 'r');
+    headerBytesRead = fs.readSync(fd, header, 0, 100, 0);
+  } catch (readError) {
+    const readCode = (readError as NodeJS.ErrnoException | null)?.code;
+    if (readCode === 'ENOENT' || readCode === 'ENOTDIR') return null;
+    if (throwOnReadError) {
+      throw new Error(
+        `Could not read SQLite header from ${filePath}: ${readError instanceof Error ? readError.message : 'unknown error'}`,
+        { cause: readError },
+      );
+    }
+    return null;
+  } finally {
+    if (fd !== null) {
+      try {
+        fs.closeSync(fd);
+      } catch {}
+    }
+  }
+  if (headerBytesRead < 100 || !header.subarray(0, 16).equals(SQLITE_HEADER_MAGIC)) {
+    return null;
+  }
+  const rawPageSize = header.readUInt16BE(16);
+  const pageSize = rawPageSize === 1 ? 65536 : rawPageSize;
+  return {
+    headerVersion: header.readInt32BE(60),
+    isLegacyRollbackFormat: header[18] === 1 && header[19] === 1,
+    pageSize,
+  };
+}
+
+function walChecksum(
+  buf: Buffer,
+  offset: number,
+  length: number,
+  initialS1: number,
+  initialS2: number,
+  bigEndian: boolean,
+): [number, number] {
+  let s1 = initialS1;
+  let s2 = initialS2;
+  for (let i = 0; i < length; i += 8) {
+    const w1 = bigEndian ? buf.readUInt32BE(offset + i) : buf.readUInt32LE(offset + i);
+    const w2 = bigEndian ? buf.readUInt32BE(offset + i + 4) : buf.readUInt32LE(offset + i + 4);
+    s1 = (s1 + w1 + s2) >>> 0;
+    s2 = (s2 + w2 + s1) >>> 0;
+  }
+  return [s1, s2];
+}
+
+export function readWalCommittedPage1UserVersion(
+  walPath: string,
+  expectedPageSize?: number,
+): number | null {
+  let stat: fs.Stats;
+  try {
+    stat = fs.lstatSync(walPath);
+  } catch {
+    return null;
+  }
+  if (stat.isSymbolicLink() || !stat.isFile() || stat.size < 32) return null;
+
+  let fd: number | null = null;
+  try {
+    fd = fs.openSync(walPath, 'r');
+    const header = Buffer.alloc(32);
+    if (fs.readSync(fd, header, 0, 32, 0) < 32) return null;
+
+    const magic = header.readUInt32BE(0);
+    if (magic !== 0x377f0682 && magic !== 0x377f0683) return null;
+    const isBigEndianChecksum = magic === 0x377f0683;
+
+    const rawPageSize = header.readUInt32BE(8);
+    const pageSize = rawPageSize === 1 ? 65536 : rawPageSize;
+    if (pageSize < 512 || pageSize > 65536 || (pageSize & (pageSize - 1)) !== 0) return null;
+    if (expectedPageSize !== undefined && pageSize !== expectedPageSize) return null;
+
+    const salt1 = header.readUInt32BE(16);
+    const salt2 = header.readUInt32BE(20);
+    const headerCksum1 = header.readUInt32BE(24);
+    const headerCksum2 = header.readUInt32BE(28);
+
+    const [hS1, hS2] = walChecksum(header, 0, 24, 0, 0, isBigEndianChecksum);
+    if (hS1 !== headerCksum1 || hS2 !== headerCksum2) return null;
+
+    let runningS1 = headerCksum1;
+    let runningS2 = headerCksum2;
+
+    const frameHeader = Buffer.alloc(24);
+    const pageData = Buffer.alloc(pageSize);
+    const frameSize = 24 + pageSize;
+    const totalFrames = Math.floor((stat.size - 32) / frameSize);
+
+    let lastCommittedPage1UserVersion: number | null = null;
+    let pendingPage1UserVersion: number | null = null;
+
+    for (let f = 0; f < totalFrames; f++) {
+      const frameOffset = 32 + f * frameSize;
+      if (fs.readSync(fd, frameHeader, 0, 24, frameOffset) < 24) break;
+      if (fs.readSync(fd, pageData, 0, pageSize, frameOffset + 24) < pageSize) break;
+
+      const pageNo = frameHeader.readUInt32BE(0);
+      const dbSize = frameHeader.readUInt32BE(4);
+      const fSalt1 = frameHeader.readUInt32BE(8);
+      const fSalt2 = frameHeader.readUInt32BE(12);
+      const fCksum1 = frameHeader.readUInt32BE(16);
+      const fCksum2 = frameHeader.readUInt32BE(20);
+
+      if (fSalt1 !== salt1 || fSalt2 !== salt2) break;
+
+      let [s1, s2] = walChecksum(frameHeader, 0, 8, runningS1, runningS2, isBigEndianChecksum);
+      [s1, s2] = walChecksum(pageData, 0, pageSize, s1, s2, isBigEndianChecksum);
+
+      if (s1 !== fCksum1 || s2 !== fCksum2) break;
+
+      runningS1 = s1;
+      runningS2 = s2;
+
+      if (pageNo === 1) {
+        pendingPage1UserVersion = pageData.readInt32BE(60);
+      }
+
+      if (dbSize > 0) {
+        if (pendingPage1UserVersion !== null) {
+          lastCommittedPage1UserVersion = pendingPage1UserVersion;
+          pendingPage1UserVersion = null;
+        }
+      }
+    }
+
+    return lastCommittedPage1UserVersion;
+  } catch {
+    return null;
+  } finally {
+    if (fd !== null) {
+      try {
+        fs.closeSync(fd);
+      } catch {}
+    }
+  }
+}
+
+function getEffectiveDatabaseHeaderVersion(dbPath: string, headerInfo: SqliteHeaderInfo): number {
+  const walPath = `${dbPath}-wal`;
+  if (!pathEntryExists(walPath)) {
+    return headerInfo.headerVersion;
+  }
+  const walPage1Version = readWalCommittedPage1UserVersion(walPath, headerInfo.pageSize);
+  return walPage1Version !== null
+    ? Math.max(headerInfo.headerVersion, walPage1Version)
+    : headerInfo.headerVersion;
+}
+
+function isReadableRecoverySnapshotWithSidecars(
+  recoveryPath: string,
+  expectedSidecars: readonly ReplacementJournalSidecar[],
+): boolean {
+  const headerInfo = readSqliteHeaderInfo(recoveryPath, true);
+  if (!headerInfo) return false;
+  if (pathEntryExists(`${recoveryPath}-journal`)) return false;
+  const expectedSet = new Set(expectedSidecars);
+  for (const suffix of ['-wal', '-shm'] as const) {
+    const sidecarPath = `${recoveryPath}${suffix}`;
+    const exists = pathEntryExists(sidecarPath);
+    if (exists !== expectedSet.has(suffix)) return false;
+    if (exists) {
+      let sidecarStat: fs.Stats;
+      try {
+        sidecarStat = fs.lstatSync(sidecarPath);
+      } catch (statError) {
+        const code = (statError as NodeJS.ErrnoException | null)?.code;
+        if (code === 'ENOENT' || code === 'ENOTDIR') return false;
+        throw new Error(
+          `Could not inspect recovery sidecar ${sidecarPath}: ${statError instanceof Error ? statError.message : 'unknown error'}`,
+          { cause: statError },
+        );
+      }
+      if (sidecarStat.isSymbolicLink() || !sidecarStat.isFile()) return false;
+    }
+  }
+
+  if (expectedSidecars.length === 0 && headerInfo.isLegacyRollbackFormat) {
+    let probeDb: Database.Database | undefined;
+    try {
+      probeDb = new Database(recoveryPath, { readonly: true, fileMustExist: true });
+      probeDb.pragma('temp_store = MEMORY');
+      const integrity = probeDb.prepare('PRAGMA integrity_check').all() as {
+        integrity_check: string;
+      }[];
+      return integrity.length > 0 && integrity.every((row) => row.integrity_check === 'ok');
+    } catch (error) {
+      if (isShutdownOrMaintenanceAbortError(error) || isSqliteStorageOrOpenError(error)) {
+        throw error;
+      }
+      return false;
+    } finally {
+      try {
+        probeDb?.close();
+      } catch {}
+    }
+  }
+
+  try {
+    const probed = probeStagedDatabaseWithFallback(
+      recoveryPath,
+      expectedSidecars,
+      {
+        tmpPrefix: 'flo-recovery-verify-',
+        fallbackSubprefix: 'recovery-',
+        targetFileName: 'recovery.db',
+        purposeLabel: 'recovery snapshot for verification',
+      },
+      (probeDb) => {
+        const integrity = probeDb.prepare('PRAGMA integrity_check').all() as {
+          integrity_check: string;
+        }[];
+        return integrity.length > 0 && integrity.every((row) => row.integrity_check === 'ok');
+      },
+    );
+    return probed.kind === 'ok' ? probed.value : false;
+  } catch (stageError) {
+    if (isShutdownOrMaintenanceAbortError(stageError)) {
+      throw stageError;
+    }
+    if (isSqliteStorageOrOpenError(stageError)) {
+      const walExistedBefore = pathEntryExists(`${recoveryPath}-wal`);
+      const shmExistedBefore = pathEntryExists(`${recoveryPath}-shm`);
+      let probeDb: Database.Database | undefined;
+      try {
+        probeDb = new Database(recoveryPath, { readonly: true, fileMustExist: true });
+        probeDb.pragma('temp_store = MEMORY');
+        const integrity = probeDb.prepare('PRAGMA integrity_check').all() as {
+          integrity_check: string;
+        }[];
+        return integrity.length > 0 && integrity.every((row) => row.integrity_check === 'ok');
+      } catch (inPlaceError) {
+        if (
+          isShutdownOrMaintenanceAbortError(inPlaceError) ||
+          isSqliteStorageOrOpenError(inPlaceError)
+        ) {
+          throw inPlaceError;
+        }
+        return false;
+      } finally {
+        try {
+          probeDb?.close();
+        } catch {}
+        if (!walExistedBefore && pathEntryExists(`${recoveryPath}-wal`)) {
+          try {
+            const walStat = fs.lstatSync(`${recoveryPath}-wal`);
+            if (walStat.isFile() && walStat.size === 0) {
+              fs.unlinkSync(`${recoveryPath}-wal`);
+            }
+          } catch {}
+        }
+        if (!shmExistedBefore && pathEntryExists(`${recoveryPath}-shm`)) {
+          try {
+            fs.unlinkSync(`${recoveryPath}-shm`);
+          } catch {}
+        }
+      }
+    }
+    throw stageError;
+  }
+}
+
+function validateDatabaseSchemaTableColumns(
+  dbInstance: Database.Database,
+  schemaVersion: number,
+  subjectLabel = 'Database',
+): string | null {
+  const tables = new Set(getTables(dbInstance));
+  const expectedSchema = getRecoverySchemaReference(schemaVersion).tableColumns;
+  if (
+    tables.size !== expectedSchema.size ||
+    ![...expectedSchema.keys()].every((table) => tables.has(table))
+  ) {
+    return `${subjectLabel} table structure does not match schema v${schemaVersion}`;
+  }
+  for (const [table, columns] of expectedSchema.entries()) {
+    const available = new Set(getColumns(dbInstance, table));
+    if (!columns.every((column) => available.has(column))) {
+      return `${subjectLabel} table ${table} is missing expected column(s)`;
+    }
+  }
+  return null;
+}
+
+function withProbedDatabaseFile<T>(
+  filePath: string,
+  fn: (candidate: Database.Database) => T,
+  throwOnStagingError = false,
+): T | null {
+  const headerInfo = readSqliteHeaderInfo(filePath, throwOnStagingError);
+  if (!headerInfo) return null;
+  const maxSupported = getLatestSupportedSchemaVersion();
+  const effectiveHeaderVersion = getEffectiveDatabaseHeaderVersion(filePath, headerInfo);
+
+  const presentSidecars: SqliteProbeSidecar[] = [];
+  for (const suffix of SQLITE_PROBE_SIDECAR_SUFFIXES) {
+    const sidecarPath = `${filePath}${suffix}`;
+    if (!pathEntryExists(sidecarPath)) continue;
+    let sidecarStat: fs.Stats;
+    try {
+      sidecarStat = fs.lstatSync(sidecarPath);
+    } catch (statError) {
+      if (throwOnStagingError) {
+        throw new Error(
+          `Could not inspect database sidecar ${sidecarPath}: ${statError instanceof Error ? statError.message : 'unknown error'}`,
+          { cause: statError },
+        );
+      }
+      return null;
+    }
+    if (sidecarStat.isSymbolicLink() || !sidecarStat.isFile()) {
+      if (throwOnStagingError) {
+        throw new Error(`Database sidecar ${sidecarPath} is not a regular file`);
+      }
+      return null;
+    }
+    presentSidecars.push(suffix);
+  }
+
+  if (presentSidecars.length === 0 && headerInfo.isLegacyRollbackFormat) {
+    let candidate: Database.Database | undefined;
+    try {
+      candidate = new Database(filePath, { readonly: true, fileMustExist: true });
+      candidate.pragma('temp_store = MEMORY');
+      return fn(candidate);
+    } catch (error) {
+      if (isShutdownOrMaintenanceAbortError(error)) {
+        throw error;
+      }
+      if (throwOnStagingError && isSqliteStorageOrOpenError(error)) {
+        throw error;
+      }
+      return null;
+    } finally {
+      try {
+        candidate?.close();
+      } catch {}
+    }
+  }
+
+  try {
+    const probed = probeStagedDatabaseWithFallback(
+      filePath,
+      presentSidecars,
+      {
+        tmpPrefix: 'flo-db-health-probe-',
+        fallbackSubprefix: 'health-',
+        targetFileName: 'probe.db',
+        purposeLabel: 'database file for health verification',
+      },
+      (candidate) => fn(candidate),
+    );
+    return probed.kind === 'ok' ? probed.value : null;
+  } catch (stageError) {
+    if (isShutdownOrMaintenanceAbortError(stageError)) {
+      throw stageError;
+    }
+    if (
+      !presentSidecars.includes('-journal') &&
+      isSqliteStorageOrOpenError(stageError) &&
+      effectiveHeaderVersion <= maxSupported
+    ) {
+      const walExistedBefore = pathEntryExists(`${filePath}-wal`);
+      const shmExistedBefore = pathEntryExists(`${filePath}-shm`);
+      let candidate: Database.Database | undefined;
+      try {
+        candidate = new Database(filePath, { readonly: true, fileMustExist: true });
+        candidate.pragma('temp_store = MEMORY');
+        return fn(candidate);
+      } catch (inPlaceError) {
+        if (isShutdownOrMaintenanceAbortError(inPlaceError)) {
+          throw inPlaceError;
+        }
+        if (throwOnStagingError && isSqliteStorageOrOpenError(inPlaceError)) {
+          throw inPlaceError;
+        }
+        return null;
+      } finally {
+        try {
+          candidate?.close();
+        } catch {}
+        if (!walExistedBefore && pathEntryExists(`${filePath}-wal`)) {
+          try {
+            const walStat = fs.lstatSync(`${filePath}-wal`);
+            if (walStat.isFile() && walStat.size === 0) {
+              fs.unlinkSync(`${filePath}-wal`);
+            }
+          } catch {}
+        }
+        if (!shmExistedBefore && pathEntryExists(`${filePath}-shm`)) {
+          try {
+            fs.unlinkSync(`${filePath}-shm`);
+          } catch {}
+        }
+      }
+    }
+    if (throwOnStagingError) {
+      throw stageError;
+    }
+    return null;
+  }
+}
+
+function isHealthyDowngradeCommittedDatabaseFile(
+  filePath: string,
+  allowedForeignKeyViolations: Set<string> | null,
+): boolean {
+  return (
+    withProbedDatabaseFile(
+      filePath,
+      (candidate) => {
+        const integrity = candidate.prepare('PRAGMA integrity_check').all() as {
+          integrity_check: string;
+        }[];
+        if (integrity.length === 0 || integrity.some((row) => row.integrity_check !== 'ok')) {
+          return false;
+        }
+        const foreignKeyViolations = getForeignKeyViolationKeys(candidate);
+        const foreignKeysClean =
+          allowedForeignKeyViolations === null ||
+          [...foreignKeyViolations].every((key) => allowedForeignKeyViolations.has(key));
+        if (!foreignKeysClean) return false;
+        const schemaVersion = Number(candidate.pragma('user_version', { simple: true }));
+        const supportedVersion = getLatestSupportedSchemaVersion();
+        if (schemaVersion < 1 || schemaVersion > supportedVersion) return false;
+        const metaInfo = readCanonicalMetaVersionInfo(candidate);
+        if (metaInfo.schemaVersion !== null && metaInfo.schemaVersion > supportedVersion) {
+          return false;
+        }
+        if (validateDatabaseSchemaTableColumns(candidate, schemaVersion) !== null) return false;
+        return validateInventoryLedgerDatabase(candidate) === null;
+      },
+      true,
+    ) ?? false
+  );
+}
+
+function restoreDatabaseWithSidecars(
+  recoveryPath: string,
+  dbPath: string,
+  sidecars: readonly ReplacementJournalSidecar[],
+): void {
+  fs.copyFileSync(recoveryPath, dbPath);
+  syncFile(dbPath);
+  for (const suffix of sidecars) {
+    const targetSidecar = `${dbPath}${suffix}`;
+    fs.copyFileSync(`${recoveryPath}${suffix}`, targetSidecar);
+    syncFile(targetSidecar);
+  }
+}
+
+export function recoverDatabaseReplacementJournal(handle: DatabaseReplacementJournalHandle): void {
+  const journal = readReplacementJournal(handle.journalPath);
+  if (journal?.phase === 'committed') return;
+  if (
+    !journal ||
+    journal.recoveryPath !== handle.recoveryPath ||
+    journal.dbPath !== handle.dbPath
+  ) {
+    throw new Error('Database replacement journal could not be validated');
+  }
+  const expectedSidecars = journal.recoverySidecars ?? [];
+  if (journal.downgradeRecovery) {
+    if (!isReadableRecoverySnapshotWithSidecars(handle.recoveryPath, expectedSidecars)) {
+      throw new Error('Database replacement recovery snapshot could not be validated');
+    }
+    closeDatabase();
+    const failures = removeDatabaseFiles(handle.dbPath);
+    if (failures.length > 0)
+      throw new Error(`Could not clear failed database replacement: ${failures.join(', ')}`);
+    restoreDatabaseWithSidecars(handle.recoveryPath, handle.dbPath, expectedSidecars);
+    if (!syncDirectory(path.dirname(handle.dbPath)) && process.platform !== 'win32') {
+      throw new Error('Could not durably recover failed database replacement');
+    }
+    removeReplacementArtifactsDurably(handle.journalPath, handle.recoveryPath);
+    return;
+  }
+  try {
+    const recoveryStat = fs.lstatSync(handle.recoveryPath);
+    if (
+      recoveryStat.isSymbolicLink() ||
+      !recoveryStat.isFile() ||
+      pathEntryExists(`${handle.recoveryPath}-wal`) ||
+      pathEntryExists(`${handle.recoveryPath}-shm`) ||
+      pathEntryExists(`${handle.recoveryPath}-journal`) ||
+      !checkHealthyDatabaseFile(handle.recoveryPath, undefined, false, true)
+    ) {
+      throw new Error('Database replacement recovery snapshot could not be validated');
+    }
+  } catch (error) {
+    throw error instanceof Error
+      ? error
+      : new Error('Database replacement recovery snapshot could not be validated', {
+          cause: error,
+        });
+  }
+  closeDatabase();
+  const failures = removeDatabaseFiles(handle.dbPath);
+  if (failures.length > 0)
+    throw new Error(`Could not clear failed database replacement: ${failures.join(', ')}`);
+  fs.copyFileSync(handle.recoveryPath, handle.dbPath);
+  syncFile(handle.dbPath);
+  if (!syncDirectory(path.dirname(handle.dbPath)) && process.platform !== 'win32') {
+    throw new Error('Could not durably recover failed database replacement');
+  }
+  initDatabase(false, true);
+  removeReplacementArtifactsDurably(handle.journalPath, handle.recoveryPath);
+}
+
+interface SchemaRecoveryReference {
+  identity: string;
+  tableColumns: Map<string, string[]>;
+  definitions: Map<string, string>;
+}
+
+const cachedSchemaRecoveryReferences = new Map<number, SchemaRecoveryReference>();
+const RUNTIME_KDS_INDEX_MIN_SCHEMA_VERSION = 121;
+const RUNTIME_ENSURED_SCHEMA_OBJECTS = new Set(['index:idx_order_items_active_kds']);
 let buildingIdealSchema = false;
 
-function getRecoverySchemaReference(): Map<string, string[]> {
-  if (recoverySchemaReference) return recoverySchemaReference;
-  const idealDb = buildIdealSchemaDb();
+let recoverySchemaBuildCount = 0;
+
+export function getRecoverySchemaBuildCount(): number {
+  return recoverySchemaBuildCount;
+}
+
+export function clearRecoverySchemaReference(): void {
+  cachedSchemaRecoveryReferences.clear();
+}
+
+function getMigrationRegistryIdentity(targetVersion?: number): string {
+  const supportedVersion = MIGRATIONS[MIGRATIONS.length - 1]?.version || 0;
+  const version = targetVersion !== undefined ? targetVersion : supportedVersion;
+  const last = MIGRATIONS[MIGRATIONS.length - 1];
+  return `${version}:${MIGRATIONS.length}:${last?.version ?? 0}:${last?.name ?? ''}`;
+}
+
+function getRecoverySchemaReference(targetVersion?: number): SchemaRecoveryReference {
+  const supportedVersion = MIGRATIONS[MIGRATIONS.length - 1]?.version || 0;
+  const version = targetVersion !== undefined ? targetVersion : supportedVersion;
+  const currentIdentity = getMigrationRegistryIdentity(version);
+  const cached = cachedSchemaRecoveryReferences.get(version);
+  if (cached && cached.identity === currentIdentity) {
+    return cached;
+  }
+  recoverySchemaBuildCount += 1;
+  const idealDb = buildIdealSchemaDb(version);
   try {
-    recoverySchemaReference = new Map(getTables(idealDb).map((table) => [table, getColumns(idealDb, table)]));
-    return recoverySchemaReference;
+    const ref: SchemaRecoveryReference = {
+      identity: currentIdentity,
+      tableColumns: new Map(getTables(idealDb).map((table) => [table, getColumns(idealDb, table)])),
+      definitions: getSchemaDefinitions(idealDb),
+    };
+    cachedSchemaRecoveryReferences.set(version, ref);
+    return ref;
   } finally {
     idealDb.close();
   }
 }
 
-function normalizedSchemaDefinitions(dbInstance: Database.Database): Map<string, string> {
-  const definitions = dbInstance.prepare(`
-    SELECT type, name, tbl_name, sql FROM sqlite_master
-    WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%' AND name <> '_flo_meta'
-  `).all() as { type: string; name: string; tbl_name: string; sql: string }[];
-  return new Map(definitions.map((row) => [
-    `${row.type}:${row.name}`,
-    row.sql.replace(/\s+/g, ' ').trim().toLowerCase(),
-  ]));
+function checkHealthyDatabaseFile(
+  filePath: string,
+  allowedForeignKeyViolations: Set<string> | null | undefined,
+  requireMetadata: boolean,
+  throwOnStagingError: boolean,
+): boolean {
+  return (
+    withProbedDatabaseFile(
+      filePath,
+      (candidate) => {
+        const integrity =
+          (
+            candidate.prepare('PRAGMA integrity_check').get() as
+              | { integrity_check: string }
+              | undefined
+          )?.integrity_check === 'ok';
+        const foreignKeyViolations = getForeignKeyViolationKeys(candidate);
+        const foreignKeysClean =
+          allowedForeignKeyViolations === null ||
+          (allowedForeignKeyViolations
+            ? [...foreignKeyViolations].every((key) => allowedForeignKeyViolations.has(key))
+            : foreignKeyViolations.size === 0);
+        const schemaVersion = Number(candidate.pragma('user_version', { simple: true }));
+        let metadata: { value: string } | undefined;
+        try {
+          metadata = candidate
+            .prepare("SELECT value FROM _flo_meta WHERE key = 'schema_version'")
+            .get() as { value: string } | undefined;
+        } catch (metaError) {
+          if (
+            isShutdownOrMaintenanceAbortError(metaError) ||
+            isSqliteStorageOrOpenError(metaError)
+          ) {
+            throw metaError;
+          }
+        }
+
+        const supportedVersion = MIGRATIONS[MIGRATIONS.length - 1]?.version || 0;
+        if (schemaVersion < 1 || schemaVersion > supportedVersion) {
+          return false;
+        }
+
+        const tables = new Set(getTables(candidate));
+        const schemaRef = getRecoverySchemaReference(schemaVersion);
+        const expectedSchema = schemaRef.tableColumns;
+        const columnsValid = [...expectedSchema.entries()].every(([table, columns]) => {
+          const available = new Set(getColumns(candidate, table));
+          return columns.every((column) => available.has(column));
+        });
+        const actualDefinitions = getSchemaDefinitions(candidate);
+        const requiredDefinitionsValid = [...schemaRef.definitions].every(([key, sql]) =>
+          actualDefinitions.has(key)
+            ? actualDefinitions.get(key) === sql
+            : RUNTIME_ENSURED_SCHEMA_OBJECTS.has(key),
+        );
+        const definitionsValid =
+          requiredDefinitionsValid &&
+          [...actualDefinitions.keys()].every((key) => schemaRef.definitions.has(key));
+        return (
+          integrity &&
+          foreignKeysClean &&
+          schemaVersion > 0 &&
+          schemaVersion <= supportedVersion &&
+          (!requireMetadata || metadata?.value === String(schemaVersion)) &&
+          tables.size === expectedSchema.size &&
+          [...expectedSchema.keys()].every((table) => tables.has(table)) &&
+          columnsValid &&
+          definitionsValid
+        );
+      },
+      throwOnStagingError,
+    ) ?? false
+  );
 }
 
-function isHealthyDatabaseFile(
+export function isHealthyDatabaseFile(
   filePath: string,
   allowedForeignKeyViolations: Set<string> | null | undefined = undefined,
   requireMetadata = true,
 ): boolean {
-  try {
-    const candidate = new Database(filePath, { readonly: true, fileMustExist: true });
-    const integrity = (candidate.prepare('PRAGMA integrity_check').get() as { integrity_check: string }).integrity_check === 'ok';
-    const foreignKeyViolations = getForeignKeyViolationKeys(candidate);
-    const foreignKeysClean = allowedForeignKeyViolations === null
-      || (allowedForeignKeyViolations
-        ? [...foreignKeyViolations].every((key) => allowedForeignKeyViolations.has(key))
-        : foreignKeyViolations.size === 0);
-    const schemaVersion = Number(candidate.pragma('user_version', { simple: true }));
-    let metadata: { value: string } | undefined;
-    try {
-      metadata = candidate.prepare("SELECT value FROM _flo_meta WHERE key = 'schema_version'").get() as { value: string } | undefined;
-    } catch { }
-    const tables = new Set(getTables(candidate));
-    const expectedSchema = getRecoverySchemaReference();
-    const columnsValid = [...expectedSchema.entries()].every(([table, columns]) => {
-      const available = new Set(getColumns(candidate, table));
-      return columns.every((column) => available.has(column));
-    });
-    const supportedVersion = MIGRATIONS[MIGRATIONS.length - 1]?.version || 0;
-    const idealDb = buildIdealSchemaDb();
-    let definitionsValid = false;
-    try {
-      const expectedDefinitions = normalizedSchemaDefinitions(idealDb);
-      const actualDefinitions = normalizedSchemaDefinitions(candidate);
-      definitionsValid = expectedDefinitions.size === actualDefinitions.size
-        && [...expectedDefinitions].every(([key, sql]) => actualDefinitions.get(key) === sql);
-    } finally {
-      idealDb.close();
-    }
-    candidate.close();
-    return integrity && foreignKeysClean && schemaVersion > 0 && schemaVersion <= supportedVersion
-      && (!requireMetadata || metadata?.value === String(schemaVersion))
-      && tables.size === expectedSchema.size
-      && [...expectedSchema.keys()].every((table) => tables.has(table))
-      && columnsValid && definitionsValid;
-  } catch {
-    return false;
-  }
+  return checkHealthyDatabaseFile(filePath, allowedForeignKeyViolations, requireMetadata, false);
 }
 
-function removeOlderReplacementJournals(journals: string[], dbPath: string, backupDir: string): void {
+export const MAX_RETAINED_RESTORE_SAFETY_COPIES = 3;
+
+/** True for the retained copies a successful restore leaves behind as an undo. */
+export function isRestoreSafetyCopyName(fileName: string): boolean {
+  return (
+    fileName.startsWith('flo-backup-') &&
+    fileName.includes('-pre-restore-') &&
+    fileName.endsWith('.db')
+  );
+}
+
+/**
+ * A successful restore replaces the live database, so the pre-restore snapshot is
+ * the only copy of what it replaced. It is copied into the managed backup naming
+ * scheme rather than deleted, which makes it appear in listBackups() and makes it
+ * restorable through the same preset-path route as any other managed backup.
+ * Retention is bounded so a long-lived install cannot accumulate copies forever.
+ *
+ * The snapshot is copied rather than renamed so the replacement journal keeps
+ * pointing at a real file: a crash between the committed journal and cleanup must
+ * still be able to roll the live database back from it.
+ */
+export function retainRestoreSafetyCopy(
+  recoveryPath: string,
+  schemaVersion: number,
+): string | null {
+  const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const retainedPath = path.join(
+    getBackupDir(),
+    `flo-backup-${timestamp}-pre-restore-v${schemaVersion}.db`,
+  );
+  try {
+    if (!pathEntryExists(recoveryPath)) return null;
+    // The replacement journal snapshots the live file with a raw copy, so the
+    // snapshot carries no _flo_meta stamp and every restore route would refuse
+    // it. Stamp it before copying, so a failure here leaves the recovery copy
+    // exactly where the journal expects it and changes nothing.
+    const snapshotDb = new Database(recoveryPath);
+    try {
+      snapshotDb.pragma('journal_mode = DELETE');
+      snapshotDb.exec('CREATE TABLE IF NOT EXISTS _flo_meta (key TEXT PRIMARY KEY, value TEXT)');
+      snapshotDb
+        .prepare('INSERT OR REPLACE INTO _flo_meta (key, value) VALUES (?, ?)')
+        .run('schema_version', String(schemaVersion));
+      snapshotDb
+        .prepare('INSERT OR REPLACE INTO _flo_meta (key, value) VALUES (?, ?)')
+        .run('backup_created_at', new Date().toISOString());
+      snapshotDb
+        .prepare('INSERT OR REPLACE INTO _flo_meta (key, value) VALUES (?, ?)')
+        .run('app_version', app.getVersion());
+    } finally {
+      snapshotDb.close();
+    }
+    syncFile(recoveryPath);
+    fs.copyFileSync(recoveryPath, retainedPath);
+    syncFile(retainedPath);
+    syncDirectory(getBackupDir());
+  } catch (error) {
+    // Retention is a safety net, never a reason to fail a committed restore.
+    console.warn('[DB] Could not retain the pre-restore safety copy:', error);
+    return null;
+  }
+  try {
+    const existing = fs
+      .readdirSync(getBackupDir())
+      .filter(isRestoreSafetyCopyName)
+      .map((name) => ({ name, mtimeMs: fs.lstatSync(path.join(getBackupDir(), name)).mtimeMs }))
+      .sort((a, b) => b.mtimeMs - a.mtimeMs);
+    for (const stale of existing.slice(MAX_RETAINED_RESTORE_SAFETY_COPIES)) {
+      fs.unlinkSync(path.join(getBackupDir(), stale.name));
+    }
+    syncDirectory(getBackupDir());
+  } catch (error) {
+    console.warn('[DB] Could not apply pre-restore safety copy retention:', error);
+  }
+  return retainedPath;
+}
+
+function removeOlderReplacementJournals(
+  journals: string[],
+  dbPath: string,
+  backupDir: string,
+): void {
   const backupRoot = path.resolve(backupDir);
   for (const journalPath of journals) {
     try {
       const journalStat = fs.lstatSync(journalPath);
-      if (journalStat.isSymbolicLink() || !journalStat.isFile()) throw new Error('journal is not a regular file');
-      const journal = JSON.parse(fs.readFileSync(journalPath, 'utf8')) as Partial<ReplacementJournal>;
-      if ((journal.phase !== 'prepared' && journal.phase !== 'committed')
-        || typeof journal.recoveryPath !== 'string'
-        || journal.dbPath !== dbPath
-        || path.dirname(journal.recoveryPath) !== backupRoot
-        || `${path.basename(journalPath, '.json')}.db` !== path.basename(journal.recoveryPath)) {
+      if (journalStat.isSymbolicLink() || !journalStat.isFile())
+        throw new Error('journal is not a regular file');
+      const journal = JSON.parse(
+        fs.readFileSync(journalPath, 'utf8'),
+      ) as Partial<ReplacementJournal>;
+      if (
+        (journal.phase !== 'prepared' && journal.phase !== 'committed') ||
+        typeof journal.recoveryPath !== 'string' ||
+        journal.dbPath !== dbPath ||
+        path.dirname(journal.recoveryPath) !== backupRoot ||
+        `${path.basename(journalPath, '.json')}.db` !== path.basename(journal.recoveryPath)
+      ) {
         throw new Error('invalid stale replacement journal');
       }
-      removeReplacementArtifacts(journalPath, journal.recoveryPath);
+      removeReplacementArtifactsDurably(journalPath, journal.recoveryPath);
     } catch (error) {
       // Remove invalid stale journal and its snapshot without blocking startup.
       const fallbackRecovery = path.join(backupRoot, `${path.basename(journalPath, '.json')}.db`);
-      removeReplacementArtifacts(journalPath, fallbackRecovery);
+      removeReplacementArtifactsDurably(journalPath, fallbackRecovery);
       console.warn(`[DB] Removed stale invalid replacement journal: ${journalPath}`);
     }
   }
 }
 
 function recoverInterruptedDatabaseReplacement(dbPath: string, backupDir: string): void {
+  restoreReplacementCleanupEvidence(backupDir, dbPath);
   let journals: string[] = [];
   try {
-    journals = fs.readdirSync(backupDir)
+    journals = fs
+      .readdirSync(backupDir)
       .filter((name) => /^(?:flo-restore|flo-reset)-recovery-.+\.json$/.test(name))
       .map((name) => path.join(backupDir, name))
       .sort((a, b) => fs.lstatSync(b).mtimeMs - fs.lstatSync(a).mtimeMs);
   } catch (error) {
-    throw new Error(`Could not inspect database replacement journals: ${error instanceof Error ? error.message : 'unknown error'}`);
+    throw new Error(
+      `Could not inspect database replacement journals: ${error instanceof Error ? error.message : 'unknown error'}`,
+    );
   }
   for (const journalPath of journals) {
-    const fallbackRecovery = path.join(path.resolve(backupDir), `${path.basename(journalPath, '.json')}.db`);
+    const fallbackRecovery = path.join(
+      path.resolve(backupDir),
+      `${path.basename(journalPath, '.json')}.db`,
+    );
     let journalStat: fs.Stats;
-    try { journalStat = fs.lstatSync(journalPath); } catch {
-      removeReplacementArtifacts(journalPath, fallbackRecovery);
+    try {
+      journalStat = fs.lstatSync(journalPath);
+    } catch {
+      removeReplacementArtifactsDurably(journalPath, fallbackRecovery);
       continue;
     }
     if (journalStat.isSymbolicLink() || !journalStat.isFile()) {
-      removeReplacementArtifacts(journalPath, fallbackRecovery);
+      removeReplacementArtifactsDurably(journalPath, fallbackRecovery);
       continue;
     }
     let journal: ReplacementJournal;
     try {
-      const parsed = JSON.parse(fs.readFileSync(journalPath, 'utf8')) as Partial<ReplacementJournal>;
-      if ((parsed.phase !== 'prepared' && parsed.phase !== 'committed')
-        || typeof parsed.recoveryPath !== 'string'
-        || typeof parsed.dbPath !== 'string'
-        || !path.isAbsolute(parsed.recoveryPath)
-        || !path.isAbsolute(parsed.dbPath)
-        || (parsed.baselineForeignKeyViolations !== undefined
-          && (!Array.isArray(parsed.baselineForeignKeyViolations)
-            || parsed.baselineForeignKeyViolations.some((key) => typeof key !== 'string')))) {
+      const parsed = JSON.parse(
+        fs.readFileSync(journalPath, 'utf8'),
+      ) as Partial<ReplacementJournal>;
+      if (
+        (parsed.phase !== 'prepared' && parsed.phase !== 'committed') ||
+        typeof parsed.recoveryPath !== 'string' ||
+        typeof parsed.dbPath !== 'string' ||
+        !path.isAbsolute(parsed.recoveryPath) ||
+        !path.isAbsolute(parsed.dbPath) ||
+        (parsed.downgradeRecovery !== undefined && typeof parsed.downgradeRecovery !== 'boolean') ||
+        !isValidReplacementSidecarList(parsed.recoverySidecars) ||
+        (parsed.baselineForeignKeyViolations !== undefined &&
+          (!Array.isArray(parsed.baselineForeignKeyViolations) ||
+            parsed.baselineForeignKeyViolations.some((key) => typeof key !== 'string')))
+      ) {
         throw new Error('invalid phase or paths');
       }
       journal = parsed as ReplacementJournal;
     } catch (error) {
-      throw new Error(`Interrupted database replacement journal is invalid: ${error instanceof Error ? error.message : 'unknown error'}`);
+      throw new Error(
+        `Interrupted database replacement journal is invalid: ${error instanceof Error ? error.message : 'unknown error'}`,
+      );
     }
     const recoveryPath = journal.recoveryPath;
     const backupRoot = path.resolve(backupDir);
@@ -592,40 +2073,326 @@ function recoverInterruptedDatabaseReplacement(dbPath: string, backupDir: string
       throw new Error('Interrupted database replacement recovery snapshot could not be validated');
     }
     // Preserve baseline FK violations for compatibility with older journals.
-    const allowedForeignKeyViolations = journal.baselineForeignKeyViolations === undefined
-      ? null
-      : new Set(journal.baselineForeignKeyViolations);
+    const allowedForeignKeyViolations =
+      journal.baselineForeignKeyViolations === undefined
+        ? null
+        : new Set(journal.baselineForeignKeyViolations);
     // Snapshots copy live database without metadata table.
     const requireMetadata = false;
-    // Finalize committed replacement if database file is healthy.
-    if (journal.phase === 'committed' && isHealthyDatabaseFile(dbPath, allowedForeignKeyViolations, requireMetadata)) {
-      removeReplacementArtifacts(journalPath, recoveryPath);
+    if (journal.phase === 'committed') {
+      const liveVersion = inspectDatabaseVersionNonMutating(dbPath);
+      if (liveVersion && liveVersion.schemaVersion > getLatestSupportedSchemaVersion()) {
+        return;
+      }
+      const committedHealthy = journal.downgradeRecovery
+        ? isHealthyDowngradeCommittedDatabaseFile(dbPath, allowedForeignKeyViolations)
+        : checkHealthyDatabaseFile(dbPath, allowedForeignKeyViolations, requireMetadata, true);
+      // Finalize committed replacement if database file is healthy.
+      if (committedHealthy) {
+        if (journal.driveInvalidationRequired !== false) {
+          if (journal.driveInvalidationRequired !== true) {
+            writeReplacementJournal(journalPath, {
+              ...journal,
+              driveInvalidationRequired: true,
+            });
+          }
+          removeOlderReplacementJournals(journals.slice(1), dbPath, backupDir);
+          console.warn(
+            `[DB] Preserved committed replacement journal for Drive invalidation: ${journalPath}`,
+          );
+          return;
+        }
+        removeReplacementArtifactsDurably(journalPath, recoveryPath);
+        removeOlderReplacementJournals(journals.slice(1), dbPath, backupDir);
+        console.warn(`[DB] Finalized committed database replacement journal: ${journalPath}`);
+        return;
+      }
+    }
+    if (journal.downgradeRecovery) {
+      const expectedSidecars = journal.recoverySidecars ?? [];
+      if (!isReadableRecoverySnapshotWithSidecars(recoveryPath, expectedSidecars)) {
+        throw new Error(
+          'Interrupted database replacement recovery snapshot could not be validated',
+        );
+      }
+      const failures = removeDatabaseFiles(dbPath);
+      if (failures.length > 0)
+        throw new Error(`Could not clear interrupted database replacement: ${failures.join(', ')}`);
+      restoreDatabaseWithSidecars(recoveryPath, dbPath, expectedSidecars);
+      if (!syncDirectory(path.dirname(dbPath)) && process.platform !== 'win32') {
+        throw new Error('Could not durably install recovered database');
+      }
+      removeReplacementArtifactsDurably(journalPath, recoveryPath);
       removeOlderReplacementJournals(journals.slice(1), dbPath, backupDir);
-      console.warn(`[DB] Finalized committed database replacement journal: ${journalPath}`);
+      console.warn(
+        `[DB] Recovered newer database from interrupted downgrade replacement snapshot: ${recoveryPath}`,
+      );
       return;
     }
     let recoveryStat: fs.Stats;
-    try { recoveryStat = fs.lstatSync(recoveryPath); } catch { throw new Error('Interrupted database replacement snapshot is missing'); }
-    const recoverySidecars = pathEntryExists(`${recoveryPath}-wal`) || pathEntryExists(`${recoveryPath}-shm`);
-    if (recoveryStat.isSymbolicLink() || !recoveryStat.isFile() || recoverySidecars
-      || !isHealthyDatabaseFile(recoveryPath, allowedForeignKeyViolations, requireMetadata)) {
+    try {
+      recoveryStat = fs.lstatSync(recoveryPath);
+    } catch (statError) {
+      const code = (statError as NodeJS.ErrnoException | null)?.code;
+      if (code === 'ENOENT' || code === 'ENOTDIR') {
+        throw new Error('Interrupted database replacement snapshot is missing');
+      }
+      throw statError;
+    }
+    const recoverySidecars =
+      pathEntryExists(`${recoveryPath}-wal`) ||
+      pathEntryExists(`${recoveryPath}-shm`) ||
+      pathEntryExists(`${recoveryPath}-journal`);
+    if (
+      recoveryStat.isSymbolicLink() ||
+      !recoveryStat.isFile() ||
+      recoverySidecars ||
+      !checkHealthyDatabaseFile(recoveryPath, allowedForeignKeyViolations, requireMetadata, true)
+    ) {
       throw new Error('Interrupted database replacement recovery snapshot could not be validated');
     }
     const failures = removeDatabaseFiles(dbPath);
-    if (failures.length > 0) throw new Error(`Could not clear interrupted database replacement: ${failures.join(', ')}`);
+    if (failures.length > 0)
+      throw new Error(`Could not clear interrupted database replacement: ${failures.join(', ')}`);
     fs.copyFileSync(recoveryPath, dbPath);
     syncFile(dbPath);
     if (!syncDirectory(path.dirname(dbPath)) && process.platform !== 'win32') {
       throw new Error('Could not durably install recovered database');
     }
-    removeReplacementArtifacts(journalPath, recoveryPath);
+    removeReplacementArtifactsDurably(journalPath, recoveryPath);
     removeOlderReplacementJournals(journals.slice(1), dbPath, backupDir);
     console.warn(`[DB] Recovered database from interrupted replacement snapshot: ${recoveryPath}`);
     return;
   }
 }
 
-export function initDatabase(recoverInterruptedReplacement = true, allowDuringShutdown = false): void {
+export function registerOrderSearchFunctions(dbInstance: Database.Database): void {
+  try {
+    dbInstance.function('orders_search_contains', (value: string | null, query: string) =>
+      typeof value === 'string' && value.toLowerCase().includes(query.toLowerCase()) ? 1 : 0,
+    );
+    dbInstance.function('orders_search_digits_contains', (value: string | null, digits: string) =>
+      typeof value === 'string' && value.replace(/\D/g, '').includes(digits) ? 1 : 0,
+    );
+  } catch {
+    // Function already registered or connection closed
+  }
+}
+
+export function registerSettingsRevisionTriggers(dbInstance: Database.Database = db): void {
+  try {
+    dbInstance.function('flo_bump_settings_revision', () => {
+      settingsRevision += 1;
+      return 0;
+    });
+  } catch {
+    // Function already registered or connection closed
+  }
+  const existingTables = new Set(
+    (
+      dbInstance
+        .prepare(
+          "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('settings', 'users')",
+        )
+        .all() as { name: string }[]
+    ).map((r) => r.name),
+  );
+  if (existingTables.has('settings')) {
+    dbInstance.exec(`
+      CREATE TEMP TRIGGER IF NOT EXISTS trg_settings_revision_ai AFTER INSERT ON main.settings BEGIN
+        SELECT flo_bump_settings_revision();
+      END;
+      CREATE TEMP TRIGGER IF NOT EXISTS trg_settings_revision_au AFTER UPDATE ON main.settings BEGIN
+        SELECT flo_bump_settings_revision();
+      END;
+      CREATE TEMP TRIGGER IF NOT EXISTS trg_settings_revision_ad AFTER DELETE ON main.settings BEGIN
+        SELECT flo_bump_settings_revision();
+      END;
+    `);
+  }
+  if (existingTables.has('users')) {
+    dbInstance.exec(`
+      CREATE TEMP TRIGGER IF NOT EXISTS trg_users_revision_ai AFTER INSERT ON main.users BEGIN
+        SELECT flo_bump_settings_revision();
+      END;
+      CREATE TEMP TRIGGER IF NOT EXISTS trg_users_revision_au AFTER UPDATE ON main.users BEGIN
+        SELECT flo_bump_settings_revision();
+      END;
+      CREATE TEMP TRIGGER IF NOT EXISTS trg_users_revision_ad AFTER DELETE ON main.users BEGIN
+        SELECT flo_bump_settings_revision();
+      END;
+    `);
+  }
+}
+
+function readCanonicalMetaVersionInfo(probeDb: Database.Database): {
+  schemaVersion: number | null;
+  appVersion: string | null;
+} {
+  try {
+    const metaRows = probeDb
+      .prepare("SELECT key, value FROM _flo_meta WHERE key IN ('schema_version', 'app_version')")
+      .all() as { key: string; value: string | null }[];
+    const metaValues = new Map(metaRows.map((row) => [row.key, row.value]));
+    const schemaVersion = parseCanonicalSchemaVersion(metaValues.get('schema_version'));
+    const rawAppVersion = metaValues.get('app_version');
+    const appVersion =
+      typeof rawAppVersion === 'string' && rawAppVersion.trim() ? rawAppVersion.trim() : null;
+    return { schemaVersion, appVersion };
+  } catch (error) {
+    if (isShutdownOrMaintenanceAbortError(error) || isSqliteStorageOrOpenError(error)) {
+      throw error;
+    }
+    return { schemaVersion: null, appVersion: null };
+  }
+}
+
+function inspectEffectiveDatabaseVersion(
+  probeDb: Database.Database,
+  fallbackVersion: number,
+  maxSupported: number,
+): { schemaVersion: number; appVersion: string | null } | null {
+  const rawPragma = Number(probeDb.pragma('user_version', { simple: true }));
+  const baseVersion = Number.isSafeInteger(rawPragma) ? rawPragma : fallbackVersion;
+  const metaInfo = readCanonicalMetaVersionInfo(probeDb);
+  const effectiveVersion =
+    metaInfo.schemaVersion !== null && metaInfo.schemaVersion > maxSupported
+      ? Math.max(baseVersion, metaInfo.schemaVersion)
+      : baseVersion;
+  if (!Number.isSafeInteger(effectiveVersion)) {
+    return fallbackVersion > maxSupported
+      ? { schemaVersion: fallbackVersion, appVersion: null }
+      : null;
+  }
+  return {
+    schemaVersion: effectiveVersion,
+    appVersion: metaInfo.schemaVersion === effectiveVersion ? metaInfo.appVersion : null,
+  };
+}
+
+function inspectDatabaseVersionNonMutating(
+  dbPath: string,
+): { schemaVersion: number; appVersion: string | null } | null {
+  const headerInfo = readSqliteHeaderInfo(dbPath, true);
+  if (!headerInfo) return null;
+  const { headerVersion } = headerInfo;
+  const maxSupported = getLatestSupportedSchemaVersion();
+  const effectiveHeaderVersion = getEffectiveDatabaseHeaderVersion(dbPath, headerInfo);
+
+  const presentSidecars: SqliteProbeSidecar[] = [];
+  for (const suffix of SQLITE_PROBE_SIDECAR_SUFFIXES) {
+    const sidecarPath = `${dbPath}${suffix}`;
+    if (!pathEntryExists(sidecarPath)) continue;
+    let sidecarStat: fs.Stats;
+    try {
+      sidecarStat = fs.lstatSync(sidecarPath);
+    } catch (statError) {
+      if (effectiveHeaderVersion > maxSupported) {
+        return { schemaVersion: effectiveHeaderVersion, appVersion: null };
+      }
+      throw new Error(
+        `Could not inspect database sidecar ${sidecarPath}: ${statError instanceof Error ? statError.message : 'unknown error'}`,
+        { cause: statError },
+      );
+    }
+    if (sidecarStat.isSymbolicLink() || !sidecarStat.isFile()) {
+      if (effectiveHeaderVersion > maxSupported) {
+        return { schemaVersion: effectiveHeaderVersion, appVersion: null };
+      }
+      throw new Error(`Database sidecar ${sidecarPath} is not a regular file`);
+    }
+    presentSidecars.push(suffix);
+  }
+
+  if (presentSidecars.length === 0) {
+    const walExistedBefore = pathEntryExists(`${dbPath}-wal`);
+    const shmExistedBefore = pathEntryExists(`${dbPath}-shm`);
+    let probeDb: Database.Database | undefined;
+    try {
+      probeDb = new Database(dbPath, { readonly: true, fileMustExist: true });
+      probeDb.pragma('temp_store = MEMORY');
+      return (
+        inspectEffectiveDatabaseVersion(probeDb, effectiveHeaderVersion, maxSupported) ?? {
+          schemaVersion: headerVersion,
+          appVersion: null,
+        }
+      );
+    } catch (error) {
+      if (isShutdownOrMaintenanceAbortError(error)) {
+        throw error;
+      }
+      if (effectiveHeaderVersion > maxSupported) {
+        return { schemaVersion: effectiveHeaderVersion, appVersion: null };
+      }
+      if (isSqliteStorageOrOpenError(error)) {
+        throw error;
+      }
+      return { schemaVersion: effectiveHeaderVersion, appVersion: null };
+    } finally {
+      try {
+        probeDb?.close();
+      } catch {}
+      if (!walExistedBefore && pathEntryExists(`${dbPath}-wal`)) {
+        try {
+          const walStat = fs.lstatSync(`${dbPath}-wal`);
+          if (walStat.isFile() && walStat.size === 0) {
+            fs.unlinkSync(`${dbPath}-wal`);
+          }
+        } catch {}
+      }
+      if (!shmExistedBefore && pathEntryExists(`${dbPath}-shm`)) {
+        try {
+          fs.unlinkSync(`${dbPath}-shm`);
+        } catch {}
+      }
+    }
+  }
+
+  // Inspect a disposable copy so live WAL/SHM/journal sidecars are never checkpointed or removed.
+  try {
+    const probed = probeStagedDatabaseWithFallback(
+      dbPath,
+      presentSidecars,
+      {
+        tmpPrefix: 'flo-schema-preflight-',
+        fallbackSubprefix: 'preflight-',
+        targetFileName: 'probe.db',
+        purposeLabel: 'active database for schema preflight',
+      },
+      (probeDb) => inspectEffectiveDatabaseVersion(probeDb, effectiveHeaderVersion, maxSupported),
+    );
+    if (probed.kind === 'ok') {
+      return probed.value;
+    }
+    return effectiveHeaderVersion > maxSupported
+      ? { schemaVersion: effectiveHeaderVersion, appVersion: null }
+      : null;
+  } catch (stageError) {
+    if (isShutdownOrMaintenanceAbortError(stageError)) {
+      throw stageError;
+    }
+    if (effectiveHeaderVersion > maxSupported) {
+      return { schemaVersion: effectiveHeaderVersion, appVersion: null };
+    }
+    if (isSqliteStorageOrOpenError(stageError)) {
+      return { schemaVersion: effectiveHeaderVersion, appVersion: null };
+    }
+    throw stageError;
+  }
+}
+
+export function initDatabase(
+  recoverInterruptedReplacement = true,
+  allowDuringShutdown = false,
+): void {
+  initializeDatabase(recoverInterruptedReplacement, allowDuringShutdown, false);
+}
+
+function initializeDatabase(
+  recoverInterruptedReplacement: boolean,
+  allowDuringShutdown: boolean,
+  skipPreMigrationBackup: boolean,
+): void {
   if (databaseShutdownRequested && !allowDuringShutdown) throw createDatabaseShutdownError();
   const dbPath = getDbPath();
   const backupDir = getBackupDir();
@@ -633,25 +2400,47 @@ export function initDatabase(recoverInterruptedReplacement = true, allowDuringSh
   if (!fs.existsSync(backupDir)) {
     fs.mkdirSync(backupDir, { recursive: true });
   }
-  if (recoverInterruptedReplacement) recoverInterruptedDatabaseReplacement(dbPath, backupDir);
+  if (recoverInterruptedReplacement) {
+    cleanupStaleDatabaseStageDirectories([path.dirname(dbPath), backupDir]);
+    recoverInterruptedDatabaseReplacement(dbPath, backupDir);
+  }
 
   // Startup guard: prevent silent recreation of missing database if previously initialized.
-  const isProductionStartup = recoverInterruptedReplacement && app.isPackaged && !process.env.FLO_E2E_DB_PATH;
-  if (isProductionStartup && !fs.existsSync(dbPath) && fs.existsSync(getDbInitializedMarkerPath())) {
+  const isProductionStartup =
+    recoverInterruptedReplacement && app.isPackaged && !process.env.FLO_E2E_DB_PATH;
+  if (
+    isProductionStartup &&
+    !fs.existsSync(dbPath) &&
+    fs.existsSync(getDbInitializedMarkerPath())
+  ) {
     throw createDatabaseMissingError(dbPath);
+  }
+
+  const maxSupported = getLatestSupportedSchemaVersion();
+  const preflight = inspectDatabaseVersionNonMutating(dbPath);
+  if (preflight && preflight.schemaVersion > maxSupported) {
+    throw new SchemaVersionMismatchError(
+      preflight.schemaVersion,
+      maxSupported,
+      preflight.appVersion,
+    );
   }
 
   console.log(`[DB] Opening database at: ${dbPath}`);
   dbHealthError = null;
   db = new Database(dbPath);
+  instrumentDatabase(db);
+  settingsRevision += 1;
+  registerOrderSearchFunctions(db);
   db.pragma('journal_mode = WAL');
   db.pragma('synchronous = NORMAL');
   db.pragma('busy_timeout = 5000');
   db.pragma('foreign_keys = OFF'); // Off during migrations
 
-  runMigrations();
+  runMigrations(undefined, skipPreMigrationBackup);
 
   db.pragma('foreign_keys = ON');
+  registerSettingsRevisionTriggers(db);
 
   runStartupIntegrityCheck();
   repairSequences();
@@ -670,7 +2459,7 @@ export function initDatabase(recoverInterruptedReplacement = true, allowDuringSh
         console.error('[DB] Failed to write init marker after retry:', retryErr);
         log.error(
           '[DB] Failed to write .flo-db-initialized marker after retry — the #278 ' +
-          'missing-database guard will not protect this install until a future boot succeeds:',
+            'missing-database guard will not protect this install until a future boot succeeds:',
           retryErr,
         );
       }
@@ -729,6 +2518,13 @@ export function isDiagnosticsConsentEnabled(): boolean {
   return getSettingValue('diagnostics_consent') !== 'false';
 }
 
+/** Automatic transmission is separate from capture and is disabled by either diagnostics consent gate. */
+export function isDiagnosticsTransmissionEnabled(): boolean {
+  return (
+    isDiagnosticsConsentEnabled() && getSettingValue('diagnostics_transmission_enabled') === 'true'
+  );
+}
+
 /** Kitchen Display System on/off switch. Defaults to enabled. */
 export function isKdsEnabled(): boolean {
   return getSettingValue('kds_enabled') !== 'false';
@@ -759,12 +2555,20 @@ export function withTxn<T>(fn: () => T): T {
 }
 
 /** Safely append an object to a JSON-array column. Creates the array if missing/invalid. */
-export function appendJsonArray(table: string, idColumn: string, idValue: any, column: string, value: any): void {
+export function appendJsonArray(
+  table: string,
+  idColumn: string,
+  idValue: any,
+  column: string,
+  value: any,
+): void {
   // Validate identifiers to prevent SQL injection
   if (!isSafeIdentifier(table) || !isSafeIdentifier(idColumn) || !isSafeIdentifier(column)) {
     throw new Error(`Invalid identifier: table=${table}, idColumn=${idColumn}, column=${column}`);
   }
-  const row = db.prepare(`SELECT ${column} AS v FROM ${table} WHERE ${idColumn} = ?`).get(idValue) as any;
+  const row = db
+    .prepare(`SELECT ${column} AS v FROM ${table} WHERE ${idColumn} = ?`)
+    .get(idValue) as any;
   let arr: any[] = [];
   if (row && row.v) {
     try {
@@ -775,7 +2579,10 @@ export function appendJsonArray(table: string, idColumn: string, idValue: any, c
     }
   }
   arr.push(value);
-  db.prepare(`UPDATE ${table} SET ${column} = ? WHERE ${idColumn} = ?`).run(JSON.stringify(arr), idValue);
+  db.prepare(`UPDATE ${table} SET ${column} = ? WHERE ${idColumn} = ?`).run(
+    JSON.stringify(arr),
+    idValue,
+  );
 }
 
 /** Runs on every startup. Logs loud warnings but never throws — DB stays available even if dirty. */
@@ -793,7 +2600,10 @@ function runStartupIntegrityCheck(): void {
 
     const fkViolations = db.prepare('PRAGMA foreign_key_check').all() as any[];
     if (fkViolations.length > 0) {
-      console.error(`[DB] ⚠ ${fkViolations.length} foreign-key violation(s):`, fkViolations.slice(0, 5));
+      console.error(
+        `[DB] ⚠ ${fkViolations.length} foreign-key violation(s):`,
+        fkViolations.slice(0, 5),
+      );
     } else {
       console.log('[DB] foreign_key_check: clean');
     }
@@ -802,52 +2612,103 @@ function runStartupIntegrityCheck(): void {
   }
 }
 
-/** Re-seeds sequences table from existing orders and bills to fix unique constraint collisions. */
-function repairSequences(): void {
+/**
+ * Execute sequence repair queries directly inside SQLite.
+ *
+ * Coverage boundary: Reconstructs sequence counters for canonical daily order format
+ * (`ORD-YYYYMMDD-NNNN`) and canonical daily bill format (`INV-YYYYMMDD-NNNN`).
+ * Customized prefixes (e.g. `FAC-`, `BILL-`) or non-daily reset periods (`monthly`,
+ * `financial_year`, `no_reset`) are not reconstructed from table scans; their counters
+ * are managed dynamically in the sequences table.
+ */
+export function executeSequenceRepair(targetDb: Database.Database): {
+  orderChanges: number;
+  billChanges: number;
+} {
+  const orderInfo = targetDb
+    .prepare(`
+      INSERT INTO sequences (name, date, current_value)
+      SELECT
+        'orders' AS name,
+        substr(order_number, 5, 8) AS date,
+        MAX(CAST(substr(order_number, 14) AS INTEGER)) AS current_value
+      FROM orders
+      WHERE order_number GLOB 'ORD-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-[0-9]*'
+        AND substr(order_number, 14) NOT GLOB '*[^0-9]*'
+      GROUP BY substr(order_number, 5, 8)
+      HAVING current_value > 0
+      ON CONFLICT(name, date) DO UPDATE SET
+        current_value = MAX(sequences.current_value, excluded.current_value)
+    `)
+    .run();
+
+  const billInfo = targetDb
+    .prepare(`
+      INSERT INTO sequences (name, date, current_value)
+      SELECT
+        'bills' AS name,
+        substr(bill_number, 5, 8) AS date,
+        MAX(CAST(substr(bill_number, 14) AS INTEGER)) AS current_value
+      FROM bills
+      WHERE bill_number GLOB 'INV-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-[0-9]*'
+        AND substr(bill_number, 14) NOT GLOB '*[^0-9]*'
+      GROUP BY substr(bill_number, 5, 8)
+      HAVING current_value > 0
+      ON CONFLICT(name, date) DO UPDATE SET
+        current_value = MAX(sequences.current_value, excluded.current_value)
+    `)
+    .run();
+
+  return {
+    orderChanges: orderInfo.changes,
+    billChanges: billInfo.changes,
+  };
+}
+
+/**
+ * Re-seeds sequences table from existing orders and bills to fix unique constraint collisions.
+ *
+ * Uses SQL-level aggregation to eliminate JavaScript array materialization of historical IDs.
+ * Ordinary boots verify sequence health and skip the full scan unless flagged as pending.
+ */
+export function repairSequences(force: boolean = false): {
+  repaired: boolean;
+  orderSequencesUpdated: number;
+  billSequencesUpdated: number;
+} {
   try {
-    const collectSequenceMax = (table: 'orders' | 'bills', numberColumn: string, pattern: RegExp) => {
-      const rows = db.prepare(`SELECT ${numberColumn} AS value FROM ${table} WHERE ${numberColumn} IS NOT NULL`).all() as { value: string }[];
-      const maxByDate = new Map<string, number>();
+    const isPending = getSettingValue('sequence_repair_pending') === '1';
+    const isCompleted = Boolean(getSettingValue('sequence_repair_completed_at'));
 
-      for (const row of rows) {
-        const match = String(row.value).match(pattern);
-        if (!match) continue;
-        const date = match[1];
-        const sequence = Number.parseInt(match[2], 10);
-        if (!Number.isFinite(sequence)) continue;
-        maxByDate.set(date, Math.max(maxByDate.get(date) || 0, sequence));
+    if (!force && !isPending && isCompleted) {
+      // Check safety fallback: if sequences exist, or if there are no historical orders/bills,
+      // skip scanning historical tables on ordinary boots.
+      const hasSequences = Boolean(db.prepare('SELECT 1 FROM sequences LIMIT 1').get());
+      if (hasSequences) {
+        return { repaired: false, orderSequencesUpdated: 0, billSequencesUpdated: 0 };
       }
-
-      return Array.from(maxByDate, ([date, max_val]) => ({ date, max_val }));
-    };
-
-    // Extract max sequence per date from order_numbers (format: ORD-YYYYMMDD-NNNN)
-    const orderRows = collectSequenceMax('orders', 'order_number', /^ORD-(\d{8})-(\d+)$/);
-
-    for (const row of orderRows) {
-      if (!row.date || !row.max_val) continue;
-      const existing = db.prepare(`SELECT current_value FROM sequences WHERE name = 'orders' AND date = ?`).get(row.date) as any;
-      if (!existing) {
-        db.prepare(`INSERT INTO sequences (name, date, current_value) VALUES ('orders', ?, ?)`).run(row.date, row.max_val);
-      } else if (existing.current_value < row.max_val) {
-        db.prepare(`UPDATE sequences SET current_value = ? WHERE name = 'orders' AND date = ?`).run(row.max_val, row.date);
+      const hasOrders = Boolean(db.prepare('SELECT 1 FROM orders LIMIT 1').get());
+      const hasBills = Boolean(db.prepare('SELECT 1 FROM bills LIMIT 1').get());
+      if (!hasOrders && !hasBills) {
+        return { repaired: false, orderSequencesUpdated: 0, billSequencesUpdated: 0 };
       }
     }
 
-    // Extract max sequence per date from bill_numbers (format: INV-YYYYMMDD-NNNN)
-    const billRows = collectSequenceMax('bills', 'bill_number', /^INV-(\d{8})-(\d+)$/);
+    return withTxn(() => {
+      const { orderChanges, billChanges } = executeSequenceRepair(db);
 
-    for (const row of billRows) {
-      if (!row.date || !row.max_val) continue;
-      const existing = db.prepare(`SELECT current_value FROM sequences WHERE name = 'bills' AND date = ?`).get(row.date) as any;
-      if (!existing) {
-        db.prepare(`INSERT INTO sequences (name, date, current_value) VALUES ('bills', ?, ?)`).run(row.date, row.max_val);
-      } else if (existing.current_value < row.max_val) {
-        db.prepare(`UPDATE sequences SET current_value = ? WHERE name = 'bills' AND date = ?`).run(row.max_val, row.date);
-      }
-    }
+      upsertSetting('sequence_repair_completed_at', now());
+      upsertSetting('sequence_repair_pending', '0');
+
+      return {
+        repaired: true,
+        orderSequencesUpdated: orderChanges,
+        billSequencesUpdated: billChanges,
+      };
+    });
   } catch (err) {
     console.error('[DB] repairSequences failed:', err);
+    return { repaired: false, orderSequencesUpdated: 0, billSequencesUpdated: 0 };
   }
 }
 
@@ -855,28 +2716,49 @@ function repairSequences(): void {
  *  Only runs when rows are detected as malformed AND the deduped sum matches `paid_amount`. */
 function autoRepairPaymentDetails(): void {
   try {
-    const rows = db.prepare(`SELECT id, payment_details, paid_amount FROM bills WHERE payment_details IS NOT NULL AND payment_details != ''`).all() as any[];
+    const rows = db
+      .prepare(
+        `SELECT id, payment_details, paid_amount FROM bills WHERE payment_details IS NOT NULL AND payment_details != ''`,
+      )
+      .all() as any[];
     const toFix: { id: number; value: string }[] = [];
 
     for (const row of rows) {
-      try { JSON.parse(row.payment_details); continue; } catch { }
+      try {
+        JSON.parse(row.payment_details);
+        continue;
+      } catch {}
 
       const wrapped = '[' + String(row.payment_details).replace(/\}\s*,\s*\{/g, '},{') + ']';
       let parsed: any[];
-      try { parsed = JSON.parse(wrapped); } catch { continue; }
+      try {
+        parsed = JSON.parse(wrapped);
+      } catch {
+        continue;
+      }
       if (!Array.isArray(parsed)) continue;
 
       const deduped: any[] = [];
       for (const p of parsed) {
         const prev = deduped[deduped.length - 1];
-        if (prev && prev.method === p.method && prev.amount === p.amount && prev.timestamp === p.timestamp) continue;
+        if (
+          prev &&
+          prev.method === p.method &&
+          prev.amount === p.amount &&
+          prev.timestamp === p.timestamp
+        )
+          continue;
         deduped.push(p);
       }
 
       const dedupedSum = deduped.reduce((s, p) => s + (Number(p.amount) || 0), 0);
       const rawSum = parsed.reduce((s, p) => s + (Number(p.amount) || 0), 0);
-      const chosen = Math.abs(dedupedSum - row.paid_amount) <= 0.02 ? deduped
-        : Math.abs(rawSum - row.paid_amount) <= 0.02 ? parsed : null;
+      const chosen =
+        Math.abs(dedupedSum - row.paid_amount) <= 0.02
+          ? deduped
+          : Math.abs(rawSum - row.paid_amount) <= 0.02
+            ? parsed
+            : null;
       if (!chosen) continue;
 
       toFix.push({ id: row.id, value: JSON.stringify(chosen) });
@@ -884,7 +2766,9 @@ function autoRepairPaymentDetails(): void {
 
     if (toFix.length === 0) return;
 
-    const stmt = db.prepare(`UPDATE bills SET payment_details = ?, updated_at = datetime('now') WHERE id = ?`);
+    const stmt = db.prepare(
+      `UPDATE bills SET payment_details = ?, updated_at = datetime('now') WHERE id = ?`,
+    );
     const tx = db.transaction((rows: { id: number; value: string }[]) => {
       for (const r of rows) stmt.run(r.value, r.id);
     });
@@ -895,10 +2779,108 @@ function autoRepairPaymentDetails(): void {
   }
 }
 
+/**
+ * Silently restores anything a skipped or interrupted migration should have added (columns,
+ * indexes, triggers, tables). Additive only; a snapshot is taken first and the repair is skipped
+ * if it cannot be made.
+ */
+export function autoRepairSchemaDrift(): void {
+  if (buildingIdealSchema) return;
+  try {
+    const { runHealthCheck, applySafeFixes } =
+      require('./services/schema-health') as typeof import('./services/schema-health');
+    const fixable = runHealthCheck(db).findings.filter(
+      (f) => f.autoApplicable && f.risk === 'safe',
+    );
+    if (fixable.length === 0) {
+      if (getSettingValue(SCHEMA_REPAIR_FAILED_KEY))
+        upsertSettings({ [SCHEMA_REPAIR_FAILED_KEY]: '' });
+      return;
+    }
+
+    // A set of fixes that already failed on a previous start is not retried (or re-snapshotted)
+    // until the set of findings changes.
+    const signature = fixable
+      .map((f) => f.id)
+      .sort()
+      .join('|');
+    if (getSettingValue(SCHEMA_REPAIR_FAILED_KEY) === signature) return;
+
+    const version = getCurrentSchemaVersion();
+    const backupDir = getBackupDir();
+    fs.mkdirSync(backupDir, { recursive: true });
+    const snapshotPath = path.join(
+      backupDir,
+      `flo-backup-${new Date().toISOString().replace(/[:.]/g, '-')}-pre-v${version}-schema-repair.db`,
+    );
+    try {
+      db.exec(`VACUUM INTO '${snapshotPath.replace(/'/g, "''")}'`);
+      stampSchemaRepairSnapshot(snapshotPath, version);
+    } catch (error) {
+      removeQuietlySync(snapshotPath);
+      throw error;
+    }
+    pruneSchemaRepairSnapshots(backupDir);
+
+    // No explicit ids: the multi-pass default also picks up indexes and triggers of a recreated table.
+    const result = applySafeFixes(undefined, db);
+    upsertSettings({ [SCHEMA_REPAIR_FAILED_KEY]: result.errors.length > 0 ? signature : '' });
+    console.log(
+      `[DB] schema self-repair applied ${result.applied.length} fix(es), ${result.errors.length} error(s)`,
+    );
+  } catch (err: any) {
+    console.warn('[DB] schema self-repair skipped:', err?.message || err);
+  }
+}
+
+const SCHEMA_REPAIR_FAILED_KEY = 'schema_repair_failed_signature';
+const SCHEMA_REPAIR_SNAPSHOT_RETENTION = 3;
+
+function removeQuietlySync(filePath: string): void {
+  try {
+    fs.unlinkSync(filePath);
+  } catch {
+    // best effort
+  }
+}
+
+/** Makes the snapshot a self-contained, restorable backup (same stamp as every other backup). */
+function stampSchemaRepairSnapshot(snapshotPath: string, version: number): void {
+  const snapshotDb = new Database(snapshotPath);
+  try {
+    snapshotDb.pragma('journal_mode = DELETE');
+    snapshotDb.exec('CREATE TABLE IF NOT EXISTS _flo_meta (key TEXT PRIMARY KEY, value TEXT)');
+    snapshotDb.pragma(`user_version = ${version}`);
+    const put = snapshotDb.prepare('INSERT OR REPLACE INTO _flo_meta (key, value) VALUES (?, ?)');
+    put.run('schema_version', String(version));
+    put.run('backup_created_at', new Date().toISOString());
+    put.run('app_version', app.getVersion());
+  } finally {
+    snapshotDb.close();
+  }
+  syncFile(snapshotPath);
+}
+
+function pruneSchemaRepairSnapshots(backupDir: string): void {
+  try {
+    const snapshots = fs
+      .readdirSync(backupDir)
+      .filter((name) => name.endsWith('-schema-repair.db'))
+      .sort()
+      .reverse();
+    for (const name of snapshots.slice(SCHEMA_REPAIR_SNAPSHOT_RETENTION)) {
+      removeQuietlySync(path.join(backupDir, name));
+    }
+  } catch {
+    // best effort
+  }
+}
+
 /** Keep printer selection deterministic if an older install ended up with multiple defaults. */
 function autoRepairDefaultPrinter(): void {
   try {
-    const defaults = db.prepare(`
+    const defaults = db
+      .prepare(`
       SELECT id FROM printers
       WHERE is_default = 1
       ORDER BY CASE WHEN id = 'printer-1' AND name = 'Thermal Printer' THEN 1 ELSE 0 END ASC,
@@ -906,7 +2888,8 @@ function autoRepairDefaultPrinter(): void {
                COALESCE(created_at, '') DESC,
                name COLLATE NOCASE ASC,
                id ASC
-    `).all() as { id: string }[];
+    `)
+      .all() as { id: string }[];
 
     if (defaults.length <= 1) return;
 
@@ -931,15 +2914,30 @@ export function getDatabase(): Database.Database {
 }
 
 export function waitForDatabaseRequests(timeoutMs?: number): Promise<void> {
-  if (activeDatabaseRequests === 0 && !databaseMaintenanceActive && databaseMaintenancePending === 0) return Promise.resolve();
+  if (
+    activeDatabaseRequests === 0 &&
+    !databaseMaintenanceActive &&
+    databaseMaintenancePending === 0
+  )
+    return Promise.resolve();
   const drain = new Promise<void>((resolve) => databaseIdleWaiters.push(resolve));
-  const effectiveTimeoutMs = timeoutMs ?? (databaseShutdownRequested ? SHUTDOWN_TIMEOUT_MS : undefined);
+  const effectiveTimeoutMs =
+    timeoutMs ?? (databaseShutdownRequested ? SHUTDOWN_TIMEOUT_MS : undefined);
   if (effectiveTimeoutMs === undefined) return drain;
   return new Promise<void>((resolve, reject) => {
-    const timeout = setTimeout(() => reject(createDatabaseShutdownTimeoutError()), effectiveTimeoutMs);
+    const timeout = setTimeout(
+      () => reject(createDatabaseShutdownTimeoutError()),
+      effectiveTimeoutMs,
+    );
     drain.then(
-      () => { clearTimeout(timeout); resolve(); },
-      (error) => { clearTimeout(timeout); reject(error); },
+      () => {
+        clearTimeout(timeout);
+        resolve();
+      },
+      (error) => {
+        clearTimeout(timeout);
+        reject(error);
+      },
     );
   });
 }
@@ -948,32 +2946,60 @@ export function closeDatabase(): void {
   if (db) {
     db.close();
     db = null as unknown as Database.Database;
+    settingsRevision += 1;
     console.log('[DB] Database closed');
   }
 }
 
-export async function createBackupUnlocked(targetPath?: string, signal?: AbortSignal): Promise<{ path: string; schemaVersion: number }> {
+type BackupOptions = { stagingDirectory?: string };
+
+/** Backups are never allowed to carry schema drift, whatever state the live file was in. */
+function repairBackupSchemaDrift(backupDb: Database.Database): void {
+  try {
+    if (Number(backupDb.pragma('user_version', { simple: true })) !== getCurrentSchemaVersion()) {
+      return;
+    }
+    const { applySafeFixes } =
+      require('./services/schema-health') as typeof import('./services/schema-health');
+    const result = applySafeFixes(undefined, backupDb);
+    if (result.applied.length > 0) {
+      console.log(`[DB] createBackup: repaired ${result.applied.length} schema difference(s)`);
+    }
+  } catch (err: any) {
+    console.warn('[DB] createBackup: schema repair skipped:', err?.message || err);
+  }
+}
+
+export async function createBackupUnlocked(
+  targetPath?: string,
+  signal?: AbortSignal,
+  options?: BackupOptions,
+): Promise<{ path: string; schemaVersion: number }> {
   // Internal callers must already hold withDatabaseMaintenanceLock().
   if (signal?.aborted) throw createMaintenanceAbortError();
   console.log('[DB] createBackup: Starting...');
   const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
   const uniqueSuffix = crypto.randomBytes(4).toString('hex');
   const backupDir = getBackupDir();
-
-  if (!fs.existsSync(backupDir)) {
-    fs.mkdirSync(backupDir, { recursive: true });
-  }
-
-  // Write to userData temp path first to support sandbox constraints, then copy to targetPath.
-  const tempPath = path.join(backupDir, `flo-backup-${timestamp}-${uniqueSuffix}.db`);
+  const stagingDir = options?.stagingDirectory ? path.resolve(options.stagingDirectory) : backupDir;
+  const tempPath = path.join(stagingDir, `flo-backup-${timestamp}-${uniqueSuffix}.db`);
   const finalPath = targetPath ? path.resolve(targetPath) : tempPath;
-  const stagedTargetPath = finalPath !== tempPath
-    ? path.join(path.dirname(finalPath), `.${path.basename(finalPath)}.tmp-${uniqueSuffix}`)
-    : null;
+  const stagedTargetPath =
+    finalPath !== tempPath
+      ? path.join(path.dirname(finalPath), `.${path.basename(finalPath)}.tmp-${uniqueSuffix}`)
+      : null;
   let completed = false;
 
+  if (!fs.existsSync(backupDir)) fs.mkdirSync(backupDir, { recursive: true });
+  if (stagingDir !== backupDir && !fs.existsSync(stagingDir))
+    fs.mkdirSync(stagingDir, { recursive: true });
+
   const liveDatabasePath = getDbPath();
-  if ([liveDatabasePath, `${liveDatabasePath}-wal`, `${liveDatabasePath}-shm`].some((livePath) => isLiveDatabaseTarget(finalPath, livePath))) {
+  if (
+    [liveDatabasePath, `${liveDatabasePath}-wal`, `${liveDatabasePath}-shm`].some((livePath) =>
+      isLiveDatabaseTarget(finalPath, livePath),
+    )
+  ) {
     throw new Error('Backup target cannot be the live database or its SQLite sidecars');
   }
   if (stagedTargetPath && fs.existsSync(finalPath) && fs.lstatSync(finalPath).isSymbolicLink()) {
@@ -998,6 +3024,7 @@ export async function createBackupUnlocked(targetPath?: string, signal?: AbortSi
       // Switch to DELETE journal mode: checkpoints WAL and removes
       // .db-wal/.db-shm so the final file is self-contained.
       backupDb.pragma('journal_mode = DELETE');
+      repairBackupSchemaDrift(backupDb);
       backupDb.exec(`
         CREATE TABLE IF NOT EXISTS _flo_meta (
           key TEXT PRIMARY KEY,
@@ -1007,11 +3034,14 @@ export async function createBackupUnlocked(targetPath?: string, signal?: AbortSi
 
       if (signal?.aborted) throw createMaintenanceAbortError();
       currentVersion = getCurrentSchemaVersion();
-      backupDb.prepare(`INSERT OR REPLACE INTO _flo_meta (key, value) VALUES (?, ?)`)
+      backupDb
+        .prepare(`INSERT OR REPLACE INTO _flo_meta (key, value) VALUES (?, ?)`)
         .run('schema_version', String(currentVersion));
-      backupDb.prepare(`INSERT OR REPLACE INTO _flo_meta (key, value) VALUES (?, ?)`)
+      backupDb
+        .prepare(`INSERT OR REPLACE INTO _flo_meta (key, value) VALUES (?, ?)`)
         .run('backup_created_at', new Date().toISOString());
-      backupDb.prepare(`INSERT OR REPLACE INTO _flo_meta (key, value) VALUES (?, ?)`)
+      backupDb
+        .prepare(`INSERT OR REPLACE INTO _flo_meta (key, value) VALUES (?, ?)`)
         .run('app_version', app.getVersion());
     } finally {
       backupDb?.close();
@@ -1038,11 +3068,16 @@ export async function createBackupUnlocked(targetPath?: string, signal?: AbortSi
         if (process.platform !== 'win32' || !['EBUSY', 'EPERM'].includes(unlinkErr?.code)) {
           throw unlinkErr;
         }
-        console.warn('[DB] Could not remove temp backup file (Windows file lock); will be cleaned up on exit:', unlinkErr.message);
+        console.warn(
+          '[DB] Could not remove temp backup file (Windows file lock); will be cleaned up on exit:',
+          unlinkErr.message,
+        );
       }
     }
     for (const sidecar of [`${finalPath}-wal`, `${finalPath}-shm`]) {
-      try { if (pathEntryExists(sidecar)) fs.unlinkSync(sidecar); } catch { }
+      try {
+        if (pathEntryExists(sidecar)) fs.unlinkSync(sidecar);
+      } catch {}
     }
     syncFile(finalPath);
     if (!syncDirectory(path.dirname(finalPath)) && process.platform !== 'win32') {
@@ -1058,20 +3093,34 @@ export async function createBackupUnlocked(targetPath?: string, signal?: AbortSi
     return { path: finalPath, schemaVersion: currentVersion };
   } finally {
     if (!completed) {
-      for (const filePath of [tempPath, stagedTargetPath, `${tempPath}-wal`, `${tempPath}-shm`].filter((value): value is string => Boolean(value))) {
-        try { if (pathEntryExists(filePath)) fs.unlinkSync(filePath); } catch { }
+      for (const filePath of [
+        tempPath,
+        stagedTargetPath,
+        `${tempPath}-wal`,
+        `${tempPath}-shm`,
+      ].filter((value): value is string => Boolean(value))) {
+        try {
+          if (pathEntryExists(filePath)) fs.unlinkSync(filePath);
+        } catch {}
       }
     }
   }
 }
 
-export function createBackup(targetPath?: string, signal?: AbortSignal): Promise<{ path: string; schemaVersion: number }> {
-  return withDatabaseMaintenanceLock((maintenanceSignal) => createBackupUnlocked(targetPath, maintenanceSignal), signal);
+export function createBackup(
+  targetPath?: string,
+  signal?: AbortSignal,
+  options?: BackupOptions,
+): Promise<{ path: string; schemaVersion: number }> {
+  return withDatabaseMaintenanceLock(
+    (maintenanceSignal) => createBackupUnlocked(targetPath, maintenanceSignal, options),
+    signal,
+  );
 }
 
 function removeDatabaseFiles(dbPath: string): string[] {
   const failures: string[] = [];
-  for (const filePath of [dbPath, `${dbPath}-wal`, `${dbPath}-shm`]) {
+  for (const filePath of [dbPath, `${dbPath}-wal`, `${dbPath}-shm`, `${dbPath}-journal`]) {
     try {
       if (pathEntryExists(filePath)) fs.unlinkSync(filePath);
     } catch (error: any) {
@@ -1082,80 +3131,334 @@ function removeDatabaseFiles(dbPath: string): string[] {
   return failures;
 }
 
-/** Resets database while holding maintenance lock; recovers safety backup if reset fails. */
-export async function resetDatabaseWithBackup(signal?: AbortSignal): Promise<{ backupPath: string }> {
-  return withDatabaseMaintenanceLock(async (maintenanceSignal) => {
-    const { path: backupPath } = await createBackupUnlocked(undefined, maintenanceSignal);
-    throwIfDatabaseMaintenanceAborted(maintenanceSignal);
-    const dbPath = getDbPath();
-    const baselineForeignKeyViolations = getForeignKeyViolationKeys(getDatabase());
-    const recoveryPath = path.join(getBackupDir(), `flo-reset-recovery-${crypto.randomBytes(8).toString('hex')}.db`);
-    const journalPath = recoveryPath.replace(/\.db$/, '.json');
-    let replacementCompleted = false;
-    let recoveryCompleted = false;
-    let replacementStarted = false;
+type ResetAfterInit = (freshDb: Database.Database) => void;
 
+/** Resets database under an existing maintenance lock; recovers its safety backup if reset fails. */
+async function resetDatabaseWithBackupUnlocked(
+  maintenanceSignal: AbortSignal,
+  afterInit?: ResetAfterInit,
+): Promise<{ backupPath: string; committed?: boolean; cleanupPending?: boolean }> {
+  const { path: backupPath } = await createBackupUnlocked(undefined, maintenanceSignal);
+  throwIfDatabaseMaintenanceAborted(maintenanceSignal);
+  const dbPath = getDbPath();
+  const currentDb = getDatabase();
+  const baselineForeignKeyViolations = getForeignKeyViolationKeys(currentDb);
+  const localBackupEnabled = (
+    currentDb.prepare("SELECT value FROM settings WHERE key = 'local_backup_enabled'").get() as
+      | { value?: string }
+      | undefined
+  )?.value;
+  const recoveryPath = path.join(
+    getBackupDir(),
+    `flo-reset-recovery-${crypto.randomBytes(8).toString('hex')}.db`,
+  );
+  const journalPath = recoveryPath.replace(/\.db$/, '.json');
+  let recoveryCompleted = false;
+  let replacementStarted = false;
+  let replacementCommitted = false;
+
+  try {
+    fs.copyFileSync(backupPath, recoveryPath);
+    syncFile(recoveryPath);
+    writeReplacementJournal(journalPath, {
+      phase: 'prepared',
+      recoveryPath,
+      dbPath,
+      baselineForeignKeyViolations: [...baselineForeignKeyViolations],
+      driveInvalidationRequired: true,
+    });
+    throwIfDatabaseMaintenanceAborted(maintenanceSignal);
+    replacementStarted = true;
+    closeDatabase();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    throwIfDatabaseMaintenanceAborted(maintenanceSignal);
+    const failures = removeDatabaseFiles(dbPath);
+    if (failures.length > 0) {
+      throw new Error(`Could not remove database files: ${failures.join(', ')}`);
+    }
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    throwIfDatabaseMaintenanceAborted(maintenanceSignal);
+    initDatabase(false, true);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    throwIfDatabaseMaintenanceAborted(maintenanceSignal);
+    const freshDb = getDatabase();
+    if (localBackupEnabled !== undefined) {
+      freshDb
+        .prepare('INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES (?, ?, ?)')
+        .run('local_backup_enabled', localBackupEnabled, now());
+      settingsRevision += 1;
+    }
+    afterInit?.(freshDb);
+    throwIfDatabaseMaintenanceAborted(maintenanceSignal);
+    (db ?? getDatabase()).pragma('wal_checkpoint(TRUNCATE)');
+    syncFile(dbPath);
+    if (!syncDirectory(path.dirname(dbPath)) && process.platform !== 'win32') {
+      throw new Error('Could not durably commit reset database');
+    }
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    throwIfDatabaseMaintenanceAborted(maintenanceSignal);
+    writeReplacementJournal(journalPath, {
+      phase: 'committed',
+      recoveryPath,
+      dbPath,
+      baselineForeignKeyViolations: [...baselineForeignKeyViolations],
+      driveInvalidationRequired: true,
+    });
+    replacementCommitted = true;
+    return { backupPath, committed: true, cleanupPending: false };
+  } catch (error: any) {
+    const committedJournal = readReplacementJournal(journalPath)?.phase === 'committed';
+    if (replacementCommitted || committedJournal) {
+      console.error('[DB] Reset committed; cleanup remains pending:', error);
+      return { backupPath, committed: true, cleanupPending: true };
+    }
+    // Reopen the pre-wipe snapshot so a partial filesystem failure cannot
+    // leave the process serving an empty or closed database.
+    if (!replacementStarted) {
+      removeReplacementArtifactsDurably(journalPath, recoveryPath);
+      throw error;
+    }
     try {
-      fs.copyFileSync(backupPath, recoveryPath);
-      syncFile(recoveryPath);
-      writeReplacementJournal(journalPath, {
-        phase: 'prepared', recoveryPath, dbPath,
-        baselineForeignKeyViolations: [...baselineForeignKeyViolations],
-      });
-      throwIfDatabaseMaintenanceAborted(maintenanceSignal);
-      replacementStarted = true;
       closeDatabase();
-      await new Promise<void>((resolve) => setImmediate(resolve));
-      throwIfDatabaseMaintenanceAborted(maintenanceSignal);
-      const failures = removeDatabaseFiles(dbPath);
-      if (failures.length > 0) {
-        throw new Error(`Could not remove database files: ${failures.join(', ')}`);
-      }
-      await new Promise<void>((resolve) => setImmediate(resolve));
-      throwIfDatabaseMaintenanceAborted(maintenanceSignal);
-      initDatabase(false, true);
-      await new Promise<void>((resolve) => setImmediate(resolve));
-      throwIfDatabaseMaintenanceAborted(maintenanceSignal);
-      (db ?? getDatabase()).pragma('wal_checkpoint(TRUNCATE)');
-      syncFile(dbPath);
-      if (!syncDirectory(path.dirname(dbPath)) && process.platform !== 'win32') {
-        throw new Error('Could not durably commit reset database');
-      }
-      await new Promise<void>((resolve) => setImmediate(resolve));
-      throwIfDatabaseMaintenanceAborted(maintenanceSignal);
-      writeReplacementJournal(journalPath, {
-        phase: 'committed', recoveryPath, dbPath,
-        baselineForeignKeyViolations: [...baselineForeignKeyViolations],
-      });
-      replacementCompleted = true;
-      return { backupPath };
-    } catch (error: any) {
-      // Reopen the pre-wipe snapshot so a partial filesystem failure cannot
-      // leave the process serving an empty or closed database.
-      if (!replacementStarted) {
-        removeReplacementArtifacts(journalPath, recoveryPath);
-        throw error;
-      }
-      try {
-        closeDatabase();
-        removeDatabaseFiles(dbPath);
-        fs.copyFileSync(backupPath, dbPath);
-        syncFile(dbPath);
-        if (!syncDirectory(path.dirname(dbPath)) && process.platform !== 'win32') {
-          throw new Error('Could not durably recover reset database');
-        }
-        initDatabase(false, true);
-        recoveryCompleted = true;
-      } catch (recoveryError: any) {
+      const recoveryRemoveFailures = removeDatabaseFiles(dbPath);
+      if (recoveryRemoveFailures.length > 0) {
         throw new Error(
-          `Database reset failed: ${error?.message || 'unknown error'}; ` +
-          `database recovery also failed: ${recoveryError?.message || 'unknown error'}`,
+          `Could not remove database files during reset recovery: ${recoveryRemoveFailures.join(', ')}`,
         );
       }
-      throw error;
-    } finally {
-      if (replacementCompleted || recoveryCompleted) removeReplacementArtifacts(journalPath, recoveryPath);
+      fs.copyFileSync(backupPath, dbPath);
+      syncFile(dbPath);
+      if (!syncDirectory(path.dirname(dbPath)) && process.platform !== 'win32') {
+        throw new Error('Could not durably recover reset database');
+      }
+      initDatabase(false, true);
+      recoveryCompleted = true;
+    } catch (recoveryError: any) {
+      throw new Error(
+        `Database reset failed: ${error?.message || 'unknown error'}; ` +
+          `database recovery also failed: ${recoveryError?.message || 'unknown error'}`,
+      );
     }
+    throw error;
+  } finally {
+    if (recoveryCompleted) removeReplacementArtifactsDurably(journalPath, recoveryPath);
+  }
+}
+
+/** Resets database while holding maintenance lock; recovers safety backup if reset fails. */
+export async function resetDatabaseWithBackup(
+  signal?: AbortSignal,
+): Promise<{ backupPath: string; committed?: boolean; cleanupPending?: boolean }> {
+  return withDatabaseMaintenanceLock(
+    (maintenanceSignal) => resetDatabaseWithBackupUnlocked(maintenanceSignal),
+    signal,
+  );
+}
+
+type CurrencyResetMenuSnapshot = {
+  categories: Record<string, unknown>[];
+  products: Record<string, unknown>[];
+  productVariants: Record<string, unknown>[];
+  addonGroups: Record<string, unknown>[];
+  addons: Record<string, unknown>[];
+  addonGroupProducts: Record<string, unknown>[];
+  categoryAddonGroups: Record<string, unknown>[];
+};
+
+export interface CurrencyResetImpact {
+  currentCurrency: string;
+  invoices: number;
+  orders: number;
+  refunds: number;
+  customers: number;
+  products: number;
+  addons: number;
+}
+
+function countTableRows(dbInstance: Database.Database, table: string): number {
+  return (dbInstance.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get() as { count: number })
+    .count;
+}
+
+export function getCurrencyResetImpact(
+  dbInstance: Database.Database = getDatabase(),
+): CurrencyResetImpact {
+  const currentCurrency =
+    (
+      dbInstance.prepare("SELECT value FROM settings WHERE key = 'currency'").get() as
+        | { value?: string }
+        | undefined
+    )?.value || '';
+  return {
+    currentCurrency,
+    invoices: countTableRows(dbInstance, 'bills'),
+    orders: countTableRows(dbInstance, 'orders'),
+    refunds: countTableRows(dbInstance, 'refunds'),
+    customers: countTableRows(dbInstance, 'customers'),
+    products: countTableRows(dbInstance, 'products'),
+    addons: countTableRows(dbInstance, 'addons'),
+  };
+}
+
+function captureCurrencyResetMenu(dbInstance: Database.Database): CurrencyResetMenuSnapshot {
+  const rows = (table: string) =>
+    dbInstance.prepare(`SELECT * FROM ${table}`).all() as Record<string, unknown>[];
+  return {
+    categories: rows('categories'),
+    products: rows('products'),
+    productVariants: rows('product_variants'),
+    addonGroups: rows('addon_groups'),
+    addons: rows('addons'),
+    addonGroupProducts: rows('addon_group_product'),
+    categoryAddonGroups: rows('category_addon_groups'),
+  };
+}
+
+function insertSnapshotRows(
+  dbInstance: Database.Database,
+  table: string,
+  rows: Record<string, unknown>[],
+): void {
+  if (rows.length === 0) return;
+  const targetColumns = new Set(
+    (dbInstance.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[]).map(
+      (column) => column.name,
+    ),
+  );
+  const columns = Object.keys(rows[0]).filter((column) => targetColumns.has(column));
+  const sql = `INSERT INTO ${table} (${columns.join(', ')}) VALUES (${columns.map(() => '?').join(', ')})`;
+  const insert = dbInstance.prepare(sql);
+  for (const row of rows) insert.run(...columns.map((column) => row[column]));
+}
+
+function restoreCurrencyResetMenu(
+  dbInstance: Database.Database,
+  snapshot: CurrencyResetMenuSnapshot,
+): void {
+  const categoryIds = new Set(snapshot.categories.map((category) => category.id));
+  const productIds = new Set(snapshot.products.map((product) => product.id));
+  const addonGroupIds = new Set(snapshot.addonGroups.map((group) => group.id));
+  const inventoryLinks = snapshot.products.map((product) => ({
+    id: product.id,
+    inventoryProductId: product.inventory_product_id,
+  }));
+  const products = snapshot.products.map((product) => ({
+    ...product,
+    category_id: categoryIds.has(product.category_id) ? product.category_id : null,
+    price: 0,
+    cost: 0,
+    stock_quantity: 0,
+    tax_type: 'none',
+    tax_rate: 0,
+    tax_category_id: null,
+    tax_behavior: 'country_default',
+    cb_percent: 0,
+    inventory_product_id: null,
+  }));
+  const addons = snapshot.addons
+    .filter((addon) => addonGroupIds.has(addon.addon_group_id))
+    .map((addon) => ({
+      ...addon,
+      price: 0,
+      tax_category_id: null,
+      tax_behavior: 'country_default',
+      inherit_parent_tax_category: 1,
+      // Add-on stock is reset for the same reason variant stock is: the reset
+      // starts an empty ledger, so any restored stock would have no movement
+      // history behind it and would fail the ledger pre-check on every later
+      // restore.
+      stock_quantity: 0,
+    }));
+  const addonGroupProducts = snapshot.addonGroupProducts.filter(
+    (link) => productIds.has(link.product_id) && addonGroupIds.has(link.addon_group_id),
+  );
+  const categoryAddonGroups = snapshot.categoryAddonGroups.filter(
+    (link) => categoryIds.has(link.category_id) && addonGroupIds.has(link.addon_group_id),
+  );
+  // Variants are reset exactly like their product: prices are zeroed because
+  // they are denominated in the old currency, and stock is zeroed because the
+  // reset starts an empty ledger, so any restored stock would have no movement
+  // history behind it and would fail the ledger pre-check on every later
+  // restore. A recipe link whose base product did not survive is dropped so the
+  // restored row stays referentially valid.
+  const productVariants = snapshot.productVariants
+    .filter((variant) => productIds.has(variant.product_id))
+    .map((variant) => ({
+      ...variant,
+      price: 0,
+      online_price: null,
+      cost_price: null,
+      stock_quantity: 0,
+      inventory_product_id: productIds.has(variant.inventory_product_id)
+        ? variant.inventory_product_id
+        : null,
+    }));
+
+  insertSnapshotRows(dbInstance, 'categories', snapshot.categories);
+  insertSnapshotRows(dbInstance, 'addon_groups', snapshot.addonGroups);
+  insertSnapshotRows(dbInstance, 'products', products);
+  const restoreInventoryLink = dbInstance.prepare(
+    'UPDATE products SET inventory_product_id = ? WHERE id = ?',
+  );
+  for (const link of inventoryLinks) {
+    if (link.inventoryProductId && productIds.has(link.inventoryProductId)) {
+      restoreInventoryLink.run(link.inventoryProductId, link.id);
+    }
+  }
+  insertSnapshotRows(dbInstance, 'addons', addons);
+  insertSnapshotRows(dbInstance, 'product_variants', productVariants);
+  insertSnapshotRows(dbInstance, 'addon_group_product', addonGroupProducts);
+  insertSnapshotRows(dbInstance, 'category_addon_groups', categoryAddonGroups);
+}
+
+export async function resetDatabaseForCurrencyChange(
+  targetCurrency: string,
+  expectedCurrentCurrency: string,
+  signal?: AbortSignal,
+): Promise<{ backupPath: string; committed?: boolean; cleanupPending?: boolean }> {
+  return withDatabaseMaintenanceLock(async (maintenanceSignal) => {
+    const currentDb = getDatabase();
+    const PRESERVED_SETTINGS = ['country', 'currency', 'timezone', 'local_backup_enabled'] as const;
+    const settingsRows = currentDb
+      .prepare(
+        `SELECT key, value FROM settings WHERE key IN (${PRESERVED_SETTINGS.map(() => '?').join(', ')})`,
+      )
+      .all(...PRESERVED_SETTINGS) as { key: string; value: string }[];
+    const settings = Object.fromEntries(settingsRows.map((row) => [row.key, row.value]));
+    if (settings.currency !== expectedCurrentCurrency || settings.currency === targetCurrency) {
+      throw Object.assign(new Error('Active currency changed'), { code: 'ERR_CURRENCY_CHANGED' });
+    }
+    const snapshot = captureCurrencyResetMenu(currentDb);
+    const regional = resolveRegionalSnapshot({
+      country: settings.country,
+      currency: targetCurrency,
+      timezone: settings.timezone,
+    });
+
+    return resetDatabaseWithBackupUnlocked(maintenanceSignal, (freshDb) => {
+      freshDb.transaction(() => {
+        freshDb.exec('CREATE TABLE IF NOT EXISTS _flo_meta (key TEXT PRIMARY KEY, value TEXT)');
+        restoreCurrencyResetMenu(freshDb, snapshot);
+        const writeSetting = freshDb.prepare(
+          'INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES (?, ?, ?)',
+        );
+        writeSetting.run('country', regional.country, now());
+        writeSetting.run('currency', regional.currency, now());
+        writeSetting.run('currency_symbol', regional.currencySymbol, now());
+        writeSetting.run('timezone', regional.timezone, now());
+        if (settings.local_backup_enabled !== undefined) {
+          writeSetting.run('local_backup_enabled', settings.local_backup_enabled, now());
+        }
+        freshDb.prepare('INSERT OR REPLACE INTO _flo_meta (key, value) VALUES (?, ?)').run(
+          'currency_reset_pending',
+          JSON.stringify({
+            country: regional.country,
+            currency: regional.currency,
+            timezone: regional.timezone,
+          }),
+        );
+      })();
+    });
   }, signal);
 }
 
@@ -1166,43 +3469,198 @@ function parseCanonicalSchemaVersion(value: unknown): number | null {
   return Number.isSafeInteger(parsed) ? parsed : null;
 }
 
-function readBackupSchemaVersion(fullPath: string): number | null {
+export type BackupMetadata = {
+  schemaVersion: number | null;
+  appVersion: string | null;
+  backupCreatedAt: string | null;
+};
+
+/** Reads the canonical metadata stamp without changing local backup behavior. */
+export function getBackupMetadata(backupPath: string): BackupMetadata {
   let backupDb: Database.Database | undefined;
   try {
-    backupDb = new Database(fullPath, { readonly: true, fileMustExist: true });
-    const row = backupDb.prepare(`SELECT value FROM _flo_meta WHERE key = 'schema_version'`).get() as { value: string } | undefined;
-    return row ? parseCanonicalSchemaVersion(row.value) : null;
+    backupDb = new Database(backupPath, { readonly: true, fileMustExist: true });
+    const rows = backupDb
+      .prepare(
+        `SELECT key, value FROM _flo_meta WHERE key IN ('schema_version', 'app_version', 'backup_created_at')`,
+      )
+      .all() as { key: string; value: string }[];
+    const values = new Map(rows.map((row) => [row.key, row.value]));
+    const schemaValue = values.get('schema_version');
+    const schemaVersion =
+      schemaValue && /^(?:0|[1-9]\d*)$/.test(schemaValue) ? Number(schemaValue) : null;
+    return {
+      schemaVersion:
+        schemaVersion !== null && Number.isSafeInteger(schemaVersion) ? schemaVersion : null,
+      appVersion: values.get('app_version') || null,
+      backupCreatedAt: values.get('backup_created_at') || null,
+    };
   } catch {
-    return null;
+    return { schemaVersion: null, appVersion: null, backupCreatedAt: null };
   } finally {
     backupDb?.close();
   }
 }
 
-/** Lists auto and manual backups located in the managed backups directory, newest first. */
-export function listBackups(): { fileName: string; path: string; sizeBytes: number; createdAt: string; kind: 'manual' | 'auto'; schemaVersion: number | null }[] {
-  const backupDir = getBackupDir();
-  if (!fs.existsSync(backupDir)) return [];
+export interface BackupInfo {
+  fileName: string;
+  path: string;
+  sizeBytes: number;
+  createdAt: string;
+  kind: 'manual' | 'auto';
+  schemaVersion: number | null;
+}
 
-  return fs.readdirSync(backupDir)
+export interface BackupPaginationOptions {
+  limit?: number;
+  cursor?: string;
+}
+
+export interface BackupPageResult {
+  backups: BackupInfo[];
+  nextCursor: string | null;
+  hasMore: boolean;
+}
+
+function createInvalidBackupPaginationError(message: string): Error & { code: string } {
+  const error = new Error(message) as Error & { code: string };
+  error.code = 'ERR_INVALID_BACKUP_PAGINATION';
+  return error;
+}
+
+export function encodeBackupCursor(createdAt: string, id: string): string {
+  return Buffer.from(JSON.stringify({ createdAt, id }), 'utf8').toString('base64url');
+}
+
+export function decodeBackupCursor(rawCursor: string): { createdAt: string; id: string } {
+  if (typeof rawCursor !== 'string' || !/^[A-Za-z0-9_-]+$/.test(rawCursor)) {
+    throw createInvalidBackupPaginationError('Invalid backup cursor');
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(Buffer.from(rawCursor, 'base64url').toString('utf8'));
+  } catch {
+    throw createInvalidBackupPaginationError('Invalid backup cursor');
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw createInvalidBackupPaginationError('Invalid backup cursor');
+  }
+  const { createdAt, id } = parsed as { createdAt?: unknown; id?: unknown };
+  if (
+    typeof createdAt !== 'string' ||
+    createdAt.length === 0 ||
+    Number.isNaN(Date.parse(createdAt)) ||
+    typeof id !== 'string' ||
+    id.length === 0
+  ) {
+    throw createInvalidBackupPaginationError('Invalid backup cursor');
+  }
+  return { createdAt, id };
+}
+
+export function parseBackupPaginationQuery(
+  rawLimit: unknown,
+  rawCursor: unknown,
+): BackupPaginationOptions {
+  const options: BackupPaginationOptions = {};
+  if (rawLimit !== undefined) {
+    if (typeof rawLimit !== 'string' || !/^\d+$/.test(rawLimit)) {
+      throw createInvalidBackupPaginationError('Invalid backup pagination limit');
+    }
+    const limit = Number.parseInt(rawLimit, 10);
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) {
+      throw createInvalidBackupPaginationError('Invalid backup pagination limit');
+    }
+    options.limit = limit;
+  }
+  if (rawCursor !== undefined) {
+    if (typeof rawCursor !== 'string' || rawCursor.length === 0) {
+      throw createInvalidBackupPaginationError('Invalid backup cursor');
+    }
+    decodeBackupCursor(rawCursor);
+    options.cursor = rawCursor;
+  }
+  return options;
+}
+
+/** Lists auto and manual backups in the managed backups directory, newest first. */
+export function listBackupsPage(options: BackupPaginationOptions = {}): BackupPageResult {
+  if (
+    options.limit !== undefined &&
+    (typeof options.limit !== 'number' ||
+      !Number.isSafeInteger(options.limit) ||
+      options.limit < 1 ||
+      options.limit > 100)
+  ) {
+    throw createInvalidBackupPaginationError('Invalid backup pagination limit');
+  }
+  const cursor = options.cursor !== undefined ? decodeBackupCursor(options.cursor) : null;
+  const backupDir = getBackupDir();
+  if (!fs.existsSync(backupDir)) {
+    return { backups: [], nextCursor: null, hasMore: false };
+  }
+
+  let candidates = fs
+    .readdirSync(backupDir)
     .filter((fileName) => fileName.startsWith('flo-backup-') && fileName.endsWith('.db'))
     .map((fileName) => ({ fileName, fullPath: resolveContainedPath(backupDir, fileName) }))
     .filter((entry): entry is { fileName: string; fullPath: string } => {
       if (!entry.fullPath) return false;
-      try { return fs.lstatSync(entry.fullPath).isFile(); } catch { return false; }
+      try {
+        return fs.lstatSync(entry.fullPath).isFile();
+      } catch {
+        return false;
+      }
     })
     .map(({ fileName, fullPath }) => {
       const stat = fs.statSync(fullPath);
       return {
         fileName,
-        path: fullPath,
+        fullPath,
         sizeBytes: stat.size,
         createdAt: stat.mtime.toISOString(),
-        kind: (fileName.includes('-pre-v') ? 'auto' : 'manual') as 'manual' | 'auto',
-        schemaVersion: readBackupSchemaVersion(fullPath),
+        kind: (fileName.includes('-pre-v') || isRestoreSafetyCopyName(fileName)
+          ? 'auto'
+          : 'manual') as 'manual' | 'auto',
       };
     })
-    .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+    .sort((a, b) => {
+      if (a.createdAt !== b.createdAt) return a.createdAt < b.createdAt ? 1 : -1;
+      return a.fileName === b.fileName ? 0 : a.fileName < b.fileName ? 1 : -1;
+    });
+
+  if (cursor) {
+    candidates = candidates.filter(
+      (entry) =>
+        entry.createdAt < cursor.createdAt ||
+        (entry.createdAt === cursor.createdAt && entry.fileName < cursor.id),
+    );
+  }
+
+  const limit = options.limit;
+  const sliced = limit !== undefined ? candidates.slice(0, limit + 1) : candidates;
+  const hasMore = limit !== undefined && sliced.length > limit;
+  const pageEntries = limit !== undefined ? sliced.slice(0, limit) : sliced;
+  const backups = pageEntries.map((entry) => ({
+    fileName: entry.fileName,
+    path: entry.fullPath,
+    sizeBytes: entry.sizeBytes,
+    createdAt: entry.createdAt,
+    kind: entry.kind,
+    schemaVersion: getSchemaVersionFromBackup(entry.fullPath),
+  }));
+  const last = backups[backups.length - 1];
+  const nextCursor = hasMore && last ? encodeBackupCursor(last.createdAt, last.fileName) : null;
+  return { backups, nextCursor, hasMore };
+}
+
+export function listBackups(): BackupInfo[];
+export function listBackups(options: BackupPaginationOptions): BackupPageResult;
+export function listBackups(options?: BackupPaginationOptions): BackupInfo[] | BackupPageResult {
+  if (options === undefined) {
+    return listBackupsPage().backups;
+  }
+  return listBackupsPage(options);
 }
 
 /** Deletes a backup from the managed backups directory after validating filename format. */
@@ -1249,38 +3707,1704 @@ export function isManagedBackupFile(candidatePath: string): boolean {
   }
 }
 
+export type DowngradeBackupKind = 'pre-upgrade' | 'pre-restore' | 'manual';
+
+export interface CompatibleDowngradeBackup {
+  fileName: string;
+  path: string;
+  sizeBytes: number;
+  createdAt: string;
+  backupCreatedAt: string | null;
+  appVersion: string | null;
+  schemaVersion: number;
+  kind: DowngradeBackupKind;
+}
+
+export interface RejectedDowngradeBackup {
+  fileName: string;
+  path: string;
+  reason: 'incompatible_newer' | 'corrupt_or_invalid';
+  schemaVersion: number | null;
+  appVersion: string | null;
+  detail: string;
+}
+
+export interface DowngradeBackupDiscovery {
+  backupDir: string;
+  maxSupportedSchemaVersion: number;
+  compatible: CompatibleDowngradeBackup[];
+  incompatibleNewer: RejectedDowngradeBackup[];
+  corruptOrInvalid: RejectedDowngradeBackup[];
+}
+
+export interface DowngradeRestoreOptions {
+  newerDbVersion?: number;
+  archivePath?: string;
+  signal?: AbortSignal;
+}
+
+export interface DowngradeRestoreResult {
+  restoredBackupPath: string;
+  backupSchemaVersion: number;
+  restoredSchemaVersion: number;
+  preservedDbPath: string;
+  preservedSidecarPaths: string[];
+}
+
+const CORE_FLO_BACKUP_TABLES = [
+  'settings',
+  'users',
+  'categories',
+  'products',
+  'orders',
+  'order_items',
+  'bills',
+] as const;
+
+const INTERNAL_BACKUP_ARTIFACT_PATTERN =
+  /^(?:(?:flo-restore|flo-reset)-recovery-.+|flo-preserved-newer-.+)\.db$/;
+
+function classifyDowngradeBackupKind(fileName: string): DowngradeBackupKind {
+  if (fileName.includes('-pre-v')) return 'pre-upgrade';
+  if (isRestoreSafetyCopyName(fileName)) return 'pre-restore';
+  return 'manual';
+}
+
+type DowngradeBackupSnapshotInspection =
+  | {
+      status: 'compatible';
+      schemaVersion: number;
+      appVersion: string | null;
+      backupCreatedAt: string | null;
+    }
+  | {
+      status: 'incompatible_newer' | 'corrupt_or_invalid';
+      schemaVersion: number | null;
+      appVersion: string | null;
+      detail: string;
+    };
+
+function validatePreLedgerBackupInventory(
+  dbInstance: Database.Database,
+  tables: ReadonlySet<string>,
+): string | null {
+  const productColumns = getColumns(dbInstance, 'products');
+  if (!productColumns.includes('id') || !productColumns.includes('stock_quantity')) {
+    return 'Backup products table is missing stock_quantity';
+  }
+
+  const products = dbInstance.prepare('SELECT id, stock_quantity FROM products').all() as Record<
+    string,
+    unknown
+  >[];
+  let hasStockedProduct = false;
+  for (const row of products) {
+    const productId = row?.id == null ? '' : String(row.id);
+    if (!productId) {
+      return 'Product stock quantity is missing from the inventory snapshot';
+    }
+    const rawStock = row.stock_quantity;
+    if (
+      rawStock !== null &&
+      (typeof rawStock !== 'number' || !Number.isFinite(rawStock) || rawStock < 0)
+    ) {
+      return 'Product stock quantity is invalid in the inventory snapshot';
+    }
+    if (typeof rawStock === 'number' && rawStock > 0) {
+      hasStockedProduct = true;
+    }
+  }
+
+  if (
+    tables.has('product_variants') &&
+    getColumns(dbInstance, 'product_variants').includes('stock_quantity')
+  ) {
+    const variants = dbInstance
+      .prepare('SELECT id, product_id, stock_quantity FROM product_variants')
+      .all() as Record<string, unknown>[];
+    for (const variant of variants) {
+      const rawStock = variant.stock_quantity;
+      if (
+        rawStock !== null &&
+        (typeof rawStock !== 'number' || !Number.isFinite(rawStock) || rawStock < 0)
+      ) {
+        return 'Variant stock quantity is invalid in the inventory snapshot';
+      }
+      if (typeof rawStock === 'number' && rawStock > 0) {
+        return 'Backup is missing inventory movement history for variant stock';
+      }
+    }
+  }
+
+  if (tables.has('addons') && getColumns(dbInstance, 'addons').includes('stock_quantity')) {
+    const addons = dbInstance.prepare('SELECT id, stock_quantity FROM addons').all() as Record<
+      string,
+      unknown
+    >[];
+    for (const addon of addons) {
+      const rawStock = addon.stock_quantity;
+      if (
+        rawStock !== null &&
+        (typeof rawStock !== 'number' || !Number.isFinite(rawStock) || rawStock < 0)
+      ) {
+        return 'Add-on stock quantity is invalid in the inventory snapshot';
+      }
+      if (typeof rawStock === 'number' && rawStock > 0) {
+        return 'Backup is missing inventory movement history for add-on stock';
+      }
+    }
+  }
+
+  if (hasStockedProduct) {
+    const userColumns = new Set(getColumns(dbInstance, 'users'));
+    if (!userColumns.has('id') || !userColumns.has('role') || !userColumns.has('created_at')) {
+      return 'Backup users table is missing required columns for inventory migration';
+    }
+    const actor = dbInstance
+      .prepare(
+        `SELECT id FROM users ORDER BY CASE WHEN role = 'owner' THEN 0 ELSE 1 END, created_at, id LIMIT 1`,
+      )
+      .get() as { id: unknown } | undefined;
+    if (!actor || typeof actor.id !== 'string' || actor.id.length === 0) {
+      return 'Backup requires at least one staff user to migrate product stock';
+    }
+  }
+
+  return null;
+}
+
+function inspectOpenBackupDatabaseForDowngrade(
+  candidateDb: Database.Database,
+  maxSupportedSchemaVersion: number,
+): DowngradeBackupSnapshotInspection {
+  candidateDb.pragma('temp_store = MEMORY');
+  const integrityRows = candidateDb.prepare('PRAGMA integrity_check').all() as {
+    integrity_check: string;
+  }[];
+  if (integrityRows.length === 0 || integrityRows.some((row) => row.integrity_check !== 'ok')) {
+    return {
+      status: 'corrupt_or_invalid',
+      schemaVersion: null,
+      appVersion: null,
+      detail: 'SQLite integrity check failed',
+    };
+  }
+
+  const pragmaVersion = Number(candidateDb.pragma('user_version', { simple: true }));
+  let hasMetaSchemaStamp = false;
+  let parsedMetaVersion: number | null = null;
+  let appVersion: string | null = null;
+  let backupCreatedAt: string | null = null;
+  const hasMetaTable = Boolean(
+    candidateDb
+      .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '_flo_meta'")
+      .get(),
+  );
+  if (hasMetaTable) {
+    const metaRows = candidateDb
+      .prepare(
+        "SELECT key, value FROM _flo_meta WHERE key IN ('schema_version', 'app_version', 'backup_created_at')",
+      )
+      .all() as { key: string; value: string | null }[];
+    const values = new Map(metaRows.map((row) => [row.key, row.value]));
+    hasMetaSchemaStamp = values.has('schema_version');
+    parsedMetaVersion = parseCanonicalSchemaVersion(values.get('schema_version'));
+    if (
+      hasMetaSchemaStamp &&
+      parsedMetaVersion !== null &&
+      parsedMetaVersion >= 1 &&
+      parsedMetaVersion === pragmaVersion
+    ) {
+      const rawAppVersion = values.get('app_version');
+      if (typeof rawAppVersion === 'string' && rawAppVersion.trim()) {
+        appVersion = rawAppVersion.trim();
+      }
+      const rawCreatedAt = values.get('backup_created_at');
+      if (typeof rawCreatedAt === 'string' && rawCreatedAt.trim()) {
+        backupCreatedAt = rawCreatedAt.trim();
+      }
+    }
+  }
+
+  if (hasMetaSchemaStamp && (parsedMetaVersion === null || parsedMetaVersion !== pragmaVersion)) {
+    return {
+      status: 'corrupt_or_invalid',
+      schemaVersion:
+        Number.isSafeInteger(pragmaVersion) && pragmaVersion > 0 ? pragmaVersion : null,
+      appVersion: null,
+      detail: 'Backup schema metadata does not match the SQLite header',
+    };
+  }
+
+  if (!Number.isSafeInteger(pragmaVersion) || pragmaVersion < 1) {
+    return {
+      status: 'corrupt_or_invalid',
+      schemaVersion: null,
+      appVersion: null,
+      detail: 'Backup does not contain an initialized Flo Cafe schema',
+    };
+  }
+
+  if (pragmaVersion > maxSupportedSchemaVersion) {
+    return {
+      status: 'incompatible_newer',
+      schemaVersion: pragmaVersion,
+      appVersion,
+      detail: `Requires schema v${pragmaVersion} (this version supports up to v${maxSupportedSchemaVersion})`,
+    };
+  }
+
+  const tables = new Set(getTables(candidateDb));
+  const missingCoreTables = CORE_FLO_BACKUP_TABLES.filter((table) => !tables.has(table));
+  if (missingCoreTables.length > 0) {
+    return {
+      status: 'corrupt_or_invalid',
+      schemaVersion: pragmaVersion,
+      appVersion,
+      detail: `Backup is missing required Flo Cafe table(s): ${missingCoreTables.join(', ')}`,
+    };
+  }
+
+  if (pragmaVersion === maxSupportedSchemaVersion) {
+    const schemaError = validateDatabaseSchemaTableColumns(
+      candidateDb,
+      maxSupportedSchemaVersion,
+      'Backup',
+    );
+    if (schemaError) {
+      return {
+        status: 'corrupt_or_invalid',
+        schemaVersion: pragmaVersion,
+        appVersion,
+        detail: schemaError,
+      };
+    }
+  }
+
+  const fkViolations = getForeignKeyViolationKeys(candidateDb);
+  if (fkViolations.size > 0) {
+    return {
+      status: 'corrupt_or_invalid',
+      schemaVersion: pragmaVersion,
+      appVersion,
+      detail: `Backup contains ${fkViolations.size} foreign-key violation(s)`,
+    };
+  }
+
+  const inventoryError =
+    pragmaVersion < 85 && !tables.has('inventory_movements')
+      ? validatePreLedgerBackupInventory(candidateDb, tables)
+      : validateInventoryLedgerDatabase(candidateDb);
+  if (inventoryError) {
+    return {
+      status: 'corrupt_or_invalid',
+      schemaVersion: pragmaVersion,
+      appVersion,
+      detail: inventoryError,
+    };
+  }
+
+  return {
+    status: 'compatible',
+    schemaVersion: pragmaVersion,
+    appVersion,
+    backupCreatedAt,
+  };
+}
+
+function inspectBackupSnapshotForDowngrade(
+  snapshotPath: string,
+  maxSupportedSchemaVersion: number,
+): DowngradeBackupSnapshotInspection {
+  let candidateDb: Database.Database | undefined;
+  try {
+    candidateDb = new Database(snapshotPath, { readonly: true, fileMustExist: true });
+    return inspectOpenBackupDatabaseForDowngrade(candidateDb, maxSupportedSchemaVersion);
+  } catch (error: unknown) {
+    if (isShutdownOrMaintenanceAbortError(error) || isSqliteStorageOrOpenError(error)) {
+      throw error;
+    }
+    return {
+      status: 'corrupt_or_invalid',
+      schemaVersion: null,
+      appVersion: null,
+      detail:
+        error instanceof Error && error.message
+          ? error.message
+          : 'File is not a readable SQLite database',
+    };
+  } finally {
+    try {
+      candidateDb?.close();
+    } catch {}
+  }
+}
+
+function inspectNewerHeaderBackupFastPath(
+  snapshotPath: string,
+  headerVersion: number,
+  maxSupportedSchemaVersion: number,
+): DowngradeBackupSnapshotInspection {
+  let candidateDb: Database.Database | undefined;
+  try {
+    candidateDb = new Database(snapshotPath, { readonly: true, fileMustExist: true });
+    candidateDb.pragma('temp_store = MEMORY');
+    let hasMetaSchemaStamp = false;
+    let parsedMetaVersion: number | null = null;
+    let appVersion: string | null = null;
+    const hasMetaTable = Boolean(
+      candidateDb
+        .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '_flo_meta'")
+        .get(),
+    );
+    if (hasMetaTable) {
+      const metaRows = candidateDb
+        .prepare("SELECT key, value FROM _flo_meta WHERE key IN ('schema_version', 'app_version')")
+        .all() as { key: string; value: string | null }[];
+      const values = new Map(metaRows.map((row) => [row.key, row.value]));
+      hasMetaSchemaStamp = values.has('schema_version');
+      parsedMetaVersion = parseCanonicalSchemaVersion(values.get('schema_version'));
+      if (hasMetaSchemaStamp && parsedMetaVersion === headerVersion) {
+        const rawAppVersion = values.get('app_version');
+        if (typeof rawAppVersion === 'string' && rawAppVersion.trim()) {
+          appVersion = rawAppVersion.trim();
+        }
+      }
+    }
+    if (hasMetaSchemaStamp && (parsedMetaVersion === null || parsedMetaVersion !== headerVersion)) {
+      return {
+        status: 'corrupt_or_invalid',
+        schemaVersion: headerVersion,
+        appVersion: null,
+        detail: 'Backup schema metadata does not match the SQLite header',
+      };
+    }
+    return {
+      status: 'incompatible_newer',
+      schemaVersion: headerVersion,
+      appVersion,
+      detail: `Requires schema v${headerVersion} (this version supports up to v${maxSupportedSchemaVersion})`,
+    };
+  } catch (error: unknown) {
+    if (isShutdownOrMaintenanceAbortError(error)) {
+      throw error;
+    }
+    if (isSqliteStorageOrOpenError(error)) {
+      return {
+        status: 'incompatible_newer',
+        schemaVersion: headerVersion,
+        appVersion: null,
+        detail: `Requires schema v${headerVersion} (this version supports up to v${maxSupportedSchemaVersion})`,
+      };
+    }
+    return {
+      status: 'corrupt_or_invalid',
+      schemaVersion: null,
+      appVersion: null,
+      detail:
+        error instanceof Error && error.message
+          ? error.message
+          : 'File is not a readable SQLite database',
+    };
+  } finally {
+    try {
+      candidateDb?.close();
+    } catch {}
+  }
+}
+
+function listDowngradeBackupCandidateEntries(
+  backupDir: string,
+  liveDbPath: string,
+): { fileName: string; fullPath: string }[] {
+  let entries: string[];
+  try {
+    entries = fs.readdirSync(backupDir);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException | null)?.code;
+    if (code === 'ENOENT' || code === 'ENOTDIR') return [];
+    throw error;
+  }
+  const candidates: { fileName: string; fullPath: string }[] = [];
+  for (const fileName of entries.sort()) {
+    if (
+      fileName.startsWith(INTERNAL_DB_STAGE_DIR_PREFIX) ||
+      !fileName.endsWith('.db') ||
+      INTERNAL_BACKUP_ARTIFACT_PATTERN.test(fileName)
+    ) {
+      continue;
+    }
+    const fullPath = resolveContainedPath(backupDir, fileName);
+    if (!fullPath) continue;
+    if (
+      [liveDbPath, `${liveDbPath}-wal`, `${liveDbPath}-shm`, `${liveDbPath}-journal`].some(
+        (target) => isLiveDatabaseTarget(fullPath, target),
+      )
+    ) {
+      continue;
+    }
+    candidates.push({ fileName, fullPath });
+  }
+  return candidates;
+}
+
+function evaluateDowngradeBackupCandidate(
+  fileName: string,
+  fullPath: string,
+  maxSupportedSchemaVersion: number,
+  compatible: CompatibleDowngradeBackup[],
+  incompatibleNewer: RejectedDowngradeBackup[],
+  corruptOrInvalid: RejectedDowngradeBackup[],
+): void {
+  let lstat: fs.BigIntStats;
+  try {
+    lstat = fs.lstatSync(fullPath, { bigint: true });
+  } catch (statError) {
+    const code = (statError as NodeJS.ErrnoException | null)?.code;
+    if (code === 'ENOENT' || code === 'ENOTDIR') {
+      return;
+    }
+    throw statError;
+  }
+  if (lstat.isSymbolicLink() || !lstat.isFile()) {
+    corruptOrInvalid.push({
+      fileName,
+      path: fullPath,
+      reason: 'corrupt_or_invalid',
+      schemaVersion: null,
+      appVersion: null,
+      detail: 'Backup candidate must be a regular file',
+    });
+    return;
+  }
+
+  if (
+    pathEntryExists(`${fullPath}-wal`) ||
+    pathEntryExists(`${fullPath}-shm`) ||
+    pathEntryExists(`${fullPath}-journal`)
+  ) {
+    corruptOrInvalid.push({
+      fileName,
+      path: fullPath,
+      reason: 'corrupt_or_invalid',
+      schemaVersion: null,
+      appVersion: null,
+      detail: 'Restore source must not have SQLite sidecars',
+    });
+    return;
+  }
+
+  let headerInfo: SqliteHeaderInfo | null;
+  try {
+    headerInfo = readSqliteHeaderInfo(fullPath, true);
+  } catch (readError: unknown) {
+    if (isShutdownOrMaintenanceAbortError(readError) || isSqliteStorageOrOpenError(readError)) {
+      throw readError;
+    }
+    corruptOrInvalid.push({
+      fileName,
+      path: fullPath,
+      reason: 'corrupt_or_invalid',
+      schemaVersion: null,
+      appVersion: null,
+      detail:
+        readError instanceof Error && readError.message
+          ? readError.message
+          : 'Backup candidate could not be read safely',
+    });
+    return;
+  }
+  if (!headerInfo) {
+    corruptOrInvalid.push({
+      fileName,
+      path: fullPath,
+      reason: 'corrupt_or_invalid',
+      schemaVersion: null,
+      appVersion: null,
+      detail: 'File is not a readable SQLite database',
+    });
+    return;
+  }
+
+  try {
+    let inspection: DowngradeBackupSnapshotInspection;
+    if (headerInfo.headerVersion > maxSupportedSchemaVersion) {
+      inspection = headerInfo.isLegacyRollbackFormat
+        ? inspectNewerHeaderBackupFastPath(
+            fullPath,
+            headerInfo.headerVersion,
+            maxSupportedSchemaVersion,
+          )
+        : {
+            status: 'incompatible_newer',
+            schemaVersion: headerInfo.headerVersion,
+            appVersion: null,
+            detail: `Requires schema v${headerInfo.headerVersion} (this version supports up to v${maxSupportedSchemaVersion})`,
+          };
+    } else if (headerInfo.isLegacyRollbackFormat) {
+      inspection = inspectBackupSnapshotForDowngrade(fullPath, maxSupportedSchemaVersion);
+    } else {
+      const probed = probeStagedDatabaseWithFallback(
+        fullPath,
+        [],
+        {
+          tmpPrefix: 'flo-backup-discover-',
+          fallbackSubprefix: 'discover-',
+          targetFileName: 'candidate.db',
+          purposeLabel: 'backup candidate for discovery',
+        },
+        (probeDb) => inspectOpenBackupDatabaseForDowngrade(probeDb, maxSupportedSchemaVersion),
+      );
+      inspection =
+        probed.kind === 'ok'
+          ? probed.value
+          : {
+              status: 'corrupt_or_invalid',
+              schemaVersion: null,
+              appVersion: null,
+              detail:
+                probed.error instanceof Error && probed.error.message
+                  ? probed.error.message
+                  : 'File is not a readable SQLite database',
+            };
+    }
+
+    let afterStat: fs.BigIntStats;
+    try {
+      afterStat = fs.lstatSync(fullPath, { bigint: true });
+    } catch (afterStatError) {
+      const code = (afterStatError as NodeJS.ErrnoException | null)?.code;
+      if (code === 'ENOENT' || code === 'ENOTDIR') {
+        corruptOrInvalid.push({
+          fileName,
+          path: fullPath,
+          reason: 'corrupt_or_invalid',
+          schemaVersion: null,
+          appVersion: null,
+          detail: 'Restore source was removed while it was being read',
+        });
+        return;
+      }
+      throw afterStatError;
+    }
+    if (
+      afterStat.isSymbolicLink() ||
+      !afterStat.isFile() ||
+      afterStat.dev !== lstat.dev ||
+      afterStat.ino !== lstat.ino ||
+      afterStat.size !== lstat.size ||
+      afterStat.mtimeMs !== lstat.mtimeMs ||
+      pathEntryExists(`${fullPath}-wal`) ||
+      pathEntryExists(`${fullPath}-shm`) ||
+      pathEntryExists(`${fullPath}-journal`)
+    ) {
+      corruptOrInvalid.push({
+        fileName,
+        path: fullPath,
+        reason: 'corrupt_or_invalid',
+        schemaVersion: null,
+        appVersion: null,
+        detail: 'Restore source changed while it was being read',
+      });
+      return;
+    }
+
+    if (inspection.status === 'compatible') {
+      compatible.push({
+        fileName,
+        path: fullPath,
+        sizeBytes: Number(lstat.size),
+        createdAt: lstat.mtime.toISOString(),
+        backupCreatedAt: inspection.backupCreatedAt,
+        appVersion: inspection.appVersion,
+        schemaVersion: inspection.schemaVersion,
+        kind: classifyDowngradeBackupKind(fileName),
+      });
+    } else if (inspection.status === 'incompatible_newer') {
+      incompatibleNewer.push({
+        fileName,
+        path: fullPath,
+        reason: 'incompatible_newer',
+        schemaVersion: inspection.schemaVersion,
+        appVersion: inspection.appVersion,
+        detail: inspection.detail,
+      });
+    } else {
+      corruptOrInvalid.push({
+        fileName,
+        path: fullPath,
+        reason: 'corrupt_or_invalid',
+        schemaVersion: inspection.schemaVersion,
+        appVersion: inspection.appVersion,
+        detail: inspection.detail,
+      });
+    }
+  } catch (error: unknown) {
+    if (isShutdownOrMaintenanceAbortError(error) || isSqliteStorageOrOpenError(error)) {
+      throw error;
+    }
+    corruptOrInvalid.push({
+      fileName,
+      path: fullPath,
+      reason: 'corrupt_or_invalid',
+      schemaVersion: null,
+      appVersion: null,
+      detail:
+        error instanceof Error && error.message
+          ? error.message
+          : 'Backup candidate could not be read safely',
+    });
+  }
+}
+
+function sortCompatibleDowngradeBackups(compatible: CompatibleDowngradeBackup[]): void {
+  const effectiveTimeMs = (item: CompatibleDowngradeBackup): number => {
+    if (item.backupCreatedAt) {
+      const parsed = Date.parse(item.backupCreatedAt);
+      if (!Number.isNaN(parsed)) return parsed;
+    }
+    const created = Date.parse(item.createdAt);
+    return Number.isNaN(created) ? 0 : created;
+  };
+
+  compatible.sort((left, right) => {
+    const timeDiff = effectiveTimeMs(right) - effectiveTimeMs(left);
+    if (timeDiff !== 0) return timeDiff;
+    if (left.kind !== right.kind) {
+      if (left.kind === 'pre-upgrade') return -1;
+      if (right.kind === 'pre-upgrade') return 1;
+    }
+    return right.fileName.localeCompare(left.fileName);
+  });
+}
+
+export async function discoverDowngradeBackupsAsync(options?: {
+  signal?: AbortSignal;
+}): Promise<DowngradeBackupDiscovery> {
+  const signal = getMaintenanceSignal(options?.signal);
+  throwIfDatabaseMaintenanceAborted(signal);
+  const backupDir = getBackupDir();
+  const maxSupportedSchemaVersion = getLatestSupportedSchemaVersion();
+  const compatible: CompatibleDowngradeBackup[] = [];
+  const incompatibleNewer: RejectedDowngradeBackup[] = [];
+  const corruptOrInvalid: RejectedDowngradeBackup[] = [];
+  const liveDbPath = getDbPath();
+
+  const candidates = listDowngradeBackupCandidateEntries(backupDir, liveDbPath);
+  for (const { fileName, fullPath } of candidates) {
+    throwIfDatabaseMaintenanceAborted(signal);
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    throwIfDatabaseMaintenanceAborted(signal);
+    evaluateDowngradeBackupCandidate(
+      fileName,
+      fullPath,
+      maxSupportedSchemaVersion,
+      compatible,
+      incompatibleNewer,
+      corruptOrInvalid,
+    );
+  }
+  throwIfDatabaseMaintenanceAborted(signal);
+  sortCompatibleDowngradeBackups(compatible);
+
+  return {
+    backupDir,
+    maxSupportedSchemaVersion,
+    compatible,
+    incompatibleNewer,
+    corruptOrInvalid,
+  };
+}
+
+export function planNewerDatabaseArchivePath(newerDbVersion: number): string {
+  const backupDir = getBackupDir();
+  const safeVersion =
+    Number.isFinite(newerDbVersion) && newerDbVersion > 0 ? Math.trunc(newerDbVersion) : 0;
+  const sanitizedTimestamp = new Date().toISOString().replace(/[^0-9A-Za-z._-]/g, '-');
+  const basePrefix = `flo-preserved-newer-v${safeVersion}-${sanitizedTimestamp}`;
+  let suffixIndex = 1;
+  while (true) {
+    const candidateName =
+      suffixIndex === 1 ? `${basePrefix}.db` : `${basePrefix}-${suffixIndex}.db`;
+    const candidatePath = path.join(backupDir, candidateName);
+    if (
+      !pathEntryExists(candidatePath) &&
+      !pathEntryExists(`${candidatePath}-wal`) &&
+      !pathEntryExists(`${candidatePath}-shm`) &&
+      !pathEntryExists(`${candidatePath}-journal`)
+    ) {
+      return candidatePath;
+    }
+    suffixIndex += 1;
+  }
+}
+
+export function restoreCompatibleBackupForDowngrade(
+  backupPath: string,
+  options?: DowngradeRestoreOptions,
+): Promise<DowngradeRestoreResult> {
+  return withDatabaseMaintenanceLock(async (maintenanceSignal) => {
+    throwIfDatabaseMaintenanceAborted(maintenanceSignal);
+    closeDatabase();
+
+    const dbPath = getDbPath();
+    const backupDir = getBackupDir();
+    const maxSupported = getLatestSupportedSchemaVersion();
+    const activeRollbackJournalPath = `${dbPath}-journal`;
+    const throwIfActiveRollbackJournalPresent = () => {
+      if (pathEntryExists(activeRollbackJournalPath)) {
+        throw new Error(
+          `Active SQLite rollback journal detected (${activeRollbackJournalPath}). ` +
+            `Refusing backup restore so uncommitted newer-database recovery state is not lost or replayed. ` +
+            `Update Flo Cafe to the latest compatible version to recover the database cleanly before restoring.`,
+        );
+      }
+    };
+    throwIfActiveRollbackJournalPresent();
+
+    let stagedSource: { snapshotPath: string; cleanup: () => void } | undefined;
+    try {
+      stagedSource = materializeRestoreSource(backupPath, dbPath);
+      const inspection = inspectBackupSnapshotForDowngrade(stagedSource.snapshotPath, maxSupported);
+      if (inspection.status === 'incompatible_newer') {
+        throw new Error(
+          `Selected backup cannot be restored: ${inspection.detail}. Update Flo Cafe or choose an older compatible backup.`,
+        );
+      }
+      if (inspection.status !== 'compatible') {
+        throw new Error(`Selected backup failed validation: ${inspection.detail}.`);
+      }
+
+      if (!pathEntryExists(dbPath)) {
+        throw new Error(`Active database was not found at ${dbPath}.`);
+      }
+      const liveStat = fs.lstatSync(dbPath);
+      if (liveStat.isSymbolicLink() || !liveStat.isFile()) {
+        throw new Error('Active database path is not a regular file.');
+      }
+      throwIfActiveRollbackJournalPresent();
+
+      const presentSidecars: ReplacementJournalSidecar[] = [];
+      for (const suffix of ['-wal', '-shm'] as const) {
+        const sidecarPath = `${dbPath}${suffix}`;
+        if (!pathEntryExists(sidecarPath)) continue;
+        const sidecarStat = fs.lstatSync(sidecarPath);
+        if (sidecarStat.isSymbolicLink() || !sidecarStat.isFile()) {
+          throw new Error(`Active database sidecar ${sidecarPath} is not a regular file.`);
+        }
+        presentSidecars.push(suffix);
+      }
+
+      let liveVersionInfo: { schemaVersion: number; appVersion: string | null } | null = null;
+      try {
+        liveVersionInfo = inspectDatabaseVersionNonMutating(dbPath);
+      } catch (preflightError) {
+        if (options?.newerDbVersion === undefined) throw preflightError;
+      }
+      const newerVersion = liveVersionInfo?.schemaVersion ?? options?.newerDbVersion ?? 0;
+
+      if (!fs.existsSync(backupDir)) {
+        fs.mkdirSync(backupDir, { recursive: true });
+      }
+
+      let preservedDbPath: string;
+      if (options?.archivePath) {
+        const requestedName = path.basename(options.archivePath);
+        const contained = resolveContainedPath(backupDir, requestedName);
+        if (
+          !contained ||
+          path.resolve(options.archivePath) !== path.resolve(contained) ||
+          !/^flo-preserved-newer-v\d+-[\w.-]+\.db$/.test(requestedName)
+        ) {
+          throw new Error('Preserved newer-database archive path must reside in backups.');
+        }
+        preservedDbPath =
+          !pathEntryExists(contained) &&
+          !pathEntryExists(`${contained}-wal`) &&
+          !pathEntryExists(`${contained}-shm`) &&
+          !pathEntryExists(`${contained}-journal`)
+            ? contained
+            : planNewerDatabaseArchivePath(newerVersion);
+      } else {
+        preservedDbPath = planNewerDatabaseArchivePath(newerVersion);
+      }
+
+      const preservedSidecarPaths = presentSidecars.map((suffix) => `${preservedDbPath}${suffix}`);
+      let archiveComplete = false;
+      try {
+        throwIfDatabaseMaintenanceAborted(maintenanceSignal);
+        fs.copyFileSync(dbPath, preservedDbPath, fs.constants.COPYFILE_EXCL);
+        syncFile(preservedDbPath);
+        if (fs.statSync(preservedDbPath).size !== liveStat.size) {
+          throw new Error('Preserved newer-database archive size did not match active database');
+        }
+        for (const suffix of presentSidecars) {
+          const sourceSidecar = `${dbPath}${suffix}`;
+          const targetSidecar = `${preservedDbPath}${suffix}`;
+          const expectedSize = fs.statSync(sourceSidecar).size;
+          fs.copyFileSync(sourceSidecar, targetSidecar, fs.constants.COPYFILE_EXCL);
+          syncFile(targetSidecar);
+          if (fs.statSync(targetSidecar).size !== expectedSize) {
+            throw new Error(`Preserved sidecar ${targetSidecar} size did not match source`);
+          }
+        }
+        if (!syncDirectory(backupDir) && process.platform !== 'win32') {
+          throw new Error('Could not durably persist preserved newer-database archive');
+        }
+        archiveComplete = true;
+      } finally {
+        if (!archiveComplete) {
+          for (const partialPath of [preservedDbPath, ...preservedSidecarPaths]) {
+            try {
+              if (pathEntryExists(partialPath)) fs.unlinkSync(partialPath);
+            } catch {}
+          }
+        }
+      }
+
+      const journalPath = replacementJournalPath('restore');
+      const recoveryPath = journalPath.replace(/\.json$/, '.db');
+      let journalPrepared = false;
+      try {
+        fs.copyFileSync(preservedDbPath, recoveryPath);
+        syncFile(recoveryPath);
+        for (const suffix of presentSidecars) {
+          fs.copyFileSync(`${preservedDbPath}${suffix}`, `${recoveryPath}${suffix}`);
+          syncFile(`${recoveryPath}${suffix}`);
+        }
+        writeReplacementJournal(journalPath, {
+          phase: 'prepared',
+          recoveryPath,
+          dbPath,
+          driveInvalidationRequired: true,
+          downgradeRecovery: true,
+          recoverySidecars: [...presentSidecars],
+        });
+        journalPrepared = true;
+      } catch (prepError) {
+        removeReplacementArtifactsDurably(journalPath, recoveryPath);
+        throw prepError;
+      }
+
+      try {
+        throwIfDatabaseMaintenanceAborted(maintenanceSignal);
+        const removeFailures = removeDatabaseFiles(dbPath);
+        if (removeFailures.length > 0) {
+          throw new Error(
+            `Could not clear active database files for replacement: ${removeFailures.join(', ')}`,
+          );
+        }
+
+        throwIfDatabaseMaintenanceAborted(maintenanceSignal);
+        fs.copyFileSync(stagedSource.snapshotPath, dbPath);
+        syncFile(dbPath);
+
+        initializeDatabase(false, true, true);
+        const freshDb = getDatabase();
+        repairBackupSchemaDrift(freshDb);
+        const restoredSchemaVersion = getCurrentSchemaVersion();
+
+        const hasMetaTable = Boolean(
+          freshDb
+            .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '_flo_meta'")
+            .get(),
+        );
+        if (hasMetaTable) {
+          freshDb
+            .prepare("INSERT OR REPLACE INTO _flo_meta (key, value) VALUES ('schema_version', ?)")
+            .run(String(restoredSchemaVersion));
+          freshDb
+            .prepare("INSERT OR REPLACE INTO _flo_meta (key, value) VALUES ('app_version', ?)")
+            .run(app.getVersion());
+          freshDb.prepare("DELETE FROM _flo_meta WHERE key = 'backup_created_at'").run();
+        }
+
+        const existingTables = new Set(getTables(freshDb));
+        if (existingTables.has('kds_pairing_tokens')) {
+          freshDb.prepare('DELETE FROM kds_pairing_tokens').run();
+        }
+        if (existingTables.has('customer_display_tokens')) {
+          freshDb.prepare('DELETE FROM customer_display_tokens').run();
+        }
+        clearGoogleDriveRestoreBinding(freshDb);
+        const rotatedJwtSecret = crypto.randomBytes(32).toString('hex');
+        const credentialTimestamp = now();
+        freshDb
+          .prepare(`
+            INSERT INTO settings (key, value, updated_at) VALUES ('jwt_secret', ?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+          `)
+          .run(rotatedJwtSecret, credentialTimestamp);
+        freshDb
+          .prepare('DELETE FROM settings WHERE key = ?')
+          .run(AUTH_CLOCK_HIGH_WATER_SETTING_KEY);
+        freshDb
+          .prepare('UPDATE users SET tokens_valid_after = ?, updated_at = ?')
+          .run(nextTokensValidAfterTimestamp(), credentialTimestamp);
+        freshDb
+          .prepare("DELETE FROM settings WHERE key LIKE 'mobile\\_pairing\\_code%' ESCAPE '\\'")
+          .run();
+        executeSequenceRepair(freshDb);
+        freshDb
+          .prepare(`
+            INSERT INTO settings (key, value, updated_at) VALUES ('sequence_repair_completed_at', ?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+          `)
+          .run(now(), now());
+        freshDb
+          .prepare(`
+            INSERT INTO settings (key, value, updated_at) VALUES ('sequence_repair_pending', '0', ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+          `)
+          .run(now());
+
+        const integrity = freshDb.prepare('PRAGMA integrity_check').all() as {
+          integrity_check: string;
+        }[];
+        const fkViolations = getForeignKeyViolationKeys(freshDb);
+        const schemaError =
+          restoredSchemaVersion < 1 || restoredSchemaVersion > maxSupported
+            ? `Restored database schema v${restoredSchemaVersion} is outside supported range`
+            : validateDatabaseSchemaTableColumns(
+                freshDb,
+                restoredSchemaVersion,
+                'Restored database',
+              );
+        const inventoryError =
+          schemaError === null ? validateInventoryLedgerDatabase(freshDb) : null;
+        if (
+          integrity.length === 0 ||
+          integrity.some((row) => row.integrity_check !== 'ok') ||
+          fkViolations.size > 0 ||
+          schemaError !== null ||
+          inventoryError !== null
+        ) {
+          throw new Error(
+            schemaError ||
+              inventoryError ||
+              'Restored database failed post-restore integrity validation',
+          );
+        }
+
+        throwIfDatabaseMaintenanceAborted(maintenanceSignal);
+        freshDb.pragma('wal_checkpoint(TRUNCATE)');
+        syncFile(dbPath);
+        if (!syncDirectory(path.dirname(dbPath)) && process.platform !== 'win32') {
+          throw new Error('Could not durably commit restored compatible database');
+        }
+
+        writeReplacementJournal(journalPath, {
+          phase: 'committed',
+          recoveryPath,
+          dbPath,
+          driveInvalidationRequired: true,
+          downgradeRecovery: true,
+          recoverySidecars: [...presentSidecars],
+        });
+        clearUserAuthCache();
+        clearInMemoryRevokedTokens();
+        clearJWTSecretCache();
+        closeDatabase();
+
+        return {
+          restoredBackupPath: path.resolve(backupPath),
+          backupSchemaVersion: inspection.schemaVersion,
+          restoredSchemaVersion,
+          preservedDbPath,
+          preservedSidecarPaths,
+        };
+      } catch (replaceError: unknown) {
+        const replaceMessage =
+          replaceError instanceof Error && replaceError.message
+            ? replaceError.message
+            : 'unknown error';
+        if (readReplacementJournal(journalPath)?.phase === 'committed') {
+          clearUserAuthCache();
+          clearInMemoryRevokedTokens();
+          clearJWTSecretCache();
+          closeDatabase();
+          return {
+            restoredBackupPath: path.resolve(backupPath),
+            backupSchemaVersion: inspection.schemaVersion,
+            restoredSchemaVersion: maxSupported,
+            preservedDbPath,
+            preservedSidecarPaths,
+          };
+        }
+        if (!journalPrepared) {
+          closeDatabase();
+          throw replaceError;
+        }
+        try {
+          closeDatabase();
+          const rollbackRemoveFailures = removeDatabaseFiles(dbPath);
+          if (rollbackRemoveFailures.length > 0) {
+            throw new Error(
+              `Could not remove partial database files during rollback: ${rollbackRemoveFailures.join(', ')}`,
+            );
+          }
+          restoreDatabaseWithSidecars(recoveryPath, dbPath, presentSidecars);
+          if (!syncDirectory(path.dirname(dbPath)) && process.platform !== 'win32') {
+            throw new Error('Could not durably restore original database during rollback');
+          }
+          removeReplacementArtifactsDurably(journalPath, recoveryPath);
+        } catch (rollbackError: unknown) {
+          const rollbackMessage =
+            rollbackError instanceof Error && rollbackError.message
+              ? rollbackError.message
+              : 'unknown error';
+          throw new Error(
+            `Compatible backup restore failed (${replaceMessage}), ` +
+              `and automatic rollback encountered an error (${rollbackMessage}). ` +
+              `Recovery journal artifacts were retained for next startup and the newer database is preserved at ${preservedDbPath}.`,
+            { cause: rollbackError },
+          );
+        }
+        const wrappedReplaceError = new Error(
+          `Compatible backup restore failed: ${replaceMessage}. ` +
+            `Your newer database and its sidecar files were restored in place and preserved at ${preservedDbPath}.`,
+          { cause: replaceError },
+        ) as Error & { code?: string };
+        if ((replaceError as { code?: unknown } | null)?.code === 'ERR_SHUTDOWN_ABORTED') {
+          wrappedReplaceError.code = 'ERR_SHUTDOWN_ABORTED';
+        }
+        throw wrappedReplaceError;
+      }
+    } finally {
+      stagedSource?.cleanup();
+    }
+  }, options?.signal);
+}
+
+function normalizeSchemaSql(sql: string | null): string {
+  return (sql || '')
+    .replace(/--[^\n]*/g, ' ')
+    .replace(/\/\*[\s\S]*?\*\//g, ' ')
+    .replace(/"([A-Za-z_][A-Za-z0-9_]*)"/g, '$1')
+    .replace(/\s+/g, ' ')
+    .replace(/\s*([(),])\s*/g, '$1')
+    .trim();
+}
+
+function extractParenthesizedClauses(sql: string, keywordPattern: RegExp): string[] {
+  const clauses: string[] = [];
+  const matcher = new RegExp(keywordPattern.source, 'gi');
+  let match: RegExpExecArray | null;
+  while ((match = matcher.exec(sql)) !== null) {
+    let depth = 0;
+    let inQuote = false;
+    for (let i = match.index + match[0].length; i < sql.length; i++) {
+      const ch = sql[i];
+      if (ch === "'") inQuote = !inQuote;
+      if (inQuote) continue;
+      if (ch === '(') depth++;
+      else if (ch === ')' && --depth === 0) {
+        clauses.push(sql.slice(match.index, i + 1));
+        break;
+      }
+    }
+  }
+  return clauses.sort();
+}
+
+function splitCreateTableDefinitions(normalizedSql: string): string[] {
+  if (/^CREATE VIRTUAL TABLE\b/i.test(normalizedSql)) return [];
+  const openParen = normalizedSql.indexOf('(');
+  if (openParen === -1) return [];
+  const definitions: string[] = [];
+  let depth = 0;
+  let inQuote = false;
+  let start = openParen + 1;
+  for (let i = openParen; i < normalizedSql.length; i++) {
+    const ch = normalizedSql[i];
+    if (ch === "'") {
+      inQuote = !inQuote;
+      continue;
+    }
+    if (inQuote) continue;
+    if (ch === '(') {
+      depth++;
+    } else if (ch === ')') {
+      depth--;
+      if (depth === 0) {
+        const clause = normalizedSql.slice(start, i).trim();
+        if (clause) definitions.push(clause);
+        break;
+      }
+    } else if (ch === ',' && depth === 1) {
+      const clause = normalizedSql.slice(start, i).trim();
+      if (clause) definitions.push(clause);
+      start = i + 1;
+    }
+  }
+  return definitions;
+}
+
+function stripLiteralsAndParentheses(sql: string): string {
+  let result = '';
+  let depth = 0;
+  let inQuote = false;
+  for (let i = 0; i < sql.length; i++) {
+    const ch = sql[i];
+    if (ch === "'") {
+      inQuote = !inQuote;
+      if (depth === 0) result += ch;
+      continue;
+    }
+    if (inQuote) continue;
+    if (ch === '(') {
+      if (depth === 0) result += '(';
+      depth++;
+    } else if (ch === ')') {
+      depth = Math.max(0, depth - 1);
+      if (depth === 0) result += ')';
+    } else if (depth === 0) {
+      result += ch;
+    }
+  }
+  return result;
+}
+
+// Upgraded databases (ALTER ADD COLUMN, table rebuilds) and fresh installs yield identical
+// structure with different CREATE TABLE text and column order, so tables compare structurally.
+function describeTableStructure(dbInstance: Database.Database, tableName: string, sql: string) {
+  const columns = (
+    dbInstance.prepare(`PRAGMA table_xinfo(${tableName})`).all() as {
+      name: string;
+      type: string;
+      notnull: number;
+      dflt_value: string | null;
+      pk: number;
+      hidden: number;
+    }[]
+  )
+    .map(
+      (c) =>
+        `${c.name}|${String(c.type).toUpperCase()}|${c.notnull}|${c.dflt_value}|${c.pk}|${c.hidden}`,
+    )
+    .sort();
+  const foreignKeys = (
+    dbInstance.prepare(`PRAGMA foreign_key_list(${tableName})`).all() as {
+      from: string;
+      table: string;
+      to: string;
+      on_update: string;
+      on_delete: string;
+    }[]
+  )
+    .map((fk) => `${fk.from}->${fk.table}.${fk.to}:${fk.on_delete}:${fk.on_update}`)
+    .sort();
+  const normalizedSql = normalizeSchemaSql(sql);
+  const collations: string[] = [];
+  const uniqueConflictPolicies = new Map<string, string[]>();
+  const conflictPolicies: string[] = [];
+  const recordUniqueConflictPolicy = (key: string, policy: string) => {
+    const existing = uniqueConflictPolicies.get(key);
+    if (existing) existing.push(policy);
+    else uniqueConflictPolicies.set(key, [policy]);
+  };
+  for (const clause of splitCreateTableDefinitions(normalizedSql)) {
+    const unlabeled = clause.replace(/^CONSTRAINT\s+[A-Za-z_][A-Za-z0-9_]*\s+/i, '');
+    const isTableConstraint = /^(?:PRIMARY\s+KEY|UNIQUE|CHECK|FOREIGN\s+KEY)\b/i.test(unlabeled);
+    if (isTableConstraint) {
+      const topLevelConstraintSql = stripLiteralsAndParentheses(unlabeled);
+      const uniqueOrPkMatch = unlabeled.match(/^(PRIMARY\s+KEY|UNIQUE)\(([^)]*)\)/i);
+      if (uniqueOrPkMatch) {
+        const origin = /^PRIMARY/i.test(uniqueOrPkMatch[1]) ? 'pk' : 'u';
+        const cols = uniqueOrPkMatch[2]
+          .split(',')
+          .map((part) => {
+            const trimmed = part.trim();
+            const colName = trimmed.match(/^([A-Za-z_][A-Za-z0-9_]*)/)?.[1] ?? trimmed;
+            for (const match of trimmed.matchAll(/\bCOLLATE\s+([A-Za-z_][A-Za-z0-9_]*)/gi)) {
+              collations.push(`${origin}(${colName}):${match[1].toUpperCase()}`);
+            }
+            return colName;
+          })
+          .join(',');
+        const conflictMatch = topLevelConstraintSql.match(
+          /\bON\s+CONFLICT\s+(ROLLBACK|ABORT|FAIL|IGNORE|REPLACE)\b/i,
+        );
+        const policy = (conflictMatch?.[1] || 'ABORT').toUpperCase();
+        recordUniqueConflictPolicy(`${origin}:${cols}`, policy);
+        if (policy !== 'ABORT') conflictPolicies.push(`${origin}(${cols}):${policy}`);
+      } else if (/^CHECK\b/i.test(unlabeled)) {
+        const conflictMatch = topLevelConstraintSql.match(
+          /\bON\s+CONFLICT\s+(ROLLBACK|ABORT|FAIL|IGNORE|REPLACE)\b/i,
+        );
+        const policy = (conflictMatch?.[1] || 'ABORT').toUpperCase();
+        if (policy !== 'ABORT') conflictPolicies.push(`check:${unlabeled}:${policy}`);
+      }
+      continue;
+    }
+    const colName = clause.match(/^([A-Za-z_][A-Za-z0-9_]*)\b/)?.[1];
+    if (!colName) continue;
+    const topLevelColSql = stripLiteralsAndParentheses(clause);
+    for (const match of topLevelColSql.matchAll(/\bCOLLATE\s+([A-Za-z_][A-Za-z0-9_]*)/gi)) {
+      collations.push(`${colName}:${match[1].toUpperCase()}`);
+    }
+    const uniqueMatch = topLevelColSql.match(
+      /\bUNIQUE(?:\s+ON\s+CONFLICT\s+(ROLLBACK|ABORT|FAIL|IGNORE|REPLACE))?\b/i,
+    );
+    if (uniqueMatch) {
+      const policy = (uniqueMatch[1] || 'ABORT').toUpperCase();
+      recordUniqueConflictPolicy(`u:${colName}`, policy);
+      if (policy !== 'ABORT') conflictPolicies.push(`u(${colName}):${policy}`);
+    }
+    const pkMatch = topLevelColSql.match(
+      /\bPRIMARY\s+KEY(?:\s+(?:ASC|DESC))?(?:\s+ON\s+CONFLICT\s+(ROLLBACK|ABORT|FAIL|IGNORE|REPLACE))?\b/i,
+    );
+    if (pkMatch) {
+      const policy = (pkMatch[1] || 'ABORT').toUpperCase();
+      recordUniqueConflictPolicy(`pk:${colName}`, policy);
+      if (policy !== 'ABORT') conflictPolicies.push(`pk(${colName}):${policy}`);
+    }
+    const notNullMatch = topLevelColSql.match(
+      /\bNOT\s+NULL\s+ON\s+CONFLICT\s+(ROLLBACK|ABORT|FAIL|IGNORE|REPLACE)\b/i,
+    );
+    if (notNullMatch && notNullMatch[1].toUpperCase() !== 'ABORT') {
+      conflictPolicies.push(`notnull(${colName}):${notNullMatch[1].toUpperCase()}`);
+    }
+    const checkMatch = topLevelColSql.match(
+      /\bCHECK\(\)\s+ON\s+CONFLICT\s+(ROLLBACK|ABORT|FAIL|IGNORE|REPLACE)\b/i,
+    );
+    if (checkMatch && checkMatch[1].toUpperCase() !== 'ABORT') {
+      conflictPolicies.push(`check(${colName}):${checkMatch[1].toUpperCase()}`);
+    }
+  }
+  // Implicit UNIQUE / PRIMARY KEY indexes carry the uniqueness rules ON CONFLICT relies on.
+  const uniqueConstraints = (
+    dbInstance.prepare(`PRAGMA index_list(${tableName})`).all() as {
+      name: string;
+      unique: number;
+      origin: string;
+    }[]
+  )
+    .filter((index) => index.origin === 'u' || index.origin === 'pk')
+    .filter((index) => isSafeIdentifier(index.name))
+    .map((index) => {
+      const columns = (
+        dbInstance.prepare(`PRAGMA index_info(${index.name})`).all() as { name: string }[]
+      ).map((column) => column.name);
+      const conflictPolicy = (
+        uniqueConflictPolicies.get(`${index.origin}:${columns.join(',')}`) ?? ['ABORT']
+      )
+        .slice()
+        .sort()
+        .join(',');
+      return `${index.origin}:${index.unique}:${columns.join(',')}:${conflictPolicy}`;
+    })
+    .sort();
+  return JSON.stringify({
+    uniqueConstraints,
+    conflictPolicies: conflictPolicies.sort(),
+    autoincrement: /\bAUTOINCREMENT\b/i.test(normalizedSql),
+    withoutRowid: /\bWITHOUT ROWID\b/i.test(normalizedSql),
+    collations: collations.sort(),
+    columns,
+    foreignKeys,
+    checks: extractParenthesizedClauses(normalizedSql, /\bCHECK\s*(?=\()/),
+    generated: extractParenthesizedClauses(normalizedSql, /\bAS\s*(?=\()/),
+    virtual: /^CREATE VIRTUAL TABLE/i.test(normalizedSql) ? normalizedSql : null,
+  });
+}
+
 function getSchemaDefinitions(dbInstance: Database.Database): Map<string, string> {
-  const rows = dbInstance.prepare(`
+  const rows = dbInstance
+    .prepare(`
     SELECT type, name, sql
     FROM sqlite_master
     WHERE type IN ('table', 'index', 'trigger', 'view')
       AND name NOT LIKE 'sqlite_%'
       AND name <> '_flo_meta'
-  `).all() as { type: string; name: string; sql: string | null }[];
-  return new Map(rows.map((row) => [
-    `${row.type}:${row.name}`,
-    (row.sql || '').replace(/\s+/g, ' ').trim(),
-  ]));
+  `)
+    .all() as { type: string; name: string; sql: string | null }[];
+  return new Map(
+    rows.map((row) => [
+      `${row.type}:${row.name}`,
+      row.type === 'table' && isSafeIdentifier(row.name)
+        ? describeTableStructure(dbInstance, row.name, row.sql || '')
+        : normalizeSchemaSql(row.sql),
+    ]),
+  );
 }
 
-function getColumns(dbInstance: Database.Database, tableName: string): string[] {
+export function getColumns(dbInstance: Database.Database, tableName: string): string[] {
   try {
-    const columns = dbInstance.prepare(`PRAGMA table_info(${tableName})`).all() as { name: string }[];
-    return columns.map(col => col.name);
-  } catch {
+    const columns = dbInstance.prepare(`PRAGMA table_info(${tableName})`).all() as {
+      name: string;
+    }[];
+    return columns.map((col) => col.name);
+  } catch (error) {
+    if (isShutdownOrMaintenanceAbortError(error) || isSqliteStorageOrOpenError(error)) {
+      throw error;
+    }
     return [];
   }
 }
 
 export function getTables(dbInstance: Database.Database): string[] {
   try {
-    const tables = dbInstance.prepare(`
-      SELECT name FROM sqlite_master WHERE type='table' 
-      AND name NOT LIKE 'sqlite_%' AND name <> '_flo_meta'
-    `).all() as { name: string }[];
-    return tables.map(t => t.name);
-  } catch {
+    const tables = dbInstance
+      .prepare(`
+      SELECT name FROM sqlite_master WHERE type='table'
+      AND (sql NOT LIKE 'CREATE VIRTUAL TABLE%' OR sql IS NULL)
+      AND name NOT LIKE 'sqlite_%'
+      AND name NOT LIKE '%_fts_%'
+      AND name NOT LIKE '%_fts'
+      AND name <> '_flo_meta'
+    `)
+      .all() as { name: string }[];
+    return tables.map((t) => t.name);
+  } catch (error) {
+    if (isShutdownOrMaintenanceAbortError(error) || isSqliteStorageOrOpenError(error)) {
+      throw error;
+    }
     return [];
+  }
+}
+
+export function validateInventoryLedgerRows(
+  productRows: readonly Record<string, unknown>[],
+  movementRows: readonly Record<string, unknown>[],
+  variantRows: readonly Record<string, unknown>[] = [],
+  addonRows: readonly Record<string, unknown>[] = [],
+): string | null {
+  type Chain = {
+    id: number | null;
+    index: number;
+    movementType: string;
+    quantityDelta: number;
+    stockAfter: number;
+  };
+  // A variant owns its own stock pool but shares the product id, and an add-on
+  // pool has no product at all, so a chain is keyed by product AND variant AND
+  // add-on. Exactly one pool id is set per movement, which keeps an add-on chain
+  // from ever being compared against a product or variant snapshot row.
+  const chainKey = (productId: string, variantId: string | null, addonId: string | null) =>
+    `${productId}|${variantId ?? ''}|${addonId ?? ''}`;
+  const movementsByChain = new Map<string, Chain[]>();
+
+  for (const [index, row] of movementRows.entries()) {
+    const productId = row?.product_id == null ? '' : String(row.product_id);
+    const variantId = row?.variant_id == null ? null : String(row.variant_id);
+    const addonId = row?.addon_id == null ? null : String(row.addon_id);
+    const movementType = String(row?.movement_type ?? '');
+    const quantityDelta = Number(row?.quantity_delta);
+    const stockAfter = Number(row?.stock_after);
+    const namesOnePool = productId ? !addonId : Boolean(addonId);
+    if (
+      !namesOnePool ||
+      !Number.isFinite(quantityDelta) ||
+      quantityDelta === 0 ||
+      !Number.isFinite(stockAfter) ||
+      stockAfter < 0
+    ) {
+      return 'Inventory movement history contains an invalid stock state';
+    }
+    if (movementType === 'sale' && quantityDelta >= 0) {
+      return 'Sale movements must reduce product stock';
+    }
+    const rawId = Number(row?.id);
+    const id = Number.isFinite(rawId) ? rawId : null;
+    const key = chainKey(productId, variantId, addonId);
+    const movements = movementsByChain.get(key) ?? [];
+    movements.push({ id, index, movementType, quantityDelta, stockAfter });
+    movementsByChain.set(key, movements);
+  }
+
+  const allHavePositiveIntegerIds =
+    movementRows.length > 0 &&
+    movementRows.every((row) => {
+      const rawId = Number(row?.id);
+      return Number.isInteger(rawId) && rawId > 0;
+    });
+
+  const latestMovementByChain = new Map<string, Chain>();
+  for (const [key, movements] of movementsByChain) {
+    // Order by durable append sequence when all movements carry positive integer IDs, otherwise preserve input order.
+    movements.sort((left, right) =>
+      allHavePositiveIntegerIds && left.id !== null && right.id !== null && left.id !== right.id
+        ? left.id - right.id
+        : left.index - right.index,
+    );
+    const firstMovement = movements[0];
+    const firstTolerance =
+      Number.EPSILON *
+      Math.max(1, Math.abs(firstMovement.quantityDelta), Math.abs(firstMovement.stockAfter)) *
+      10;
+    if (Math.abs(firstMovement.quantityDelta - firstMovement.stockAfter) > firstTolerance) {
+      return 'Inventory movement history is missing an opening balance';
+    }
+    for (let index = 1; index < movements.length; index += 1) {
+      const previous = movements[index - 1];
+      const current = movements[index];
+      const expectedStockAfter = previous.stockAfter + current.quantityDelta;
+      const tolerance =
+        Number.EPSILON *
+        Math.max(1, Math.abs(expectedStockAfter), Math.abs(current.stockAfter)) *
+        10;
+      if (Math.abs(expectedStockAfter - current.stockAfter) > tolerance) {
+        return 'Inventory movement history contains a broken stock chain';
+      }
+    }
+    const latestMovement = movements[movements.length - 1];
+    latestMovementByChain.set(key, latestMovement);
+  }
+
+  const matchesLatestMovement = (
+    label: 'Product' | 'Variant' | 'Add-on',
+    productId: string,
+    variantId: string | null,
+    addonId: string | null,
+    stockQuantity: number,
+  ): string | null => {
+    const latestMovement = latestMovementByChain.get(chainKey(productId, variantId, addonId));
+    if (!latestMovement) {
+      return stockQuantity === 0
+        ? null
+        : `${label} stock has no matching inventory movement history`;
+    }
+    const tolerance =
+      Number.EPSILON *
+      Math.max(1, Math.abs(latestMovement.stockAfter), Math.abs(stockQuantity)) *
+      10;
+    return Math.abs(latestMovement.stockAfter - stockQuantity) <= tolerance
+      ? null
+      : `${label} stock does not match the latest inventory movement`;
+  };
+
+  for (const row of productRows) {
+    const productId = row?.id == null ? '' : String(row.id);
+    if (
+      !row ||
+      typeof row !== 'object' ||
+      !productId ||
+      !Object.prototype.hasOwnProperty.call(row, 'stock_quantity')
+    ) {
+      return 'Product stock quantity is missing from the inventory snapshot';
+    }
+    const stockQuantity = row.stock_quantity == null ? 0 : Number(row.stock_quantity);
+    if (!Number.isFinite(stockQuantity) || stockQuantity < 0) {
+      return 'Product stock quantity is invalid in the inventory snapshot';
+    }
+    const mismatch = matchesLatestMovement('Product', productId, null, null, stockQuantity);
+    if (mismatch) return mismatch;
+  }
+
+  for (const row of variantRows) {
+    const productId = row?.product_id == null ? '' : String(row.product_id);
+    const variantId = row?.id == null ? '' : String(row.id);
+    if (
+      !row ||
+      typeof row !== 'object' ||
+      !productId ||
+      !variantId ||
+      !Object.prototype.hasOwnProperty.call(row, 'stock_quantity')
+    ) {
+      return 'Variant stock quantity is missing from the inventory snapshot';
+    }
+    const stockQuantity = row.stock_quantity == null ? 0 : Number(row.stock_quantity);
+    if (!Number.isFinite(stockQuantity) || stockQuantity < 0) {
+      return 'Variant stock quantity is invalid in the inventory snapshot';
+    }
+    const mismatch = matchesLatestMovement('Variant', productId, variantId, null, stockQuantity);
+    if (mismatch) return mismatch;
+  }
+
+  for (const row of addonRows) {
+    const addonId = row?.id == null ? '' : String(row.id);
+    if (
+      !row ||
+      typeof row !== 'object' ||
+      !addonId ||
+      !Object.prototype.hasOwnProperty.call(row, 'stock_quantity')
+    ) {
+      return 'Add-on stock quantity is missing from the inventory snapshot';
+    }
+    const stockQuantity = row.stock_quantity == null ? 0 : Number(row.stock_quantity);
+    if (!Number.isFinite(stockQuantity) || stockQuantity < 0) {
+      return 'Add-on stock quantity is invalid in the inventory snapshot';
+    }
+    const mismatch = matchesLatestMovement('Add-on', '', null, addonId, stockQuantity);
+    if (mismatch) return mismatch;
+  }
+
+  return null;
+}
+
+export function validateInventoryLedgerDatabase(dbInstance: Database.Database): string | null {
+  const tables = new Set(getTables(dbInstance));
+  if (!tables.has('products')) return null;
+  if (!getColumns(dbInstance, 'products').includes('stock_quantity')) {
+    return 'Backup products table is missing stock_quantity';
+  }
+
+  const products = dbInstance.prepare('SELECT id, stock_quantity FROM products').all() as Record<
+    string,
+    unknown
+  >[];
+  const variants =
+    tables.has('product_variants') &&
+    getColumns(dbInstance, 'product_variants').includes('stock_quantity')
+      ? (dbInstance
+          .prepare('SELECT id, product_id, stock_quantity FROM product_variants')
+          .all() as Record<string, unknown>[])
+      : [];
+  const addons =
+    tables.has('addons') && getColumns(dbInstance, 'addons').includes('stock_quantity')
+      ? (dbInstance.prepare('SELECT id, stock_quantity FROM addons').all() as Record<
+          string,
+          unknown
+        >[])
+      : [];
+  if (!tables.has('inventory_movements')) {
+    if (variants.some((variant) => Number(variant.stock_quantity ?? 0) !== 0)) {
+      return 'Backup is missing inventory movement history for variant stock';
+    }
+    if (addons.some((addon) => Number(addon.stock_quantity ?? 0) !== 0)) {
+      return 'Backup is missing inventory movement history for add-on stock';
+    }
+    return products.some((product) => Number(product.stock_quantity ?? 0) !== 0)
+      ? 'Backup is missing inventory movement history for product stock'
+      : null;
+  }
+
+  const movements = getInventoryMovementRows(dbInstance);
+  return validateInventoryLedgerRows(products, movements, variants, addons);
+}
+
+export function getInventoryMovementRows(dbInstance: Database.Database): Record<string, unknown>[] {
+  const columns = new Set(getColumns(dbInstance, 'inventory_movements'));
+  const selectableColumns = [
+    'id',
+    'product_id',
+    'variant_id',
+    'addon_id',
+    'quantity_delta',
+    'movement_type',
+    'reference_type',
+    'reference_id',
+    'reason',
+    'actor_user_id',
+    'stock_after',
+    'created_at',
+    'imported_by_user_id',
+    'import_batch_id',
+    'source_actor_user_id',
+    'source_reference_type',
+    'source_reference_id',
+    'source_reason',
+    'source_created_at',
+  ].filter((column) => columns.has(column));
+  if (selectableColumns.length === 0) return [];
+  const orderBy = columns.has('id') ? ' ORDER BY id ASC' : '';
+  return dbInstance
+    .prepare(`SELECT ${selectableColumns.join(', ')} FROM inventory_movements${orderBy}`)
+    .all() as Record<string, unknown>[];
+}
+
+function inventoryMovementHistoryKey(row: Record<string, unknown>): string {
+  const nullableString = (value: unknown): string | null => (value == null ? null : String(value));
+  const numericValue = (value: unknown): number | string | null => {
+    if (value == null) return null;
+    const numeric = Number(value);
+    return Number.isFinite(numeric) ? numeric : String(value);
+  };
+  return JSON.stringify([
+    numericValue(row.id),
+    nullableString(row.product_id),
+    nullableString(row.variant_id),
+    nullableString(row.addon_id),
+    numericValue(row.quantity_delta),
+    nullableString(row.movement_type),
+    nullableString(row.reference_type),
+    nullableString(row.reference_id),
+    nullableString(row.reason),
+    nullableString(row.actor_user_id),
+    nullableString(row.imported_by_user_id),
+    nullableString(row.import_batch_id),
+    numericValue(row.stock_after),
+    nullableString(row.created_at),
+    nullableString(row.source_actor_user_id ?? row.actor_user_id),
+    nullableString(row.source_reference_type ?? row.reference_type),
+    nullableString(row.source_reference_id ?? row.reference_id),
+    nullableString(row.source_reason ?? row.reason),
+    nullableString(row.source_created_at ?? row.created_at),
+  ]);
+}
+
+export function validateInventoryLedgerReplacement(
+  currentProductRows: readonly Record<string, unknown>[],
+  currentMovementRows: readonly Record<string, unknown>[],
+  replacementProductRows: readonly Record<string, unknown>[],
+  replacementMovementRows: readonly Record<string, unknown>[],
+): string | null {
+  const replacementByProduct = new Map<string, Record<string, unknown>>();
+  for (const row of replacementProductRows) {
+    const productId = row?.id == null ? '' : String(row.id);
+    if (productId) replacementByProduct.set(productId, row);
+  }
+  const replacementMovementProductIds = new Set(
+    replacementMovementRows
+      .map((row) => (row?.product_id == null ? '' : String(row.product_id)))
+      .filter(Boolean),
+  );
+  const replacementHistoryCounts = new Map<string, number>();
+  for (const row of replacementMovementRows) {
+    const key = inventoryMovementHistoryKey(row);
+    replacementHistoryCounts.set(key, (replacementHistoryCounts.get(key) ?? 0) + 1);
+  }
+  for (const row of currentMovementRows) {
+    const key = inventoryMovementHistoryKey(row);
+    const count = replacementHistoryCounts.get(key) ?? 0;
+    if (count === 0) return 'Inventory movement history cannot be erased by a replacement';
+    replacementHistoryCounts.set(key, count - 1);
+  }
+
+  for (const row of currentProductRows) {
+    const productId = row?.id == null ? '' : String(row.id);
+    const replacement = replacementByProduct.get(productId);
+    if (!productId || !replacement) continue;
+
+    const currentStock = Number(row?.stock_quantity ?? 0);
+    const replacementStock = Number(replacement.stock_quantity ?? 0);
+    if (!Number.isFinite(currentStock) || !Number.isFinite(replacementStock)) continue;
+    const tolerance =
+      Number.EPSILON * Math.max(1, Math.abs(currentStock), Math.abs(replacementStock)) * 10;
+    if (
+      Math.abs(currentStock - replacementStock) > tolerance &&
+      !replacementMovementProductIds.has(productId)
+    ) {
+      return 'Product stock replacement is missing matching inventory movement history';
+    }
+  }
+
+  return null;
+}
+
+// Adds only what a same-version backup is missing (columns, indexes, triggers, tables).
+// Runs on the staged copy, never on the operator's file, and never removes or rewrites data.
+function repairStagedBackupSchema(stagedPath: string, currentVersion: number): void {
+  let stagedDb: Database.Database | undefined;
+  try {
+    stagedDb = new Database(stagedPath, { fileMustExist: true });
+    if (Number(stagedDb.pragma('user_version', { simple: true })) !== currentVersion) return;
+    const { applySafeFixes } =
+      require('./services/schema-health') as typeof import('./services/schema-health');
+    const result = applySafeFixes(undefined, stagedDb);
+    if (result.applied.length > 0) {
+      console.log(
+        `[DB] restoreBackup: repaired ${result.applied.length} schema difference(s) in the staged backup`,
+      );
+    }
+    for (const failure of result.errors) {
+      console.warn(`[DB] restoreBackup: could not repair ${failure.id}: ${failure.error}`);
+    }
+  } catch (error) {
+    console.warn('[DB] restoreBackup: staged backup schema repair skipped:', error);
+  } finally {
+    stagedDb?.close();
   }
 }
 
@@ -1290,34 +5414,42 @@ export interface RestoreResult {
   backupSchemaVersion: number;
   currentSchemaVersion: number;
   tablesRestored: number;
+  committed?: boolean;
+  cleanupPending?: boolean;
+  ambiguous?: boolean;
   error?: string;
 }
 
-function validateDirectBackup(backupPath: string, currentDb: Database.Database, currentVersion: number, baselineForeignKeyViolations: Set<string> = new Set()): string | null {
+function validateDirectBackup(backupPath: string, currentVersion: number): string | null {
   let backupDb: Database.Database | undefined;
   try {
     const sourceStat = fs.lstatSync(backupPath);
-    if (sourceStat.isSymbolicLink() || !sourceStat.isFile()) return 'Direct restore source must be a regular file';
-    if (pathEntryExists(`${backupPath}-wal`) || pathEntryExists(`${backupPath}-shm`)) return 'Direct restore source must not have SQLite sidecars';
+    if (sourceStat.isSymbolicLink() || !sourceStat.isFile())
+      return 'Direct restore source must be a regular file';
+    if (pathEntryExists(`${backupPath}-wal`) || pathEntryExists(`${backupPath}-shm`))
+      return 'Direct restore source must not have SQLite sidecars';
     backupDb = new Database(backupPath, { readonly: true, fileMustExist: true });
-    const metaRow = backupDb.prepare(`SELECT value FROM _flo_meta WHERE key = 'schema_version'`).get() as { value: string } | undefined;
-    const metadataVersion = metaRow ? parseCanonicalSchemaVersion(metaRow.value) ?? 0 : 0;
+    const metaRow = backupDb
+      .prepare(`SELECT value FROM _flo_meta WHERE key = 'schema_version'`)
+      .get() as { value: string } | undefined;
+    const metadataVersion = metaRow ? (parseCanonicalSchemaVersion(metaRow.value) ?? 0) : 0;
     const pragmaVersion = Number(backupDb.pragma('user_version', { simple: true }));
     if (metadataVersion !== currentVersion || pragmaVersion !== currentVersion) {
       return `Direct restore requires matching metadata/header schema v${currentVersion}`;
     }
 
-    const integrity = backupDb.prepare('PRAGMA integrity_check').all() as { integrity_check: string }[];
+    const integrity = backupDb.prepare('PRAGMA integrity_check').all() as {
+      integrity_check: string;
+    }[];
     if (integrity.some((row) => row.integrity_check !== 'ok')) {
       return `Backup integrity check failed: ${integrity.map((row) => row.integrity_check).join('; ')}`;
     }
-    const backupForeignKeyViolations = getForeignKeyViolationKeys(backupDb);
-    const newForeignKeyViolations = [...backupForeignKeyViolations].filter((key) => !baselineForeignKeyViolations.has(key));
-    if (newForeignKeyViolations.length > 0) {
-      return `Backup contains ${newForeignKeyViolations.length} new foreign-key violation(s)`;
-    }
-
-    const currentTables = getTables(currentDb);
+    // The backup replaces the live database, so it must match the schema this
+    // version defines, not whatever the live file happens to look like.
+    const schemaRef = getRecoverySchemaReference(currentVersion);
+    const expectedColumns = schemaRef.tableColumns;
+    const currentTables = [...expectedColumns.keys()];
+    const currentSchema = schemaRef.definitions;
     const backupTables = new Set(getTables(backupDb));
     const missingTables = currentTables.filter((tableName) => !backupTables.has(tableName));
     if (missingTables.length > 0) {
@@ -1326,15 +5458,22 @@ function validateDirectBackup(backupPath: string, currentDb: Database.Database, 
 
     for (const tableName of currentTables) {
       const backupColumns = new Set(getColumns(backupDb, tableName));
-      const missingColumns = getColumns(currentDb, tableName).filter((column) => !backupColumns.has(column));
+      const missingColumns = (expectedColumns.get(tableName) ?? []).filter(
+        (column) => !backupColumns.has(column),
+      );
       if (missingColumns.length > 0) {
         return `Backup table ${tableName} is missing required column(s): ${missingColumns.join(', ')}`;
       }
     }
 
-    const currentSchema = getSchemaDefinitions(currentDb);
+    const inventoryValidationError = validateInventoryLedgerDatabase(backupDb);
+    if (inventoryValidationError) return inventoryValidationError;
+
     const backupSchema = getSchemaDefinitions(backupDb);
     for (const [key, definition] of currentSchema) {
+      if (!backupSchema.has(key) && RUNTIME_ENSURED_SCHEMA_OBJECTS.has(key)) {
+        continue;
+      }
       if (backupSchema.get(key) !== definition) {
         return `Backup schema object ${key} is missing or differs from the current definition`;
       }
@@ -1352,7 +5491,6 @@ function validateDirectBackup(backupPath: string, currentDb: Database.Database, 
   }
 }
 
-type RevocationRow = { token_hash: string; expires_at: number; revoked_at: string };
 export type UserStationSecurityState = {
   user_id: string;
   station_id: string;
@@ -1365,9 +5503,13 @@ export type KitchenStationSecurityState = {
   category_ids: string | null;
 };
 
-export function captureKitchenStationSecurityState(dbInstance: Database.Database): KitchenStationSecurityState[] {
+export function captureKitchenStationSecurityState(
+  dbInstance: Database.Database,
+): KitchenStationSecurityState[] {
   try {
-    return dbInstance.prepare('SELECT id, is_active, category_ids FROM kitchen_stations').all() as KitchenStationSecurityState[];
+    return dbInstance
+      .prepare('SELECT id, is_active, category_ids FROM kitchen_stations')
+      .all() as KitchenStationSecurityState[];
   } catch {
     return [];
   }
@@ -1379,32 +5521,83 @@ export type RestoreOutboxState = {
   cloud: Record<string, unknown>[];
   support: Record<string, unknown>[];
   diagnostics: Record<string, unknown>[];
+  diagnosticsAggregates?: Record<string, unknown>[];
+  diagnosticsGaps?: Record<string, unknown>[];
+  /** Device-local failure log; present on restores that predate it. */
+  local?: Record<string, unknown>[];
 };
+const AUTH_CLOCK_HIGH_WATER_SETTING_KEY = 'auth_clock_high_water_ms';
+const MAX_AUTH_CLOCK_HIGH_WATER_MS = 8_639_999_999_999_000;
+const MAX_JS_DATE_NON_BOUNDARY_MS = 8_639_999_999_999_999;
+
+function parseValidAuthClockHighWaterMs(rawValue: string | null | undefined): number | null {
+  if (typeof rawValue !== 'string') return null;
+  const trimmed = rawValue.trim();
+  if (!/^\d+$/.test(trimmed)) return null;
+  const highWaterMs = Number.parseInt(trimmed, 10);
+  if (
+    !Number.isSafeInteger(highWaterMs) ||
+    highWaterMs <= 0 ||
+    highWaterMs > MAX_AUTH_CLOCK_HIGH_WATER_MS
+  ) {
+    return null;
+  }
+  return highWaterMs;
+}
+
 const RESTORE_PROTECTED_SETTING_KEYS = [
-  'jwt_secret', 'cloud_api_key', 'cloud_device_secret', 'cloud_pos_hash',
-  'telemetry_enabled', 'diagnostics_consent',
-  'mobile_pairing_code', 'mobile_pairing_code_expires_at',
+  'jwt_secret',
+  AUTH_CLOCK_HIGH_WATER_SETTING_KEY,
+  'email',
+  'cloud_api_key',
+  'cloud_device_secret',
+  'cloud_pos_hash',
+  'offline_mode',
+  'local_backup_enabled',
+  'telemetry_enabled',
+  'product_analytics_level',
+  'diagnostics_consent',
+  'diagnostics_transmission_enabled',
+  'diagnostics_settings_explicit',
+  'diagnostics_consent_sync_pending',
+  'diagnostics_consent_change_id',
+  'diagnostics_consent_revision',
+  'diagnostics_consent_remote_initialized',
+  'mobile_pairing_code',
+  'mobile_pairing_code_expires_at',
 ];
 
-export function captureRestoreProtectedSettings(dbInstance: Database.Database): RestoreProtectedSettingState[] {
-  const fixedRows = dbInstance.prepare(
-    `SELECT key, value FROM settings WHERE key IN (${RESTORE_PROTECTED_SETTING_KEYS.map(() => '?').join(',')})`,
-  ).all(...RESTORE_PROTECTED_SETTING_KEYS) as { key: string; value: string | null }[];
-  const cloudRows = dbInstance.prepare("SELECT key, value FROM settings WHERE key LIKE 'cloud_%'").all() as { key: string; value: string | null }[];
+export function captureRestoreProtectedSettings(
+  dbInstance: Database.Database,
+): RestoreProtectedSettingState[] {
+  const fixedRows = dbInstance
+    .prepare(
+      `SELECT key, value FROM settings WHERE key IN (${RESTORE_PROTECTED_SETTING_KEYS.map(() => '?').join(',')})`,
+    )
+    .all(...RESTORE_PROTECTED_SETTING_KEYS) as { key: string; value: string | null }[];
+  const cloudRows = dbInstance
+    .prepare("SELECT key, value FROM settings WHERE key LIKE 'cloud_%'")
+    .all() as { key: string; value: string | null }[];
   const byKey = new Map([...fixedRows, ...cloudRows].map((row) => [row.key, row.value]));
-  const keys = [...new Set([...RESTORE_PROTECTED_SETTING_KEYS, ...cloudRows.map((row) => row.key)])];
+  const keys = [
+    ...new Set([...RESTORE_PROTECTED_SETTING_KEYS, ...cloudRows.map((row) => row.key)]),
+  ];
   const deviceSecret = byKey.get('cloud_device_secret');
   return keys.map((key) => ({
     key,
     // Exclude short-lived credentials and standalone position hashes from restore.
-    present: !key.startsWith('mobile_pairing_code')
-      && !(key === 'cloud_pos_hash' && !deviceSecret)
-      && byKey.has(key),
+    present:
+      !key.startsWith('mobile_pairing_code') &&
+      !(key === 'cloud_pos_hash' && !deviceSecret) &&
+      byKey.has(key),
     value: byKey.get(key) ?? null,
   }));
 }
 
-export function mergeRestoreProtectedSettings(dbInstance: Database.Database, states: RestoreProtectedSettingState[]): void {
+export function mergeRestoreProtectedSettings(
+  dbInstance: Database.Database,
+  states: RestoreProtectedSettingState[],
+): void {
   const upsert = dbInstance.prepare(`
     INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?)
     ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
@@ -1412,57 +5605,226 @@ export function mergeRestoreProtectedSettings(dbInstance: Database.Database, sta
   // Clear cloud settings first; cloud identity is installation-local.
   dbInstance.prepare("DELETE FROM settings WHERE key LIKE 'cloud_%'").run();
   for (const state of states) {
+    if (state.key === AUTH_CLOCK_HIGH_WATER_SETTING_KEY) {
+      const validLocalMs = state.present ? parseValidAuthClockHighWaterMs(state.value) : null;
+      if (validLocalMs !== null) {
+        upsert.run(state.key, String(validLocalMs), now());
+      } else {
+        dbInstance.prepare('DELETE FROM settings WHERE key = ?').run(state.key);
+      }
+      continue;
+    }
     if (state.present) upsert.run(state.key, state.value, now());
-    else if (!state.key.startsWith('cloud_')) dbInstance.prepare('DELETE FROM settings WHERE key = ?').run(state.key);
+    else if (!state.key.startsWith('cloud_'))
+      dbInstance.prepare('DELETE FROM settings WHERE key = ?').run(state.key);
   }
-  const hasDeviceSecret = states.some((state) => state.key === 'cloud_device_secret' && state.present);
+  try {
+    const activeOwners = dbInstance
+      .prepare(
+        "SELECT lower(trim(email)) AS email FROM users WHERE role = 'owner' AND is_active = 1 AND email IS NOT NULL AND trim(email) != '' ORDER BY created_at ASC, id ASC",
+      )
+      .all() as { email: string }[];
+    if (activeOwners.length > 0) {
+      const currentEmail = String(
+        (
+          dbInstance.prepare("SELECT value FROM settings WHERE key = 'email'").get() as
+            | { value: string | null }
+            | undefined
+        )?.value || '',
+      )
+        .trim()
+        .toLowerCase();
+      if (!activeOwners.some((row) => row.email === currentEmail)) {
+        upsert.run('email', activeOwners[0].email, now());
+      }
+    }
+  } catch {
+    // Skip owner email resync if users table is unavailable in a partial fixture.
+  }
+  const hasDeviceSecret = states.some(
+    (state) => state.key === 'cloud_device_secret' && state.present,
+  );
   const hasPosHash = states.some((state) => state.key === 'cloud_pos_hash' && state.present);
   if (!hasDeviceSecret || !hasPosHash) ensureCloudIdentity();
+  settingsRevision += 1;
 }
 
+// Exported for outbox/diagnostics bounds verification tests; authoritative restore replaces the DB directly.
 export function captureRestoreOutboxState(dbInstance: Database.Database): RestoreOutboxState {
-  const pending = (table: string) => dbInstance.prepare(`SELECT * FROM ${table} WHERE status IN ('pending', 'failed', 'sending')`).all() as Record<string, unknown>[];
-  return { cloud: pending('cloud_sync_outbox'), support: pending('support_ticket_outbox'), diagnostics: pending('store_diagnostics_outbox') };
+  const pending = (table: string) =>
+    dbInstance
+      .prepare(`SELECT * FROM ${table} WHERE status IN ('pending', 'failed', 'sending')`)
+      .all() as Record<string, unknown>[];
+  // A SQLite backup copies the whole file, so local_diagnostics travels with it.
+  // Those rows describe the till that produced them, so the receiving device
+  // keeps its own and drops the incoming one.
+  const local = dbInstance
+    .prepare('SELECT * FROM local_diagnostics ORDER BY id ASC')
+    .all() as Record<string, unknown>[];
+  const diagnosticsAggregates = dbInstance
+    .prepare('SELECT * FROM diagnostics_hourly_aggregates ORDER BY window_start, aggregate_key')
+    .all() as Record<string, unknown>[];
+  const diagnosticsGaps = dbInstance
+    .prepare('SELECT * FROM diagnostics_delivery_gaps ORDER BY reason_code')
+    .all() as Record<string, unknown>[];
+  return {
+    cloud: pending('cloud_sync_outbox'),
+    support: pending('support_ticket_outbox'),
+    diagnostics: pending('store_diagnostics_outbox'),
+    diagnosticsAggregates,
+    diagnosticsGaps,
+    local,
+  };
 }
 
-export function mergeRestoreOutboxState(dbInstance: Database.Database, state: RestoreOutboxState): void {
-  dbInstance.exec('DELETE FROM cloud_sync_outbox; DELETE FROM support_ticket_outbox; DELETE FROM store_diagnostics_outbox');
+export function mergeRestoreOutboxState(
+  dbInstance: Database.Database,
+  state: RestoreOutboxState,
+): void {
+  dbInstance.exec(
+    'DELETE FROM cloud_sync_outbox; DELETE FROM support_ticket_outbox; DELETE FROM store_diagnostics_outbox; DELETE FROM local_diagnostics; DELETE FROM diagnostics_hourly_aggregates; DELETE FROM diagnostics_delivery_gaps',
+  );
   const cloud = dbInstance.prepare(`INSERT OR REPLACE INTO cloud_sync_outbox
     (id, event_type, entity_type, entity_id, payload, status, attempt_count, next_attempt_at, last_error, delivered_at, created_at, updated_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
-  for (const row of state.cloud) cloud.run(row.id, row.event_type, row.entity_type, row.entity_id, row.payload, row.status === 'sending' ? 'failed' : row.status, row.attempt_count || 0, row.next_attempt_at || now(), row.last_error || null, row.delivered_at || null, row.created_at || now(), row.updated_at || now());
+  for (const row of state.cloud)
+    cloud.run(
+      row.id,
+      row.event_type,
+      row.entity_type,
+      row.entity_id,
+      row.payload,
+      row.status === 'sending' ? 'failed' : row.status,
+      row.attempt_count || 0,
+      row.next_attempt_at || now(),
+      row.last_error || null,
+      row.delivered_at || null,
+      row.created_at || now(),
+      row.updated_at || now(),
+    );
   const support = dbInstance.prepare(`INSERT OR REPLACE INTO support_ticket_outbox
     (client_ticket_id, payload, status, support_code, attempt_count, next_attempt_at, last_error, created_at, updated_at, delivered_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
-  for (const row of state.support) support.run(row.client_ticket_id, row.payload, row.status === 'sending' ? 'failed' : row.status, row.support_code || null, row.attempt_count || 0, row.next_attempt_at || now(), row.last_error || null, row.created_at || now(), row.updated_at || now(), row.delivered_at || null);
+  for (const row of state.support)
+    support.run(
+      row.client_ticket_id,
+      row.payload,
+      row.status === 'sending' ? 'failed' : row.status,
+      row.support_code || null,
+      row.attempt_count || 0,
+      row.next_attempt_at || now(),
+      row.last_error || null,
+      row.created_at || now(),
+      row.updated_at || now(),
+      row.delivered_at || null,
+    );
   const diagnostics = dbInstance.prepare(`INSERT OR REPLACE INTO store_diagnostics_outbox
-    (event_id, payload, status, attempt_count, next_attempt_at, last_error, created_at, updated_at, delivered_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`);
-  for (const row of state.diagnostics) diagnostics.run(row.event_id, row.payload, row.status === 'sending' ? 'failed' : row.status, row.attempt_count || 0, row.next_attempt_at || now(), row.last_error || null, row.created_at || now(), row.updated_at || now(), row.delivered_at || null);
+    (event_id, payload, status, attempt_count, next_attempt_at, last_error, created_at, updated_at, delivered_at, transport, permanent_failure)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+  for (const row of state.diagnostics)
+    diagnostics.run(
+      row.event_id,
+      row.payload,
+      row.status === 'sending' ? 'failed' : row.status,
+      row.attempt_count || 0,
+      row.next_attempt_at || now(),
+      row.last_error || null,
+      row.created_at || now(),
+      row.updated_at || now(),
+      row.delivered_at || null,
+      row.transport || 'signed',
+      row.permanent_failure ? 1 : 0,
+    );
+  const aggregate = dbInstance.prepare(`INSERT INTO diagnostics_hourly_aggregates
+    (aggregate_key, capture_point, reason_code, classification, operation, stage, outcome, window_start,
+     count, first_occurred_at, last_occurred_at, app_version, app_build, platform, examples_json, facts_json, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+  for (const row of state.diagnosticsAggregates || [])
+    aggregate.run(
+      row.aggregate_key,
+      row.capture_point,
+      row.reason_code,
+      row.classification,
+      row.operation,
+      row.stage,
+      row.outcome,
+      row.window_start,
+      row.count,
+      row.first_occurred_at,
+      row.last_occurred_at,
+      row.app_version,
+      row.app_build,
+      row.platform,
+      row.examples_json || '[]',
+      row.facts_json || '{}',
+      row.updated_at || now(),
+    );
+  const gap = dbInstance.prepare(
+    `INSERT INTO diagnostics_delivery_gaps (reason_code, count, first_occurred_at, last_occurred_at, updated_at) VALUES (?, ?, ?, ?, ?)`,
+  );
+  for (const row of state.diagnosticsGaps || [])
+    gap.run(
+      row.reason_code,
+      row.count,
+      row.first_occurred_at || now(),
+      row.last_occurred_at || now(),
+      row.updated_at || now(),
+    );
+  const local = dbInstance.prepare(`INSERT INTO local_diagnostics
+    (event_code, severity, error_class, signature, summary, metadata_json, occurred_at, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)`);
+  for (const row of state.local || [])
+    local.run(
+      row.event_code,
+      row.severity,
+      row.error_class,
+      row.signature,
+      row.summary,
+      row.metadata_json || null,
+      row.occurred_at,
+      row.created_at,
+    );
+  // Re-cap in case this device was already at the limit before the restore.
+  dbInstance
+    .prepare(
+      'DELETE FROM local_diagnostics WHERE id NOT IN (SELECT id FROM local_diagnostics ORDER BY id DESC LIMIT ?)',
+    )
+    .run(200);
 }
 
 export function captureKdsEnabledSetting(dbInstance: Database.Database): KdsEnabledSettingState {
-  const row = dbInstance.prepare('SELECT value FROM settings WHERE key = ?').get('kds_enabled') as { value: string | null } | undefined;
+  const row = dbInstance.prepare('SELECT value FROM settings WHERE key = ?').get('kds_enabled') as
+    | { value: string | null }
+    | undefined;
   // A missing setting has always meant enabled; preserve that effective
   // security posture instead of letting an older backup disable KDS.
   return { present: true, value: row?.value ?? 'true' };
 }
 
-export function mergeKdsEnabledSetting(dbInstance: Database.Database, state: KdsEnabledSettingState): void {
+export function mergeKdsEnabledSetting(
+  dbInstance: Database.Database,
+  state: KdsEnabledSettingState,
+): void {
   if (!state.present) return;
-  dbInstance.prepare(`
+  dbInstance
+    .prepare(`
     INSERT INTO settings (key, value, updated_at) VALUES ('kds_enabled', ?, ?)
     ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
-  `).run(state.value, now());
+  `)
+    .run(state.value, now());
 }
 
-export function captureUserStationSecurityState(dbInstance: Database.Database): UserStationSecurityState[] {
+export function captureUserStationSecurityState(
+  dbInstance: Database.Database,
+): UserStationSecurityState[] {
   try {
-    return dbInstance.prepare(`
+    return dbInstance
+      .prepare(`
       SELECT su.user_id, su.station_id, ks.is_active, ks.category_ids
       FROM station_users su
       JOIN kitchen_stations ks ON ks.id = su.station_id
-    `).all() as UserStationSecurityState[];
+    `)
+      .all() as UserStationSecurityState[];
   } catch {
     return [];
   }
@@ -1480,7 +5842,9 @@ export function mergeUserStationSecurityState(
     .filter((station) => !currentStation.get(station.id))
     .map((station) => station.id);
   if (missingStations.length > 0) {
-    throw new Error(`Restore cannot preserve current kitchen station(s): ${missingStations.join(', ')}`);
+    throw new Error(
+      `Restore cannot preserve current kitchen station(s): ${missingStations.join(', ')}`,
+    );
   }
   const restoreStationSecurity = dbInstance.prepare(
     'UPDATE kitchen_stations SET is_active = ?, category_ids = ?, updated_at = ? WHERE id = ?',
@@ -1488,25 +5852,35 @@ export function mergeUserStationSecurityState(
   for (const station of preservedStations) {
     restoreStationSecurity.run(station.is_active, station.category_ids, now(), station.id);
   }
-  const stationState = dbInstance.prepare('SELECT is_active, category_ids FROM kitchen_stations WHERE id = ?');
+  const stationState = dbInstance.prepare(
+    'SELECT is_active, category_ids FROM kitchen_stations WHERE id = ?',
+  );
   const invalidStations = rows
     .filter((row) => preservedIds.has(row.user_id))
     .filter((row) => {
-      const restored = stationState.get(row.station_id) as { is_active: number; category_ids: string | null } | undefined;
-      return !restored
-        || restored.is_active !== row.is_active
-        || restored.category_ids !== row.category_ids;
+      const restored = stationState.get(row.station_id) as
+        | { is_active: number; category_ids: string | null }
+        | undefined;
+      return (
+        !restored ||
+        restored.is_active !== row.is_active ||
+        restored.category_ids !== row.category_ids
+      );
     })
     .map((row) => `${row.user_id}:${row.station_id}`);
   if (invalidStations.length > 0) {
-    throw new Error(`Restore cannot preserve current station security state(s): ${invalidStations.join(', ')}`);
+    throw new Error(
+      `Restore cannot preserve current station security state(s): ${invalidStations.join(', ')}`,
+    );
   }
 
   const currentUsers = dbInstance.prepare('SELECT id FROM users').all() as { id: string }[];
   for (const user of currentUsers) {
     dbInstance.prepare('DELETE FROM station_users WHERE user_id = ?').run(user.id);
   }
-  const insert = dbInstance.prepare('INSERT INTO station_users (user_id, station_id, created_at) VALUES (?, ?, ?)');
+  const insert = dbInstance.prepare(
+    'INSERT INTO station_users (user_id, station_id, created_at) VALUES (?, ?, ?)',
+  );
   for (const row of rows) {
     if (preservedIds.has(row.user_id)) insert.run(row.user_id, row.station_id, now());
   }
@@ -1526,31 +5900,115 @@ export type UserSecurityState = {
   station_assignments_configured: number;
 };
 
-export function getUserKdsStationIds(dbInstance: Database.Database, userId: string): string[] | null {
+export function getUserKdsStationIds(
+  dbInstance: Database.Database,
+  userId: string,
+): string[] | null {
   try {
-    return (dbInstance.prepare(`
+    return (
+      dbInstance
+        .prepare(`
       SELECT su.station_id
       FROM station_users su
       JOIN kitchen_stations ks ON ks.id = su.station_id
       WHERE su.user_id = ? AND ks.is_active = 1
-    `).all(userId) as { station_id: string }[]).map((row) => String(row.station_id));
+    `)
+        .all(userId) as { station_id: string }[]
+    ).map((row) => String(row.station_id));
   } catch {
     return null;
   }
 }
 
-export function getKdsStationCategoryIds(dbInstance: Database.Database, stationIds: string[]): string[] | null {
+export function expandCategoryIdsWithSubcategories(
+  dbInstance: Database.Database,
+  categoryIds: string[],
+  excludedChildCategoryIds?: Set<string>,
+): string[] {
+  const normalized = [
+    ...new Set(categoryIds.filter((id) => id != null && String(id).trim() !== '').map(String)),
+  ];
+  if (normalized.length === 0) return [];
+  try {
+    const placeholders = normalized.map(() => '?').join(',');
+    const childRows = dbInstance
+      .prepare(
+        `SELECT id FROM categories WHERE deleted_at IS NULL AND parent_id IN (${placeholders})`,
+      )
+      .all(...normalized) as { id: string }[];
+    const expanded = new Set<string>(normalized);
+    for (const row of childRows) {
+      if (row.id != null) {
+        const childId = String(row.id);
+        if (!excludedChildCategoryIds?.has(childId)) {
+          expanded.add(childId);
+        }
+      }
+    }
+    return [...expanded];
+  } catch {
+    return normalized;
+  }
+}
+
+function getOtherActiveStationExplicitCategories(
+  dbInstance: Database.Database,
+  stationId: string,
+): Set<string> {
+  const claimed = new Set<string>();
+  try {
+    const rows = dbInstance
+      .prepare('SELECT category_ids FROM kitchen_stations WHERE is_active = 1 AND id != ?')
+      .all(stationId) as { category_ids: string | null }[];
+    for (const row of rows) {
+      if (!row.category_ids) continue;
+      try {
+        const parsed = JSON.parse(row.category_ids);
+        if (Array.isArray(parsed)) {
+          for (const categoryId of parsed) {
+            if (categoryId != null && String(categoryId).trim() !== '') {
+              claimed.add(String(categoryId));
+            }
+          }
+        }
+      } catch {}
+    }
+  } catch {}
+  return claimed;
+}
+
+export function getKdsStationCategoryIds(
+  dbInstance: Database.Database,
+  stationIds: string[],
+): string[] | null {
   if (stationIds.length === 0) return [];
   try {
     const placeholders = stationIds.map(() => '?').join(',');
-    const rows = dbInstance.prepare(`SELECT category_ids FROM kitchen_stations WHERE is_active = 1 AND id IN (${placeholders})`).all(...stationIds) as { category_ids: string | null }[];
+    const rows = dbInstance
+      .prepare(
+        `SELECT id, category_ids FROM kitchen_stations WHERE is_active = 1 AND id IN (${placeholders})`,
+      )
+      .all(...stationIds) as { id: string; category_ids: string | null }[];
     const categories = new Set<string>();
     for (const row of rows) {
       if (!row.category_ids) continue;
       try {
         const parsed = JSON.parse(row.category_ids);
-        if (Array.isArray(parsed)) for (const categoryId of parsed) if (categoryId != null) categories.add(String(categoryId));
-      } catch { }
+        if (Array.isArray(parsed)) {
+          const rawIds = parsed.filter((id) => id != null).map(String);
+          const excludedChildren = getOtherActiveStationExplicitCategories(
+            dbInstance,
+            String(row.id),
+          );
+          for (const categoryId of expandCategoryIdsWithSubcategories(
+            dbInstance,
+            rawIds,
+            excludedChildren,
+          )) {
+            categories.add(categoryId);
+          }
+        }
+      } catch {}
     }
     return [...categories];
   } catch {
@@ -1569,13 +6027,17 @@ export function getKdsStationRoutingScope(
   stationIds: string[],
   userCategoryIds: string[],
 ): KdsStationRoutingScope | null {
-  if (stationIds.length === 0) return { tablelessCategoryIds: [], categoryIdsByStation: {}, hasUnrestrictedStation: false };
+  const expandedUserCategoryIds = expandCategoryIdsWithSubcategories(dbInstance, userCategoryIds);
+  if (stationIds.length === 0)
+    return { tablelessCategoryIds: [], categoryIdsByStation: {}, hasUnrestrictedStation: false };
   try {
     const placeholders = stationIds.map(() => '?').join(',');
-    const rows = dbInstance.prepare(`
+    const rows = dbInstance
+      .prepare(`
       SELECT id, category_ids FROM kitchen_stations
       WHERE is_active = 1 AND id IN (${placeholders})
-    `).all(...stationIds) as { id: string; category_ids: string | null }[];
+    `)
+      .all(...stationIds) as { id: string; category_ids: string | null }[];
     const byStation: Record<string, string[] | null> = {};
     const tableless = new Set<string>();
     let hasUnrestrictedStation = false;
@@ -1586,19 +6048,32 @@ export function getKdsStationRoutingScope(
         try {
           const parsed = JSON.parse(row.category_ids);
           if (!Array.isArray(parsed)) return null;
-          stationCategories = parsed.filter((id) => id != null).map(String);
+          stationCategories = expandCategoryIdsWithSubcategories(
+            dbInstance,
+            parsed.filter((id) => id != null).map(String),
+            getOtherActiveStationExplicitCategories(dbInstance, String(stationId)),
+          );
         } catch {
           return null;
         }
       }
-      const allowed = stationCategories.length > 0
-        ? stationCategories.filter((id) => userCategoryIds.length === 0 || userCategoryIds.includes(id))
-        : (userCategoryIds.length > 0 ? [...userCategoryIds] : null);
+      const allowed =
+        stationCategories.length > 0
+          ? stationCategories.filter(
+              (id) => expandedUserCategoryIds.length === 0 || expandedUserCategoryIds.includes(id),
+            )
+          : expandedUserCategoryIds.length > 0
+            ? [...expandedUserCategoryIds]
+            : null;
       byStation[String(stationId)] = allowed;
       if (allowed === null) hasUnrestrictedStation = true;
       if (allowed !== null) allowed.forEach((id) => tableless.add(id));
     }
-    return { tablelessCategoryIds: [...tableless], categoryIdsByStation: byStation, hasUnrestrictedStation };
+    return {
+      tablelessCategoryIds: [...tableless],
+      categoryIdsByStation: byStation,
+      hasUnrestrictedStation,
+    };
   } catch {
     return null;
   }
@@ -1609,7 +6084,9 @@ export function getKdsStationRoutingCategoryIds(
   stationIds: string[],
   userCategoryIds: string[],
 ): string[] | null {
-  return getKdsStationRoutingScope(dbInstance, stationIds, userCategoryIds)?.tablelessCategoryIds ?? null;
+  return (
+    getKdsStationRoutingScope(dbInstance, stationIds, userCategoryIds)?.tablelessCategoryIds ?? null
+  );
 }
 
 export function isKdsStationItemAllowed(
@@ -1627,16 +6104,26 @@ export function isKdsStationItemAllowed(
     if (orderStationCategoryIds === null) return true;
     return !!itemCategoryId && orderStationCategoryIds.includes(String(itemCategoryId));
   }
-  return hasUnrestrictedStation || (!!itemCategoryId && stationCategoryIds.includes(String(itemCategoryId)));
+  return (
+    hasUnrestrictedStation ||
+    (!!itemCategoryId && stationCategoryIds.includes(String(itemCategoryId)))
+  );
 }
 
-export function hasUserKdsStationAssignments(dbInstance: Database.Database, userId: string): boolean | null {
+export function hasUserKdsStationAssignments(
+  dbInstance: Database.Database,
+  userId: string,
+): boolean | null {
   try {
-    const row = dbInstance.prepare(`
+    const row = dbInstance
+      .prepare(`
       SELECT station_assignments_configured,
              EXISTS (SELECT 1 FROM station_users WHERE user_id = ?) AS assigned
       FROM users WHERE id = ?
-    `).get(userId, userId) as { station_assignments_configured: number; assigned: number } | undefined;
+    `)
+      .get(userId, userId) as
+      | { station_assignments_configured: number; assigned: number }
+      | undefined;
     if (!row) return null;
     return row.station_assignments_configured === 1 || row.assigned === 1;
   } catch {
@@ -1646,45 +6133,77 @@ export function hasUserKdsStationAssignments(dbInstance: Database.Database, user
 
 export function captureUserSecurityState(dbInstance: Database.Database): UserSecurityState[] {
   try {
-    return dbInstance.prepare('SELECT id, name, email, password, pin, pin_hash, role, category_ids, is_active, tokens_valid_after, station_assignments_configured FROM users').all() as UserSecurityState[];
+    return dbInstance
+      .prepare(
+        'SELECT id, name, email, password, pin, pin_hash, role, category_ids, is_active, tokens_valid_after, station_assignments_configured FROM users',
+      )
+      .all() as UserSecurityState[];
   } catch {
     return [];
   }
 }
 
-export function mergeUserSecurityState(dbInstance: Database.Database, rows: UserSecurityState[]): void {
+export function mergeUserSecurityState(
+  dbInstance: Database.Database,
+  rows: UserSecurityState[],
+): void {
   for (const row of rows) {
-    const restored = dbInstance.prepare('SELECT id, is_active, tokens_valid_after, station_assignments_configured FROM users WHERE id = ?').get(row.id) as UserSecurityState | undefined;
+    const restored = dbInstance
+      .prepare(
+        'SELECT id, is_active, tokens_valid_after, station_assignments_configured FROM users WHERE id = ?',
+      )
+      .get(row.id) as UserSecurityState | undefined;
     if (!restored) continue;
     const currentEpoch = row.tokens_valid_after;
     const restoredEpoch = restored.tokens_valid_after;
     const currentParsedTime = currentEpoch ? parseDbTimestamp(currentEpoch).getTime() : Number.NaN;
-    const restoredParsedTime = restoredEpoch ? parseDbTimestamp(restoredEpoch).getTime() : Number.NaN;
-    const currentTime = Number.isFinite(currentParsedTime) ? currentParsedTime : Number.NEGATIVE_INFINITY;
-    const restoredTime = Number.isFinite(restoredParsedTime) ? restoredParsedTime : Number.NEGATIVE_INFINITY;
+    const restoredParsedTime = restoredEpoch
+      ? parseDbTimestamp(restoredEpoch).getTime()
+      : Number.NaN;
+    const currentTime = Number.isFinite(currentParsedTime)
+      ? currentParsedTime
+      : Number.NEGATIVE_INFINITY;
+    const restoredTime = Number.isFinite(restoredParsedTime)
+      ? restoredParsedTime
+      : Number.NEGATIVE_INFINITY;
     const tokensValidAfter = currentTime >= restoredTime ? currentEpoch : restoredEpoch;
-    dbInstance.prepare(`
+    dbInstance
+      .prepare(`
       UPDATE users
       SET name = ?, email = ?, password = ?, pin = ?, pin_hash = ?, role = ?, category_ids = ?,
           is_active = ?, tokens_valid_after = ?, station_assignments_configured = ?
       WHERE id = ?
-    `).run(
-      row.name, row.email, row.password, row.pin, row.pin_hash, row.role, row.category_ids,
-      row.is_active,
-      tokensValidAfter,
-      row.station_assignments_configured || 0,
-      row.id,
-    );
+    `)
+      .run(
+        row.name,
+        row.email,
+        row.password,
+        row.pin,
+        row.pin_hash,
+        row.role,
+        row.category_ids,
+        row.is_active,
+        tokensValidAfter,
+        row.station_assignments_configured || 0,
+        row.id,
+      );
   }
+
+  // A database with no accounts of its own (a fresh install restoring its store) has nothing
+  // to protect, and disabling every restored account would lock the operator out.
+  if (rows.length === 0) return;
 
   // Accounts introduced only by an older snapshot must not become a new
   // login path without an explicit owner reactivation.
   const preservedIds = new Set(rows.map((row) => row.id));
   const restoredUsers = dbInstance.prepare('SELECT id FROM users').all() as { id: string }[];
   const restoredIds = new Set(restoredUsers.map((user) => user.id));
-  const disableRestoredOnly = dbInstance.prepare('UPDATE users SET is_active = 0, tokens_valid_after = ? WHERE id = ?');
+  const disableRestoredOnly = dbInstance.prepare(
+    'UPDATE users SET is_active = 0, tokens_valid_after = ? WHERE id = ?',
+  );
   for (const user of restoredUsers) {
-    if (!preservedIds.has(user.id)) disableRestoredOnly.run(now(), user.id);
+    if (!preservedIds.has(user.id))
+      disableRestoredOnly.run(nextTokensValidAfterTimestamp(), user.id);
   }
 
   const insertPreservedUser = dbInstance.prepare(`
@@ -1694,41 +6213,41 @@ export function mergeUserSecurityState(dbInstance: Database.Database, rows: User
   for (const row of rows) {
     if (restoredIds.has(row.id)) continue;
     const emailConflict = row.email
-      ? dbInstance.prepare('SELECT id FROM users WHERE email = ?').get(row.email) as { id: string } | undefined
+      ? (dbInstance.prepare('SELECT id FROM users WHERE email = ?').get(row.email) as
+          | { id: string }
+          | undefined)
       : undefined;
-    if (emailConflict) dbInstance.prepare('UPDATE users SET email = NULL WHERE id = ?').run(emailConflict.id);
+    if (emailConflict)
+      dbInstance.prepare('UPDATE users SET email = NULL WHERE id = ?').run(emailConflict.id);
     insertPreservedUser.run(
-      row.id, row.name, row.email, row.password, row.pin, row.pin_hash, row.role,
-      row.category_ids, row.is_active, row.tokens_valid_after, row.station_assignments_configured || 0, now(), now(),
+      row.id,
+      row.name,
+      row.email,
+      row.password,
+      row.pin,
+      row.pin_hash,
+      row.role,
+      row.category_ids,
+      row.is_active,
+      row.tokens_valid_after,
+      row.station_assignments_configured || 0,
+      now(),
+      now(),
     );
   }
 }
 
-function readRevocations(dbInstance: Database.Database): RevocationRow[] {
-  try {
-    return dbInstance.prepare('SELECT token_hash, expires_at, revoked_at FROM revoked_tokens').all() as RevocationRow[];
-  } catch {
-    return [];
-  }
-}
-
-function mergeRevocations(dbInstance: Database.Database, rows: RevocationRow[]): void {
-  if (rows.length === 0) return;
-  const merge = dbInstance.prepare(`
-    INSERT INTO revoked_tokens (token_hash, expires_at, revoked_at)
-    VALUES (?, ?, ?)
-    ON CONFLICT(token_hash) DO UPDATE SET
-      expires_at = MAX(revoked_tokens.expires_at, excluded.expires_at),
-      revoked_at = MIN(revoked_tokens.revoked_at, excluded.revoked_at)
-  `);
-  for (const row of rows) merge.run(row.token_hash, row.expires_at, row.revoked_at);
-}
-
-export function restoreBackup(backupPath: string, forceDirect: boolean = false, signal?: AbortSignal): RestoreResult {
+export function restoreBackup(
+  backupPath: string,
+  forceDirect: boolean = false,
+  signal?: AbortSignal,
+): RestoreResult {
   throwIfDatabaseMaintenanceAborted(signal);
   console.log('[DB] restoreBackup: Starting restore from:', backupPath);
+  let stagedSource: { snapshotPath: string; cleanup: () => void } | undefined;
   try {
-    backupPath = materializeRestoreSource(backupPath, getDbPath());
+    stagedSource = materializeRestoreSource(backupPath, getDbPath());
+    backupPath = stagedSource.snapshotPath;
   } catch (error: any) {
     const currentVersion = getCurrentSchemaVersion();
     return {
@@ -1741,203 +6260,461 @@ export function restoreBackup(backupPath: string, forceDirect: boolean = false, 
     };
   }
 
-  let metadataVersion = 0;
-  let metadataStampPresent = false;
-  let pragmaVersion = 0;
-  let backupDb: Database.Database | undefined;
   try {
-    backupDb = new Database(backupPath, { readonly: true, fileMustExist: true });
-    const metaRow = backupDb.prepare(`SELECT value FROM _flo_meta WHERE key = 'schema_version'`).get() as { value: string } | undefined;
-    metadataStampPresent = Boolean(metaRow);
-    metadataVersion = metaRow ? parseCanonicalSchemaVersion(metaRow.value) ?? 0 : 0;
-    pragmaVersion = Number(backupDb.pragma('user_version', { simple: true }));
-  } finally {
-    backupDb?.close();
-  }
+    let metadataVersion = 0;
+    let metadataStampPresent = false;
+    let pragmaVersion = 0;
+    let backupDb: Database.Database | undefined;
+    let unreadableSource = false;
+    try {
+      backupDb = new Database(backupPath, { readonly: true, fileMustExist: true });
+      const hasMetadataTable = backupDb
+        .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '_flo_meta'")
+        .get();
+      const metaRow = hasMetadataTable
+        ? (backupDb.prepare(`SELECT value FROM _flo_meta WHERE key = 'schema_version'`).get() as
+            | { value: string }
+            | undefined)
+        : undefined;
+      metadataStampPresent = Boolean(metaRow);
+      metadataVersion = metaRow ? (parseCanonicalSchemaVersion(metaRow.value) ?? 0) : 0;
+      pragmaVersion = Number(backupDb.pragma('user_version', { simple: true }));
+    } catch (openError) {
+      if (isShutdownOrMaintenanceAbortError(openError)) {
+        throw openError;
+      }
+      if (isSqliteStorageOrOpenError(openError)) {
+        return {
+          success: false,
+          mode: forceDirect ? 'direct' : 'data_only',
+          backupSchemaVersion: 0,
+          currentSchemaVersion: getCurrentSchemaVersion(),
+          tablesRestored: 0,
+          error: openError instanceof Error ? openError.message : 'Could not read restore source',
+        };
+      }
+      // A file that is not a readable SQLite database (truncated, corrupt, or
+      // simply not a database at all) must be refused, never applied.
+      unreadableSource = true;
+    } finally {
+      backupDb?.close();
+    }
 
-  // Determine schema version from metadata stamp or SQLite user_version pragma.
-  const backupSchemaVersion = Number.isFinite(metadataVersion) && metadataVersion > 0
-    ? metadataVersion
-    : pragmaVersion;
-  const currentDb = getDatabase();
-  const currentVersion = getCurrentSchemaVersion();
-  // Preserve revocations from live database so restored older snapshot cannot unrevoke tokens.
-  const preservedRevocations = readRevocations(currentDb);
-  const preservedUserSecurity = captureUserSecurityState(currentDb);
-  const preservedUserStations = captureUserStationSecurityState(currentDb);
-  const preservedStationSecurity = captureKitchenStationSecurityState(currentDb);
-  const preservedKdsEnabled = captureKdsEnabledSetting(currentDb);
-  const preservedProtectedSettings = captureRestoreProtectedSettings(currentDb);
-  const preservedOutboxes = captureRestoreOutboxState(currentDb);
+    if (unreadableSource) {
+      return {
+        success: false,
+        mode: forceDirect ? 'direct' : 'data_only',
+        backupSchemaVersion: 0,
+        currentSchemaVersion: getCurrentSchemaVersion(),
+        tablesRestored: 0,
+        error: 'Restore source is not a readable Flo database file',
+      };
+    }
 
-  console.log(`[DB] Backup schema version: ${backupSchemaVersion}, SQLite: ${pragmaVersion}, Current: ${currentVersion}`);
+    // Determine schema version from metadata stamp or SQLite user_version pragma.
+    const backupSchemaVersion =
+      Number.isFinite(metadataVersion) && metadataVersion > 0 ? metadataVersion : pragmaVersion;
+    const currentDb = getDatabase();
+    const currentVersion = getCurrentSchemaVersion();
 
-  if (metadataStampPresent && (metadataVersion <= 0 || metadataVersion !== pragmaVersion)) {
-    return {
-      success: false,
-      mode: forceDirect ? 'direct' : 'data_only',
-      backupSchemaVersion,
-      currentSchemaVersion: currentVersion,
-      tablesRestored: 0,
-      error: 'Backup schema metadata does not match the SQLite header',
-    };
-  }
+    console.log(
+      `[DB] Backup schema version: ${backupSchemaVersion}, SQLite: ${pragmaVersion}, Current: ${currentVersion}`,
+    );
 
-  if (forceDirect && pragmaVersion > currentVersion) {
-    return {
-      success: false,
-      mode: 'direct',
-      backupSchemaVersion,
-      currentSchemaVersion: currentVersion,
-      tablesRestored: 0,
-      error: `Direct restore rejected: backup schema v${pragmaVersion} is newer than supported schema v${currentVersion}`,
-    };
-  }
+    if (metadataStampPresent && (metadataVersion <= 0 || metadataVersion !== pragmaVersion)) {
+      return {
+        success: false,
+        mode: forceDirect ? 'direct' : 'data_only',
+        backupSchemaVersion,
+        currentSchemaVersion: currentVersion,
+        tablesRestored: 0,
+        error: 'Backup schema metadata does not match the SQLite header',
+      };
+    }
 
-  if (forceDirect || backupSchemaVersion === currentVersion) {
-    throwIfDatabaseMaintenanceAborted(signal);
-    const baselineForeignKeyViolations = getForeignKeyViolationKeys(currentDb);
-    const validationError = validateDirectBackup(backupPath, currentDb, currentVersion, baselineForeignKeyViolations);
-    if (validationError) {
+    if (pragmaVersion > currentVersion) {
       return {
         success: false,
         mode: 'direct',
         backupSchemaVersion,
         currentSchemaVersion: currentVersion,
         tablesRestored: 0,
-        error: validationError,
+        error: `Direct restore rejected: backup schema v${pragmaVersion} is newer than supported schema v${currentVersion}`,
       };
     }
 
-    console.log('[DB] restoreBackup: Direct restore (same schema version)');
-    const dbPath = getDbPath();
-    const recoveryPath = path.join(getBackupDir(), `flo-restore-recovery-${crypto.randomBytes(8).toString('hex')}.db`);
-    const journalPath = recoveryPath.replace(/\.db$/, '.json');
-
-    let recoveryCopyReady = false;
-    let recoveryCompleted = false;
-    try {
-      // Checkpoint the live WAL before making a synchronous recovery copy.
-      currentDb.pragma('wal_checkpoint(TRUNCATE)');
-      fs.copyFileSync(dbPath, recoveryPath);
-      syncFile(recoveryPath);
-      writeReplacementJournal(journalPath, {
-        phase: 'prepared', recoveryPath, dbPath,
-        baselineForeignKeyViolations: [...baselineForeignKeyViolations],
-      });
-      recoveryCopyReady = true;
-      throwIfDatabaseMaintenanceAborted(signal);
-      closeDatabase();
-      throwIfDatabaseMaintenanceAborted(signal);
-      const removeFailures = removeDatabaseFiles(dbPath);
-      if (removeFailures.length > 0) {
-        throw new Error(`Could not remove database files: ${removeFailures.join(', ')}`);
-      }
-      throwIfDatabaseMaintenanceAborted(signal);
-      fs.copyFileSync(backupPath, dbPath);
-      initDatabase(false, true);
-
-      const freshDb = getDatabase();
-      mergeUserSecurityState(freshDb, preservedUserSecurity);
-      mergeUserStationSecurityState(freshDb, preservedUserStations, preservedUserSecurity.map((row) => row.id), preservedStationSecurity);
-      mergeKdsEnabledSetting(freshDb, preservedKdsEnabled);
-      mergeRestoreProtectedSettings(freshDb, preservedProtectedSettings);
-      freshDb.prepare('DELETE FROM kds_pairing_tokens').run();
-      mergeRestoreOutboxState(freshDb, preservedOutboxes);
-      mergeRevocations(freshDb, preservedRevocations);
-      const integrity = freshDb.prepare('PRAGMA integrity_check').all() as { integrity_check: string }[];
-      const newForeignKeyViolations = [...getForeignKeyViolationKeys(freshDb)]
-        .filter((key) => !baselineForeignKeyViolations.has(key));
-      if (
-        integrity.some((row) => row.integrity_check !== 'ok') ||
-        newForeignKeyViolations.length > 0
-      ) {
-        throw new Error('Restored database failed integrity validation');
-      }
-      throwIfDatabaseMaintenanceAborted(signal);
-      freshDb.pragma('wal_checkpoint(TRUNCATE)');
-      syncFile(dbPath);
-      if (!syncDirectory(path.dirname(dbPath)) && process.platform !== 'win32') {
-        throw new Error('Could not durably commit restored database');
-      }
-      throwIfDatabaseMaintenanceAborted(signal);
-      writeReplacementJournal(journalPath, {
-        phase: 'committed', recoveryPath, dbPath,
-        baselineForeignKeyViolations: [...baselineForeignKeyViolations],
-      });
+    if (backupSchemaVersion < 1) {
       return {
-        success: true,
+        success: false,
         mode: 'direct',
         backupSchemaVersion,
         currentSchemaVersion: currentVersion,
-        tablesRestored: getTables(freshDb).length,
+        tablesRestored: 0,
+        error: 'Backup does not contain an initialized Flo Cafe schema',
       };
-    } catch (error: any) {
-      // A corrupt/incompatible same-version file must not strand the live
-      // database. Restore the checkpointed safety copy before rethrowing.
-      if (!recoveryCopyReady) throw error;
+    }
+
+    if (backupSchemaVersion <= currentVersion) {
+      throwIfDatabaseMaintenanceAborted(signal);
+      const liveForeignKeyViolations = getForeignKeyViolationKeys(currentDb);
+      let backupForeignKeyViolations = new Set<string>();
+      let stagedDb: Database.Database | undefined;
       try {
-        closeDatabase();
-        const recoveryRemoveFailures = removeDatabaseFiles(dbPath);
-        if (recoveryRemoveFailures.length > 0) {
-          throw new Error(`Could not remove database files during recovery: ${recoveryRemoveFailures.join(', ')}`);
+        stagedDb = new Database(backupPath, { readonly: true, fileMustExist: true });
+        const integrity = stagedDb.prepare('PRAGMA integrity_check').all() as {
+          integrity_check: string;
+        }[];
+        if (integrity.some((row) => row.integrity_check !== 'ok')) {
+          return {
+            success: false,
+            mode: 'direct',
+            backupSchemaVersion,
+            currentSchemaVersion: currentVersion,
+            tablesRestored: 0,
+            error: `Backup integrity check failed: ${integrity.map((row) => row.integrity_check).join('; ')}`,
+          };
         }
-        fs.copyFileSync(recoveryPath, dbPath);
+        backupForeignKeyViolations = getForeignKeyViolationKeys(stagedDb);
+        if (backupForeignKeyViolations.size > 0) {
+          return {
+            success: false,
+            mode: 'direct',
+            backupSchemaVersion,
+            currentSchemaVersion: currentVersion,
+            tablesRestored: 0,
+            error: `Backup contains ${backupForeignKeyViolations.size} foreign-key violation(s)`,
+          };
+        }
+        const stagedTables = new Set(getTables(stagedDb));
+        const missingCoreTables = CORE_FLO_BACKUP_TABLES.filter(
+          (table) => !stagedTables.has(table),
+        );
+        if (missingCoreTables.length > 0) {
+          return {
+            success: false,
+            mode: 'direct',
+            backupSchemaVersion,
+            currentSchemaVersion: currentVersion,
+            tablesRestored: 0,
+            error: `Backup is missing required Flo Cafe table(s): ${missingCoreTables.join(', ')}`,
+          };
+        }
+        if (backupSchemaVersion >= 85 && !stagedTables.has('inventory_movements')) {
+          return {
+            success: false,
+            mode: 'direct',
+            backupSchemaVersion,
+            currentSchemaVersion: currentVersion,
+            tablesRestored: 0,
+            error: 'Backup is missing required table(s): inventory_movements',
+          };
+        }
+        const inventoryError =
+          backupSchemaVersion < 85 && !stagedTables.has('inventory_movements')
+            ? validatePreLedgerBackupInventory(stagedDb, stagedTables)
+            : validateInventoryLedgerDatabase(stagedDb);
+        if (inventoryError) {
+          return {
+            success: false,
+            mode: 'direct',
+            backupSchemaVersion,
+            currentSchemaVersion: currentVersion,
+            tablesRestored: 0,
+            error: inventoryError,
+          };
+        }
+      } finally {
+        stagedDb?.close();
+      }
+
+      if (backupSchemaVersion === currentVersion) {
+        if (!metadataStampPresent) {
+          const stagedMetadataDb = new Database(backupPath, { fileMustExist: true });
+          try {
+            stagedMetadataDb.exec(
+              'CREATE TABLE IF NOT EXISTS _flo_meta (key TEXT PRIMARY KEY, value TEXT)',
+            );
+            stagedMetadataDb
+              .prepare("INSERT INTO _flo_meta (key, value) VALUES ('schema_version', ?)")
+              .run(String(backupSchemaVersion));
+          } finally {
+            stagedMetadataDb.close();
+          }
+        }
+        repairStagedBackupSchema(backupPath, currentVersion);
+        const validationError = validateDirectBackup(backupPath, currentVersion);
+        if (validationError) {
+          return {
+            success: false,
+            mode: 'direct',
+            backupSchemaVersion,
+            currentSchemaVersion: currentVersion,
+            tablesRestored: 0,
+            error: validationError,
+          };
+        }
+      }
+
+      console.log(
+        `[DB] restoreBackup: Authoritative restore (schema v${backupSchemaVersion} → v${currentVersion})`,
+      );
+      const dbPath = getDbPath();
+      let recoveryPath = '';
+      let journalPath = '';
+
+      let recoveryCopyReady = false;
+      let recoveryCompleted = false;
+      try {
+        // Checkpoint the live WAL before making a synchronous recovery copy.
+        currentDb.pragma('wal_checkpoint(TRUNCATE)');
+        const replacementJournal = beginDatabaseReplacementJournal(dbPath, 'restore');
+        recoveryPath = replacementJournal.recoveryPath;
+        journalPath = replacementJournal.journalPath;
+        recoveryCopyReady = true;
+        writeReplacementJournal(journalPath, {
+          phase: 'prepared',
+          recoveryPath,
+          dbPath,
+          baselineForeignKeyViolations: [...liveForeignKeyViolations],
+          driveInvalidationRequired: true,
+        });
+        throwIfDatabaseMaintenanceAborted(signal);
+        closeDatabase();
+        throwIfDatabaseMaintenanceAborted(signal);
+        const removeFailures = removeDatabaseFiles(dbPath);
+        if (removeFailures.length > 0) {
+          throw new Error(`Could not remove database files: ${removeFailures.join(', ')}`);
+        }
+        throwIfDatabaseMaintenanceAborted(signal);
+        fs.copyFileSync(backupPath, dbPath);
+        initializeDatabase(false, true, true);
+
+        const freshDb = getDatabase();
+        repairBackupSchemaDrift(freshDb);
+        freshDb.exec('CREATE TABLE IF NOT EXISTS _flo_meta (key TEXT PRIMARY KEY, value TEXT)');
+        const restoredSchemaVersion = getCurrentSchemaVersion();
+        const putMeta = freshDb.prepare(
+          'INSERT OR REPLACE INTO _flo_meta (key, value) VALUES (?, ?)',
+        );
+        putMeta.run('schema_version', String(restoredSchemaVersion));
+        putMeta.run('app_version', app.getVersion());
+        freshDb.prepare("DELETE FROM _flo_meta WHERE key = 'backup_created_at'").run();
+
+        const rotatedJwtSecret = crypto.randomBytes(32).toString('hex');
+        const credentialTimestamp = now();
+        freshDb
+          .prepare(`
+            INSERT INTO settings (key, value, updated_at) VALUES ('jwt_secret', ?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+          `)
+          .run(rotatedJwtSecret, credentialTimestamp);
+        freshDb
+          .prepare('DELETE FROM settings WHERE key = ?')
+          .run(AUTH_CLOCK_HIGH_WATER_SETTING_KEY);
+        freshDb
+          .prepare('UPDATE users SET tokens_valid_after = ?, updated_at = ?')
+          .run(nextTokensValidAfterTimestamp(), credentialTimestamp);
+        freshDb.prepare('DELETE FROM kds_pairing_tokens').run();
+        freshDb.prepare('DELETE FROM customer_display_tokens').run();
+        freshDb
+          .prepare("DELETE FROM settings WHERE key LIKE 'mobile\\_pairing\\_code%' ESCAPE '\\'")
+          .run();
+        clearGoogleDriveRestoreBinding(freshDb);
+        executeSequenceRepair(freshDb);
+        freshDb
+          .prepare(`
+            INSERT INTO settings (key, value, updated_at) VALUES ('sequence_repair_completed_at', ?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+          `)
+          .run(now(), now());
+        freshDb
+          .prepare(`
+            INSERT INTO settings (key, value, updated_at) VALUES ('sequence_repair_pending', '0', ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+          `)
+          .run(now());
+        const integrity = freshDb.prepare('PRAGMA integrity_check').all() as {
+          integrity_check: string;
+        }[];
+        const newForeignKeyViolations = [...getForeignKeyViolationKeys(freshDb)].filter(
+          (key) => !backupForeignKeyViolations.has(key),
+        );
+        const schemaError = validateDatabaseSchemaTableColumns(
+          freshDb,
+          restoredSchemaVersion,
+          'Restored database',
+        );
+        const inventoryError = validateInventoryLedgerDatabase(freshDb);
+        if (
+          integrity.some((row) => row.integrity_check !== 'ok') ||
+          newForeignKeyViolations.length > 0 ||
+          schemaError !== null ||
+          inventoryError !== null
+        ) {
+          const validationError = new Error(
+            schemaError || inventoryError || 'Restored database failed integrity validation',
+          );
+          Object.assign(validationError, { code: 'ERR_RESTORE_VALIDATION' });
+          throw validationError;
+        }
+        throwIfDatabaseMaintenanceAborted(signal);
+        freshDb.pragma('wal_checkpoint(TRUNCATE)');
         syncFile(dbPath);
         if (!syncDirectory(path.dirname(dbPath)) && process.platform !== 'win32') {
-          throw new Error('Could not durably recover direct-restore database');
+          throw new Error('Could not durably commit restored database');
         }
-        initDatabase(false, true);
-        recoveryCompleted = true;
-      } catch (recoveryError: any) {
-        throw new Error(
-          `Direct restore failed: ${error?.message || 'unknown error'}; ` +
-          `live database recovery failed: ${recoveryError?.message || 'unknown error'}`,
-          { cause: recoveryError },
-        );
-      }
-      throw error;
-    } finally {
-      if (recoveryCompleted) {
-        removeReplacementArtifacts(journalPath, recoveryPath);
-      } else if (isHealthyDatabaseFile(dbPath, baselineForeignKeyViolations, false)
-        && isHealthyDatabaseFile(recoveryPath, baselineForeignKeyViolations, false)) {
-        // A committed journal is finalized here; an uncommitted journal is
-        // intentionally retained if recovery itself failed.
+        throwIfDatabaseMaintenanceAborted(signal);
+        writeReplacementJournal(journalPath, {
+          phase: 'committed',
+          recoveryPath,
+          dbPath,
+          baselineForeignKeyViolations: [...liveForeignKeyViolations],
+          driveInvalidationRequired: true,
+        });
+        clearUserAuthCache();
+        clearInMemoryRevokedTokens();
+        clearJWTSecretCache();
+        // The replacement is durable; keep the snapshot of what it replaced so a
+        // customer who restores the wrong file can undo it.
+        retainRestoreSafetyCopy(recoveryPath, currentVersion);
+        return {
+          success: true,
+          mode: 'direct',
+          backupSchemaVersion,
+          currentSchemaVersion: currentVersion,
+          tablesRestored: getTables(freshDb).length,
+          committed: true,
+          cleanupPending: false,
+        };
+      } catch (error: any) {
+        const committedJournal = readReplacementJournal(journalPath);
+        if (committedJournal?.phase === 'committed') {
+          // The replacement is authoritative once the committed journal is durable.
+          // Do not roll it back after a post-commit error; Drive invalidation and
+          // artifact cleanup must finish from the durable boundary.
+          return {
+            success: true,
+            mode: 'direct',
+            backupSchemaVersion,
+            currentSchemaVersion: currentVersion,
+            tablesRestored: getTables(getDatabase()).length,
+            committed: true,
+            cleanupPending: true,
+          };
+        }
+        // A corrupt/incompatible same-version file must not strand the live
+        // database. Restore the checkpointed safety copy before rethrowing.
+        if (!recoveryCopyReady) throw error;
         try {
-          const journal = JSON.parse(fs.readFileSync(journalPath, 'utf8')) as ReplacementJournal;
-          if (journal.phase === 'committed') removeReplacementArtifacts(journalPath, recoveryPath);
-        } catch { }
+          closeDatabase();
+          const recoveryRemoveFailures = removeDatabaseFiles(dbPath);
+          if (recoveryRemoveFailures.length > 0) {
+            throw new Error(
+              `Could not remove database files during recovery: ${recoveryRemoveFailures.join(', ')}`,
+            );
+          }
+          fs.copyFileSync(recoveryPath, dbPath);
+          syncFile(dbPath);
+          if (!syncDirectory(path.dirname(dbPath)) && process.platform !== 'win32') {
+            throw new Error('Could not durably recover direct-restore database');
+          }
+          initDatabase(false, true);
+          recoveryCompleted = true;
+        } catch (recoveryError: any) {
+          throw new Error(
+            `Direct restore failed: ${error?.message || 'unknown error'}; ` +
+              `live database recovery failed: ${recoveryError?.message || 'unknown error'}`,
+            { cause: recoveryError },
+          );
+        }
+        if (error?.code === 'ERR_RESTORE_VALIDATION') {
+          return {
+            success: false,
+            mode: 'direct',
+            backupSchemaVersion,
+            currentSchemaVersion: currentVersion,
+            tablesRestored: 0,
+            error: error.message,
+          };
+        }
+        throw error;
+      } finally {
+        if (recoveryCompleted) {
+          removeReplacementArtifactsDurably(journalPath, recoveryPath);
+        } else if (
+          recoveryCopyReady &&
+          isHealthyDatabaseFile(dbPath, liveForeignKeyViolations, false) &&
+          isHealthyDatabaseFile(recoveryPath, liveForeignKeyViolations, false)
+        ) {
+          // A committed journal is finalized here; an uncommitted journal is
+          // intentionally retained if recovery itself failed.
+          try {
+            const journal = JSON.parse(fs.readFileSync(journalPath, 'utf8')) as ReplacementJournal;
+            if (journal.phase === 'committed' && journal.driveInvalidationRequired !== true)
+              removeReplacementArtifactsDurably(journalPath, recoveryPath);
+          } catch {}
+        }
       }
     }
-  }
 
-  console.log('[DB] restoreBackup: Data-only restore (schema version mismatch)');
-  return dataOnlyRestore(backupPath, backupSchemaVersion, currentVersion, preservedRevocations, preservedUserSecurity, preservedUserStations, preservedStationSecurity, preservedKdsEnabled, preservedProtectedSettings, preservedOutboxes, signal);
+    return {
+      success: false,
+      mode: 'direct',
+      backupSchemaVersion,
+      currentSchemaVersion: currentVersion,
+      tablesRestored: 0,
+      error: `Backup schema v${backupSchemaVersion} is not supported`,
+    };
+  } finally {
+    stagedSource?.cleanup();
+  }
 }
 
 /** Return stable keys for existing FK violations so legacy dirty data can be preserved without accepting new damage. */
 export function getForeignKeyViolationKeys(dbInstance: Database.Database): Set<string> {
-  const rows = dbInstance.prepare('PRAGMA foreign_key_check').all() as { table: string; rowid: number | string | null; parent: string; fkid: number }[];
+  const rows = dbInstance.prepare('PRAGMA foreign_key_check').all() as {
+    table: string;
+    rowid: number | string | null;
+    parent: string;
+    fkid: number;
+  }[];
   const keys = new Set<string>();
   for (const row of rows) {
     let identity: unknown = row.rowid;
     try {
-      const tableInfo = dbInstance.prepare(`PRAGMA table_info("${row.table.replace(/"/g, '""')}")`).all() as { name: string; pk: number }[];
+      const tableInfo = dbInstance
+        .prepare(`PRAGMA table_info("${row.table.replace(/"/g, '""')}")`)
+        .all() as { name: string; pk: number }[];
       const primaryKeys = tableInfo.filter((column) => column.pk > 0).sort((a, b) => a.pk - b.pk);
       const columns = primaryKeys.map((column) => `"${column.name.replace(/"/g, '""')}"`);
-      const foreignKey = (dbInstance.prepare(`PRAGMA foreign_key_list("${row.table.replace(/"/g, '""')}")`).all() as { id: number; from: string }[])
+      const foreignKey = (
+        dbInstance.prepare(`PRAGMA foreign_key_list("${row.table.replace(/"/g, '""')}")`).all() as {
+          id: number;
+          from: string;
+        }[]
+      )
         .filter((entry) => entry.id === row.fkid)
         .map((entry) => entry.from);
-      const selectedColumns = [...new Set([...columns, ...foreignKey.map((column) => `"${column.replace(/"/g, '""')}"`)])];
+      const selectedColumns = [
+        ...new Set([...columns, ...foreignKey.map((column) => `"${column.replace(/"/g, '""')}"`)]),
+      ];
       if (selectedColumns.length > 0 && row.rowid != null) {
-        const values = dbInstance.prepare(`SELECT ${selectedColumns.join(', ')} FROM "${row.table.replace(/"/g, '""')}" WHERE rowid = ?`).get(row.rowid) as Record<string, unknown> | undefined;
-        if (values) identity = {
-          primary: primaryKeys.map((column) => values[column.name]),
-          foreign: foreignKey.map((column) => values[column]),
-        };
+        const values = dbInstance
+          .prepare(
+            `SELECT ${selectedColumns.join(', ')} FROM "${row.table.replace(/"/g, '""')}" WHERE rowid = ?`,
+          )
+          .get(row.rowid) as Record<string, unknown> | undefined;
+        if (values)
+          identity = {
+            primary: primaryKeys.map((column) => values[column.name]),
+            foreign: foreignKey.map((column) => values[column]),
+          };
       }
-    } catch { }
+    } catch (fkError) {
+      if (isShutdownOrMaintenanceAbortError(fkError) || isSqliteStorageOrOpenError(fkError)) {
+        throw fkError;
+      }
+    }
     keys.add(JSON.stringify([row.table, identity, row.parent, row.fkid]));
   }
   return keys;
@@ -1948,253 +6725,196 @@ export function isSafeIdentifier(name: string): boolean {
   return /^[a-zA-Z_][a-zA-Z0-9_]*$/.test(name);
 }
 
-function materializeRestoreSource(sourcePath: string, livePath: string): string {
-  const sourceStat = fs.lstatSync(sourcePath);
-  if (sourceStat.isSymbolicLink() || !sourceStat.isFile()) throw new Error('Restore source must be a regular file');
-  if (pathEntryExists(`${sourcePath}-wal`) || pathEntryExists(`${sourcePath}-shm`)) throw new Error('Restore source must not have SQLite sidecars');
-  if ([livePath, `${livePath}-wal`, `${livePath}-shm`].some((liveTarget) => isLiveDatabaseTarget(sourcePath, liveTarget))) {
+function materializeRestoreSource(
+  sourcePath: string,
+  livePath: string,
+): { snapshotPath: string; cleanup: () => void } {
+  const sourceStat = fs.lstatSync(sourcePath, { bigint: true });
+  if (sourceStat.isSymbolicLink() || !sourceStat.isFile())
+    throw new Error('Restore source must be a regular file');
+  if (
+    pathEntryExists(`${sourcePath}-wal`) ||
+    pathEntryExists(`${sourcePath}-shm`) ||
+    pathEntryExists(`${sourcePath}-journal`)
+  )
+    throw new Error('Restore source must not have SQLite sidecars');
+  if (
+    [livePath, `${livePath}-wal`, `${livePath}-shm`, `${livePath}-journal`].some((liveTarget) =>
+      isLiveDatabaseTarget(sourcePath, liveTarget),
+    )
+  ) {
     throw new Error('Restore source cannot be the live database or its SQLite sidecars');
   }
-  const sourceFd = fs.openSync(sourcePath, fs.constants.O_RDONLY | ((fs.constants as any).O_NOFOLLOW || 0));
+  const sourceFd = fs.openSync(
+    sourcePath,
+    fs.constants.O_RDONLY | ((fs.constants as any).O_NOFOLLOW || 0),
+  );
+  let snapshotDir: string | null = null;
+  let cleaned = false;
+  const cleanup = () => {
+    if (cleaned || !snapshotDir) return;
+    cleaned = true;
+    try {
+      fs.rmSync(snapshotDir, { recursive: true, force: true });
+    } catch {}
+  };
   try {
-    const openedStat = fs.fstatSync(sourceFd);
-    if (openedStat.dev !== sourceStat.dev || openedStat.ino !== sourceStat.ino || openedStat.size !== sourceStat.size) {
+    const openedStat = fs.fstatSync(sourceFd, { bigint: true });
+    if (
+      openedStat.dev !== sourceStat.dev ||
+      openedStat.ino !== sourceStat.ino ||
+      openedStat.size !== sourceStat.size
+    ) {
       throw new Error('Restore source changed while it was being opened');
     }
-    const liveStat = fs.lstatSync(livePath);
-    if (openedStat.dev === liveStat.dev && openedStat.ino === liveStat.ino) throw new Error('Restore source cannot be the live database');
+    if (pathEntryExists(livePath)) {
+      const liveStat = fs.lstatSync(livePath, { bigint: true });
+      if (isSameBigIntStatFile(openedStat, liveStat))
+        throw new Error('Restore source cannot be the live database');
+    }
     const sourceBytes = fs.readFileSync(sourceFd);
-    const finalStat = fs.fstatSync(sourceFd);
-    if (finalStat.dev !== openedStat.dev || finalStat.ino !== openedStat.ino || finalStat.size !== openedStat.size || finalStat.mtimeMs !== openedStat.mtimeMs) {
+    const finalStat = fs.fstatSync(sourceFd, { bigint: true });
+    if (
+      finalStat.dev !== openedStat.dev ||
+      finalStat.ino !== openedStat.ino ||
+      finalStat.size !== openedStat.size ||
+      finalStat.mtimeMs !== openedStat.mtimeMs
+    ) {
       throw new Error('Restore source changed while it was being read');
     }
-    if (pathEntryExists(`${sourcePath}-wal`) || pathEntryExists(`${sourcePath}-shm`)) {
+    if (
+      pathEntryExists(`${sourcePath}-wal`) ||
+      pathEntryExists(`${sourcePath}-shm`) ||
+      pathEntryExists(`${sourcePath}-journal`)
+    ) {
       throw new Error('Restore source acquired SQLite sidecars while it was being read');
     }
-    const snapshotDir = fs.mkdtempSync(path.join(os.tmpdir(), 'flo-restore-source-'));
-    const snapshotPath = path.join(snapshotDir, 'source.db');
-    fs.writeFileSync(snapshotPath, sourceBytes, { flag: 'wx', mode: 0o600 });
-    setImmediate(() => { try { fs.rmSync(snapshotDir, { recursive: true, force: true }); } catch { } });
-    return snapshotPath;
-  } finally {
-    fs.closeSync(sourceFd);
-  }
-}
-
-function dataOnlyRestore(
-  backupPath: string,
-  backupVersion: number,
-  currentVersion: number,
-  preservedRevocations: RevocationRow[] = [],
-  preservedUserSecurity: UserSecurityState[] = [],
-  preservedUserStations: UserStationSecurityState[] = [],
-  preservedStationSecurity: KitchenStationSecurityState[] = [],
-  preservedKdsEnabled: KdsEnabledSettingState = { present: false, value: null },
-  preservedProtectedSettings: RestoreProtectedSettingState[] = [],
-  preservedOutboxes: RestoreOutboxState = { cloud: [], support: [], diagnostics: [] },
-  signal?: AbortSignal,
-): RestoreResult {
-  throwIfDatabaseMaintenanceAborted(signal);
-  const livePath = getDbPath();
-  if ([livePath, `${livePath}-wal`, `${livePath}-shm`].some((liveTarget) => isLiveDatabaseTarget(backupPath, liveTarget))) {
-    return {
-      success: false,
-      mode: 'data_only',
-      backupSchemaVersion: backupVersion,
-      currentSchemaVersion: currentVersion,
-      tablesRestored: 0,
-      error: 'Data-only restore source cannot be the live database or its SQLite sidecars',
-    };
-  }
-  try {
-    backupPath = materializeRestoreSource(backupPath, livePath);
-  } catch (error: any) {
-    return {
-      success: false,
-      mode: 'data_only',
-      backupSchemaVersion: backupVersion,
-      currentSchemaVersion: currentVersion,
-      tablesRestored: 0,
-      error: error?.message || 'Invalid data-only restore source',
-    };
-  }
-  let backupDb: Database.Database | undefined;
-  let backupTables: string[] = [];
-  const backupColumns = new Map<string, string[]>();
-  try {
-    backupDb = new Database(backupPath, { readonly: true, fileMustExist: true });
-    backupTables = getTables(backupDb);
-    for (const tableName of backupTables) {
-      if (isSafeIdentifier(tableName)) backupColumns.set(tableName, getColumns(backupDb, tableName));
-    }
-  } finally {
-    backupDb?.close();
-  }
-
-  const currentDb = getDatabase();
-  const baselineForeignKeyViolations = getForeignKeyViolationKeys(currentDb);
-  const currentTables = getTables(currentDb);
-  const commonTables = backupTables.filter((tableName) => currentTables.includes(tableName));
-  const previousForeignKeys = Number(currentDb.pragma('foreign_keys', { simple: true })) === 1;
-  let attached = false;
-  let inTransaction = false;
-  let tablesRestored = 0;
-
-  // Existing failed versions of this function could strand this alias on the
-  // long-lived connection. Remove it before attempting a fresh restore.
-  try {
-    const attachedDatabases = currentDb.prepare('PRAGMA database_list').all() as { name: string }[];
-    if (attachedDatabases.some((entry) => entry.name === '_restore_src')) {
-      currentDb.exec('DETACH DATABASE _restore_src');
-    }
-  } catch (error: any) {
-    return {
-      success: false,
-      mode: 'data_only',
-      backupSchemaVersion: backupVersion,
-      currentSchemaVersion: currentVersion,
-      tablesRestored: 0,
-      error: `Could not clear a previous restore attachment: ${error?.message || 'unknown error'}`,
-    };
-  }
-
-  try {
-    throwIfDatabaseMaintenanceAborted(signal);
-    // Disable FK checks before BEGIN so deleting parent rows does not cascade to child tables.
-    currentDb.pragma('foreign_keys = OFF');
-    const safeBackupPath = backupPath.replace(/'/g, "''");
-    currentDb.exec(`ATTACH DATABASE '${safeBackupPath}' AS _restore_src`);
-    attached = true;
-    throwIfDatabaseMaintenanceAborted(signal);
-    currentDb.exec('BEGIN IMMEDIATE');
-    inTransaction = true;
-
-    for (const tableName of commonTables) {
-      throwIfDatabaseMaintenanceAborted(signal);
-      if (!isSafeIdentifier(tableName)) {
-        console.warn(`[DB] dataOnlyRestore: skipping unsafe table: ${JSON.stringify(tableName)}`);
-        continue;
-      }
-
-      const currentColumns = getColumns(currentDb, tableName);
-      const commonColumns = (backupColumns.get(tableName) || [])
-        .filter((column) => currentColumns.includes(column))
-        .filter((column) => {
-          if (isSafeIdentifier(column)) return true;
-          console.warn(`[DB] dataOnlyRestore: skipping unsafe column: ${JSON.stringify(column)} in ${tableName}`);
-          return false;
-        });
-
-      if (commonColumns.length === 0) continue;
-
-      const columnList = commonColumns.join(', ');
-      currentDb.exec(`DELETE FROM ${tableName}`);
-      currentDb.exec(`INSERT INTO ${tableName} (${columnList}) SELECT ${columnList} FROM _restore_src.${tableName}`);
-
-      tablesRestored++;
-      console.log(`[DB] Restored ${tableName}: ${commonColumns.length} columns`);
-    }
-
-    mergeUserSecurityState(currentDb, preservedUserSecurity);
-    mergeUserStationSecurityState(currentDb, preservedUserStations, preservedUserSecurity.map((row) => row.id), preservedStationSecurity);
-    mergeKdsEnabledSetting(currentDb, preservedKdsEnabled);
-    mergeRestoreProtectedSettings(currentDb, preservedProtectedSettings);
-    currentDb.prepare('DELETE FROM kds_pairing_tokens').run();
-    mergeRestoreOutboxState(currentDb, preservedOutboxes);
-    mergeRevocations(currentDb, preservedRevocations);
-    const newForeignKeyViolations = [...getForeignKeyViolationKeys(currentDb)]
-      .filter((key) => !baselineForeignKeyViolations.has(key));
-    if (newForeignKeyViolations.length > 0) {
-      throw new Error(`Restore would introduce ${newForeignKeyViolations.length} new foreign-key violation(s)`);
-    }
-
-    // Commit write transaction before detaching database.
-    throwIfDatabaseMaintenanceAborted(signal);
-    currentDb.exec('COMMIT');
-    inTransaction = false;
-    try {
-      currentDb.exec('DETACH DATABASE _restore_src');
-      attached = false;
-    } catch (detachError: any) {
-      // Reopen connection if detach fails to clean up attachments.
+    const hasSqliteMagic =
+      sourceBytes.length >= 100 && sourceBytes.subarray(0, 16).equals(SQLITE_HEADER_MAGIC);
+    const isWalFormatSource =
+      hasSqliteMagic &&
+      (sourceBytes[18] === 2 || sourceBytes[19] === 2) &&
+      (sourceBytes[18] === 1 || sourceBytes[18] === 2) &&
+      (sourceBytes[19] === 1 || sourceBytes[19] === 2);
+    const writeStagedRestoreSnapshot = (
+      parentDir: string,
+      dirPrefix: string,
+    ): { dir: string; filePath: string } => {
+      let dir: string | null = null;
       try {
-        closeDatabase();
-        initDatabase(false, true);
-        attached = false;
-      } catch (recoveryError: any) {
+        dir = fs.mkdtempSync(path.join(parentDir, dirPrefix));
+        const filePath = path.join(dir, 'source.db');
+        fs.writeFileSync(filePath, sourceBytes, { flag: 'wx', mode: 0o600 });
+        if (hasSqliteMagic) {
+          let probeDb: Database.Database | undefined;
+          try {
+            if (isWalFormatSource) {
+              probeDb = new Database(filePath, { fileMustExist: true });
+              probeDb.pragma('temp_store = MEMORY');
+              probeDb.pragma('journal_mode = DELETE');
+            } else {
+              probeDb = new Database(filePath, { readonly: true, fileMustExist: true });
+              probeDb.pragma('temp_store = MEMORY');
+              probeDb.pragma('schema_version');
+            }
+          } catch (probeError) {
+            if (
+              isShutdownOrMaintenanceAbortError(probeError) ||
+              isSqliteStorageOrOpenError(probeError)
+            ) {
+              throw probeError;
+            }
+          } finally {
+            try {
+              probeDb?.close();
+            } catch {}
+          }
+          for (const suffix of SQLITE_PROBE_SIDECAR_SUFFIXES) {
+            try {
+              if (pathEntryExists(`${filePath}${suffix}`)) {
+                fs.unlinkSync(`${filePath}${suffix}`);
+              }
+            } catch {}
+          }
+        }
+        return { dir, filePath };
+      } catch (writeError) {
+        if (dir) {
+          try {
+            fs.rmSync(dir, { recursive: true, force: true });
+          } catch {}
+        }
+        throw writeError;
+      }
+    };
+    let staged: { dir: string; filePath: string };
+    try {
+      staged = writeStagedRestoreSnapshot(os.tmpdir(), 'flo-restore-source-');
+    } catch (primaryError) {
+      if (
+        isShutdownOrMaintenanceAbortError(primaryError) ||
+        !isSqliteStorageOrOpenError(primaryError)
+      ) {
+        throw primaryError;
+      }
+      const fallbackParentDir = path.dirname(path.resolve(livePath));
+      try {
+        staged = writeStagedRestoreSnapshot(
+          fallbackParentDir,
+          `${INTERNAL_DB_STAGE_DIR_PREFIX}restore-source-`,
+        );
+      } catch (fallbackError) {
+        if (
+          isShutdownOrMaintenanceAbortError(fallbackError) ||
+          !isSqliteStorageOrOpenError(fallbackError)
+        ) {
+          throw fallbackError;
+        }
+        const primaryMessage =
+          primaryError instanceof Error ? primaryError.message : 'unknown error';
+        const fallbackMessage =
+          fallbackError instanceof Error ? fallbackError.message : 'unknown error';
         throw new Error(
-          `Restore committed but source cleanup failed: ${detachError?.message || 'unknown error'}; ` +
-          `database reopen also failed: ${recoveryError?.message || 'unknown error'}`,
+          `Could not stage restore source in system temp (${primaryMessage}) or on the database volume at ${fallbackParentDir} (${fallbackMessage}). Free disk space and try again.`,
+          { cause: fallbackError },
         );
       }
     }
-
-    return {
-      success: true,
-      mode: 'data_only',
-      backupSchemaVersion: backupVersion,
-      currentSchemaVersion: currentVersion,
-      tablesRestored,
-    };
-  } catch (error: any) {
-    let cleanupFailure: unknown = null;
-    if (inTransaction) {
-      try { currentDb.exec('ROLLBACK'); } catch (rollbackError) { cleanupFailure = rollbackError; }
-      inTransaction = false;
-    }
-    if (attached) {
-      try {
-        currentDb.exec('DETACH DATABASE _restore_src');
-        attached = false;
-      } catch (detachError) {
-        cleanupFailure = cleanupFailure || detachError;
-      }
-    }
-    if (cleanupFailure) {
-      try {
-        closeDatabase();
-        initDatabase(false, true);
-        attached = false;
-      } catch (recoveryError: any) {
-        error = new Error(
-          `${error?.message || 'Restore failed'}; cleanup failed: ${cleanupFailure instanceof Error ? cleanupFailure.message : 'unknown error'}; ` +
-          `database reopen failed: ${recoveryError?.message || 'unknown error'}`,
-        );
-      }
-    }
-    throwIfDatabaseMaintenanceAborted(signal);
-    console.error('[DB] dataOnlyRestore failed:', error);
-    return {
-      success: false,
-      mode: 'data_only',
-      backupSchemaVersion: backupVersion,
-      currentSchemaVersion: currentVersion,
-      tablesRestored: 0,
-      error: error?.message || 'Restore failed',
-    };
+    snapshotDir = staged.dir;
+    return { snapshotPath: staged.filePath, cleanup };
+  } catch (error) {
+    cleanup();
+    throw error;
   } finally {
-    if (attached) {
-      try { currentDb.exec('DETACH DATABASE _restore_src'); } catch { }
-    }
     try {
-      getDatabase().pragma(`foreign_keys = ${previousForeignKeys ? 'ON' : 'OFF'}`);
-    } catch { }
+      fs.closeSync(sourceFd);
+    } catch (closeError) {
+      cleanup();
+      throw closeError;
+    }
   }
 }
-
 
 export function getSchemaVersionFromBackup(backupPath: string): number | null {
-  let backupDb: Database.Database | undefined;
   try {
-    backupDb = new Database(backupPath, { readonly: true, fileMustExist: true });
-    const metaRow = backupDb.prepare(`SELECT value FROM _flo_meta WHERE key = 'schema_version'`).get() as { value: string } | undefined;
-    if (!metaRow) return null;
-    const version = Number.parseInt(metaRow.value, 10);
-    return Number.isFinite(version) && version >= 0 ? version : null;
+    return withProbedDatabaseFile(backupPath, (backupDb) => {
+      const hasMetadataTable = backupDb
+        .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '_flo_meta'")
+        .get();
+      const metaRow = hasMetadataTable
+        ? (backupDb.prepare(`SELECT value FROM _flo_meta WHERE key = 'schema_version'`).get() as
+            | { value: string }
+            | undefined)
+        : undefined;
+      if (metaRow) {
+        const version = parseCanonicalSchemaVersion(metaRow.value);
+        return version !== null && version > 0 ? version : null;
+      }
+      const version = Number(backupDb.pragma('user_version', { simple: true }));
+      return Number.isSafeInteger(version) && version > 0 ? version : null;
+    });
   } catch {
     return null;
-  } finally {
-    backupDb?.close();
   }
 }
 
@@ -2202,15 +6922,37 @@ export function getCurrentSchemaVersion(): number {
   return (db ?? getDatabase()).pragma('user_version', { simple: true }) as number;
 }
 
+export function rebuildSearchIndex(targetDb?: Database.Database): void {
+  const target = targetDb || db;
+  if (!target) return;
+  try {
+    const hasOrdersFts = target
+      .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'orders_search_fts'")
+      .get();
+    if (hasOrdersFts) {
+      target.exec("INSERT INTO orders_search_fts(orders_search_fts) VALUES('rebuild')");
+    }
+    const hasCustomersFts = target
+      .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'customers_search_fts'")
+      .get();
+    if (hasCustomersFts) {
+      target.exec("INSERT INTO customers_search_fts(customers_search_fts) VALUES('rebuild')");
+    }
+  } catch (err) {
+    console.warn('[DB] rebuildSearchIndex error:', err);
+  }
+}
+
 /** Builds in-memory database using migration pipeline as ideal schema reference. */
-export function buildIdealSchemaDb(): Database.Database {
+export function buildIdealSchemaDb(targetVersion?: number): Database.Database {
   const idealDb = new Database(':memory:');
+  registerOrderSearchFunctions(idealDb);
   idealDb.pragma('foreign_keys = OFF'); // Off during migrations
   const previousDb = db;
   db = idealDb;
   try {
     buildingIdealSchema = true;
-    runMigrations();
+    runMigrations(targetVersion);
   } finally {
     buildingIdealSchema = false;
     db = previousDb;
@@ -2243,14 +6985,19 @@ export const MIGRATIONS: { version: number; name: string; up: () => void }[] = [
 
       if (!userColumns.includes('pin')) return;
 
-      const usersWithPin = db.prepare('SELECT id, pin FROM users WHERE pin IS NOT NULL').all() as { id: string; pin: string }[];
+      const usersWithPin = db.prepare('SELECT id, pin FROM users WHERE pin IS NOT NULL').all() as {
+        id: string;
+        pin: string;
+      }[];
       for (const user of usersWithPin) {
         const pin = String(user.pin || '');
         if (!pin) continue;
         // Already a bcrypt hash?
         if (pin.startsWith('$2')) continue;
-        db.prepare('UPDATE users SET pin_hash = ?, pin = NULL WHERE id = ?')
-          .run(bcrypt.hashSync(pin, 10), user.id);
+        db.prepare('UPDATE users SET pin_hash = ?, pin = NULL WHERE id = ?').run(
+          bcrypt.hashSync(pin, 10),
+          user.id,
+        );
       }
     },
   },
@@ -2316,7 +7063,9 @@ export const MIGRATIONS: { version: number; name: string; up: () => void }[] = [
     version: 8,
     name: 'add_loyalty_index',
     up: () => {
-      db.exec('CREATE INDEX IF NOT EXISTS idx_loyalty_customer ON loyalty_ledger(customer_id, type)');
+      db.exec(
+        'CREATE INDEX IF NOT EXISTS idx_loyalty_customer ON loyalty_ledger(customer_id, type)',
+      );
     },
   },
   {
@@ -2346,6 +7095,10 @@ export const MIGRATIONS: { version: number; name: string; up: () => void }[] = [
           PRIMARY KEY (name, date)
         )
       `);
+      db.prepare(`
+        INSERT INTO settings (key, value, updated_at) VALUES ('sequence_repair_pending', '1', ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+      `).run(now());
     },
   },
   {
@@ -2500,22 +7253,34 @@ export const MIGRATIONS: { version: number; name: string; up: () => void }[] = [
         db.exec(`ALTER TABLE customers ADD COLUMN country_code TEXT DEFAULT '+91'`);
       }
 
-      const tenantCountryRow = db.prepare("SELECT value FROM settings WHERE key = 'country'").get() as any;
+      const tenantCountryRow = db
+        .prepare("SELECT value FROM settings WHERE key = 'country'")
+        .get() as any;
+      // Deliberate exception to "no India default" (docs/reference/product-invariants.md):
+      // this is a one-time best-effort cleanup of pre-existing customer phone
+      // records on an upgrading install, most of which predate multi-country
+      // support and were Indian. Not a live store's regional identity.
       const tenantCountry = tenantCountryRow?.value || 'IN';
-      
+
       const { parsePhoneE164 } = require('./lib/phone');
 
-      const customers = db.prepare(
-        "SELECT id, phone, country_code FROM customers WHERE phone IS NOT NULL AND phone != ''"
-      ).all() as any[];
+      const customers = db
+        .prepare(
+          "SELECT id, phone, country_code FROM customers WHERE phone IS NOT NULL AND phone != ''",
+        )
+        .all() as any[];
 
-      let normalized = 0, unparseable = 0;
+      let normalized = 0,
+        unparseable = 0;
 
       for (const c of customers) {
         const parsed = parsePhoneE164(c.phone, tenantCountry);
         if (parsed) {
-          db.prepare('UPDATE customers SET phone = ?, country_code = ? WHERE id = ?')
-            .run(parsed.e164, parsed.countryCode, c.id);
+          db.prepare('UPDATE customers SET phone = ?, country_code = ? WHERE id = ?').run(
+            parsed.e164,
+            parsed.countryCode,
+            c.id,
+          );
           normalized++;
         } else {
           console.log(`[MIGRATION v23] unparseable: ${c.id} ${c.phone}`);
@@ -2524,22 +7289,26 @@ export const MIGRATIONS: { version: number; name: string; up: () => void }[] = [
       }
       console.log(`[MIGRATION v23] normalized: ${normalized}, unparseable: ${unparseable}`);
 
-      const dupes = db.prepare(`
+      const dupes = db
+        .prepare(`
         SELECT phone_digits, GROUP_CONCAT(id) as ids, COUNT(*) as cnt
         FROM customers
         WHERE phone_digits IS NOT NULL AND phone_digits != ''
         GROUP BY phone_digits
         HAVING cnt > 1
-      `).all() as any[];
+      `)
+        .all() as any[];
 
       let merged = 0;
 
       for (const group of dupes) {
         const ids = group.ids.split(',').sort();
-        const allRows = db.prepare(
-          `SELECT * FROM customers WHERE id IN (${ids.map(() => '?').join(',')})
-           ORDER BY created_at ASC, id ASC`
-        ).all(...ids) as any[];
+        const allRows = db
+          .prepare(
+            `SELECT * FROM customers WHERE id IN (${ids.map(() => '?').join(',')})
+           ORDER BY created_at ASC, id ASC`,
+          )
+          .all(...ids) as any[];
 
         const winner = allRows[0];
         const losers = allRows.slice(1);
@@ -2560,15 +7329,19 @@ export const MIGRATIONS: { version: number; name: string; up: () => void }[] = [
 
         const fkTables = ['orders', 'bills', 'held_orders', 'loyalty_ledger'];
         for (const table of fkTables) {
-          db.prepare(`UPDATE ${table} SET customer_id = ? WHERE customer_id IN (${losers.map(() => '?').join(',')})`)
-            .run(winner.id, ...losers.map((l: any) => l.id));
+          db.prepare(
+            `UPDATE ${table} SET customer_id = ? WHERE customer_id IN (${losers.map(() => '?').join(',')})`,
+          ).run(winner.id, ...losers.map((l: any) => l.id));
         }
 
         const loserIds = losers.map((l: any) => l.id);
-        db.prepare(`DELETE FROM customers WHERE id IN (${loserIds.map(() => '?').join(',')})`)
-          .run(...loserIds);
+        db.prepare(`DELETE FROM customers WHERE id IN (${loserIds.map(() => '?').join(',')})`).run(
+          ...loserIds,
+        );
 
-        console.log(`[MIGRATION v23] merged ${loserIds.join(',')} → ${winner.id} (phone: ${winner.phone})`);
+        console.log(
+          `[MIGRATION v23] merged ${loserIds.join(',')} → ${winner.id} (phone: ${winner.phone})`,
+        );
         merged += losers.length;
       }
       console.log(`[MIGRATION v23] merged ${merged} duplicate customer(s)`);
@@ -2578,14 +7351,20 @@ export const MIGRATIONS: { version: number; name: string; up: () => void }[] = [
         ON customers(phone_digits)
         WHERE phone_digits IS NOT NULL AND phone_digits != ''
       `);
-      
+
       const total = db.prepare('SELECT COUNT(*) as cnt FROM customers').get() as { cnt: number };
-      const nonE164 = db.prepare(
-        "SELECT COUNT(*) as cnt FROM customers WHERE phone IS NOT NULL AND phone != '' AND phone NOT LIKE '+%'"
-      ).get() as { cnt: number };
-      console.log(`[MIGRATION v23] verification: ${total.cnt} customers, ${nonE164.cnt} still non-E.164`);
+      const nonE164 = db
+        .prepare(
+          "SELECT COUNT(*) as cnt FROM customers WHERE phone IS NOT NULL AND phone != '' AND phone NOT LIKE '+%'",
+        )
+        .get() as { cnt: number };
+      console.log(
+        `[MIGRATION v23] verification: ${total.cnt} customers, ${nonE164.cnt} still non-E.164`,
+      );
       if (nonE164.cnt > 0) {
-        console.warn(`[MIGRATION v23] WARNING: ${nonE164.cnt} customers have unparseable phones (preserved as raw)`);
+        console.warn(
+          `[MIGRATION v23] WARNING: ${nonE164.cnt} customers have unparseable phones (preserved as raw)`,
+        );
       }
     },
   },
@@ -2593,22 +7372,32 @@ export const MIGRATIONS: { version: number; name: string; up: () => void }[] = [
     version: 24,
     name: 'normalize_customer_phones_retry',
     up: () => {
-      const tenantCountryRow = db.prepare("SELECT value FROM settings WHERE key = 'country'").get() as any;
+      const tenantCountryRow = db
+        .prepare("SELECT value FROM settings WHERE key = 'country'")
+        .get() as any;
+      // Same deliberate exception as migration v23 above — historical
+      // customer-data cleanup, not a live store's regional identity.
       const tenantCountry = tenantCountryRow?.value || 'IN';
 
       const { parsePhoneE164 } = require('./lib/phone');
 
-      const customers = db.prepare(
-        "SELECT id, phone, country_code FROM customers WHERE phone IS NOT NULL AND phone != ''"
-      ).all() as any[];
+      const customers = db
+        .prepare(
+          "SELECT id, phone, country_code FROM customers WHERE phone IS NOT NULL AND phone != ''",
+        )
+        .all() as any[];
 
-      let normalized = 0, unparseable = 0;
+      let normalized = 0,
+        unparseable = 0;
 
       for (const c of customers) {
         const parsed = parsePhoneE164(c.phone, tenantCountry);
         if (parsed && parsed.e164 !== c.phone) {
-          db.prepare('UPDATE customers SET phone = ?, country_code = ? WHERE id = ?')
-            .run(parsed.e164, parsed.countryCode, c.id);
+          db.prepare('UPDATE customers SET phone = ?, country_code = ? WHERE id = ?').run(
+            parsed.e164,
+            parsed.countryCode,
+            c.id,
+          );
           normalized++;
         } else if (!parsed) {
           unparseable++;
@@ -2638,11 +7427,14 @@ export const MIGRATIONS: { version: number; name: string; up: () => void }[] = [
         CREATE INDEX IF NOT EXISTS idx_order_item_addons_addon_id ON order_item_addons(addon_id);
       `);
 
-      const rows = db.prepare(
-        `SELECT id, addons, created_at FROM order_items WHERE addons IS NOT NULL AND addons != '' AND addons != 'null'`
-      ).all() as { id: number; addons: string; created_at: string }[];
+      const rows = db
+        .prepare(
+          `SELECT id, addons, created_at FROM order_items WHERE addons IS NOT NULL AND addons != '' AND addons != 'null'`,
+        )
+        .all() as { id: number; addons: string; created_at: string }[];
 
-      let backfilled = 0, skipped = 0;
+      let backfilled = 0,
+        skipped = 0;
       for (const row of rows) {
         let parsed: any;
         try {
@@ -2655,7 +7447,9 @@ export const MIGRATIONS: { version: number; name: string; up: () => void }[] = [
         insertOrderItemAddons(db, row.id, parsed, row.created_at || now());
         backfilled++;
       }
-      console.log(`[MIGRATION v25] backfilled addons for ${backfilled} order items (${skipped} unparseable, skipped)`);
+      console.log(
+        `[MIGRATION v25] backfilled addons for ${backfilled} order items (${skipped} unparseable, skipped)`,
+      );
     },
   },
   {
@@ -2663,7 +7457,7 @@ export const MIGRATIONS: { version: number; name: string; up: () => void }[] = [
     name: 'add_kds_default_view',
     up: () => {
       db.prepare(
-        `INSERT OR IGNORE INTO settings (key, value, updated_at) VALUES ('kds_default_view', 'tabs', ?)`
+        `INSERT OR IGNORE INTO settings (key, value, updated_at) VALUES ('kds_default_view', 'kanban', ?)`,
       ).run(now());
     },
   },
@@ -2674,7 +7468,9 @@ export const MIGRATIONS: { version: number; name: string; up: () => void }[] = [
       // Link kitchen stations to printer rows and assign staff logins to stations.
       const stationColumns = getColumns(db, 'kitchen_stations');
       if (!stationColumns.includes('printer_id')) {
-        db.exec(`ALTER TABLE kitchen_stations ADD COLUMN printer_id TEXT REFERENCES printers(id) ON DELETE SET NULL`);
+        db.exec(
+          `ALTER TABLE kitchen_stations ADD COLUMN printer_id TEXT REFERENCES printers(id) ON DELETE SET NULL`,
+        );
       }
       db.exec(`
         CREATE TABLE IF NOT EXISTS station_users (
@@ -2694,9 +7490,15 @@ export const MIGRATIONS: { version: number; name: string; up: () => void }[] = [
     up: () => {
       // Seed default telemetry settings as disabled for pre-telemetry installs.
       const t = now();
-      db.prepare(`INSERT OR IGNORE INTO settings (key, value, updated_at) VALUES ('anonymous_data_consent', 'false', ?)`).run(t);
-      db.prepare(`INSERT OR IGNORE INTO settings (key, value, updated_at) VALUES ('telemetry_enabled', 'false', ?)`).run(t);
-      db.prepare(`INSERT OR IGNORE INTO settings (key, value, updated_at) VALUES ('telemetry_scope', 'usage_stats,country,app_version,platform,session_duration,feature_usage,error_diagnostics', ?)`).run(t);
+      db.prepare(
+        `INSERT OR IGNORE INTO settings (key, value, updated_at) VALUES ('anonymous_data_consent', 'false', ?)`,
+      ).run(t);
+      db.prepare(
+        `INSERT OR IGNORE INTO settings (key, value, updated_at) VALUES ('telemetry_enabled', 'false', ?)`,
+      ).run(t);
+      db.prepare(
+        `INSERT OR IGNORE INTO settings (key, value, updated_at) VALUES ('telemetry_scope', 'usage_stats,country,app_version,platform,session_duration,feature_usage,error_diagnostics', ?)`,
+      ).run(t);
     },
   },
   {
@@ -2715,11 +7517,13 @@ export const MIGRATIONS: { version: number; name: string; up: () => void }[] = [
       const columns = getColumns(db, 'order_items');
       if (!columns.includes('addons')) return; // already dropped (idempotent re-run)
 
-      const rows = db.prepare(`
+      const rows = db
+        .prepare(`
         SELECT id, addons, created_at FROM order_items
         WHERE addons IS NOT NULL AND addons != '' AND addons != 'null'
           AND NOT EXISTS (SELECT 1 FROM order_item_addons WHERE order_item_id = order_items.id)
-      `).all() as { id: number; addons: string; created_at: string }[];
+      `)
+        .all() as { id: number; addons: string; created_at: string }[];
 
       let backfilled = 0;
       const unrecoverable: number[] = [];
@@ -2735,26 +7539,38 @@ export const MIGRATIONS: { version: number; name: string; up: () => void }[] = [
         insertOrderItemAddons(db, row.id, parsed, row.created_at || now());
         backfilled++;
       }
-      console.log(`[MIGRATION v30] backfilled ${backfilled} order_item(s) still missing a normalized addons snapshot`);
+      console.log(
+        `[MIGRATION v30] backfilled ${backfilled} order_item(s) still missing a normalized addons snapshot`,
+      );
 
       if (unrecoverable.length > 0) {
-        console.warn(`[MIGRATION v30] ${unrecoverable.length} order_item row(s) have unparseable legacy addons JSON (ids: ${unrecoverable.join(', ')}) and could not be migrated. Leaving the addons column in place so this data isn't lost — please review these rows manually.`);
+        console.warn(
+          `[MIGRATION v30] ${unrecoverable.length} order_item row(s) have unparseable legacy addons JSON (ids: ${unrecoverable.join(', ')}) and could not be migrated. Leaving the addons column in place so this data isn't lost — please review these rows manually.`,
+        );
         return;
       }
 
-      const remaining = (db.prepare(`
+      const remaining = (
+        db
+          .prepare(`
         SELECT COUNT(*) as count FROM order_items
         WHERE addons IS NOT NULL AND addons != '' AND addons != 'null'
           AND NOT EXISTS (SELECT 1 FROM order_item_addons WHERE order_item_id = order_items.id)
-      `).get() as { count: number }).count;
+      `)
+          .get() as { count: number }
+      ).count;
 
       if (remaining > 0) {
-        console.warn(`[MIGRATION v30] ${remaining} order_item row(s) still lack a normalized addons snapshot after backfill — skipping the column drop this run.`);
+        console.warn(
+          `[MIGRATION v30] ${remaining} order_item row(s) still lack a normalized addons snapshot after backfill — skipping the column drop this run.`,
+        );
         return;
       }
 
       db.exec('ALTER TABLE order_items DROP COLUMN addons');
-      console.log('[MIGRATION v30] Dropped order_items.addons — order_item_addons is now the only place selected addons live.');
+      console.log(
+        '[MIGRATION v30] Dropped order_items.addons — order_item_addons is now the only place selected addons live.',
+      );
     },
   },
   {
@@ -2890,13 +7706,18 @@ export const MIGRATIONS: { version: number; name: string; up: () => void }[] = [
         const versionId = bundledPackVersionId(pack);
         const packJson = JSON.stringify(pack);
         const installedAt = now();
-        const alreadyInstalled = db.prepare(
-          'SELECT 1 FROM country_pack_versions WHERE id = ?'
-        ).get(versionId);
+        const alreadyInstalled = db
+          .prepare('SELECT 1 FROM country_pack_versions WHERE id = ?')
+          .get(versionId);
 
         insertPack.run(
-          pack.id, pack.publisher, pack.country, pack.jurisdiction,
-          versionId, installedAt, installedAt,
+          pack.id,
+          pack.publisher,
+          pack.country,
+          pack.jurisdiction,
+          versionId,
+          installedAt,
+          installedAt,
         );
         insertVersion.run(
           versionId,
@@ -3026,9 +7847,15 @@ export const MIGRATIONS: { version: number; name: string; up: () => void }[] = [
     up: () => {
       // Seed default telemetry settings as enabled for newly installed systems.
       const t = now();
-      db.prepare(`INSERT OR IGNORE INTO settings (key, value, updated_at) VALUES ('telemetry_enabled', 'true', ?)`).run(t);
-      db.prepare(`INSERT OR IGNORE INTO settings (key, value, updated_at) VALUES ('anonymous_data_consent', 'true', ?)`).run(t);
-      db.prepare(`INSERT OR IGNORE INTO settings (key, value, updated_at) VALUES ('telemetry_scope', 'usage_stats,country,app_version,platform,session_duration,feature_usage,error_diagnostics', ?)`).run(t);
+      db.prepare(
+        `INSERT OR IGNORE INTO settings (key, value, updated_at) VALUES ('telemetry_enabled', 'true', ?)`,
+      ).run(t);
+      db.prepare(
+        `INSERT OR IGNORE INTO settings (key, value, updated_at) VALUES ('anonymous_data_consent', 'true', ?)`,
+      ).run(t);
+      db.prepare(
+        `INSERT OR IGNORE INTO settings (key, value, updated_at) VALUES ('telemetry_scope', 'usage_stats,country,app_version,platform,session_duration,feature_usage,error_diagnostics', ?)`,
+      ).run(t);
     },
   },
   {
@@ -3075,39 +7902,66 @@ export const MIGRATIONS: { version: number; name: string; up: () => void }[] = [
         CREATE INDEX IF NOT EXISTS idx_bills_paid_at ON bills(paid_at);
       `);
       const normalize: [string, string][] = [
-        ['orders', 'created_at'], ['orders', 'updated_at'],
-        ['orders', 'cooking_started_at'], ['orders', 'ready_at'],
-        ['orders', 'served_at'], ['orders', 'completed_at'], ['orders', 'cancelled_at'],
-        ['order_items', 'created_at'], ['order_items', 'updated_at'], ['order_items', 'voided_at'],
-        ['bills', 'created_at'], ['bills', 'updated_at'], ['bills', 'paid_at'], ['bills', 'printed_at'],
-        ['customers', 'created_at'], ['customers', 'updated_at'],
-        ['users', 'created_at'], ['users', 'updated_at'],
-        ['users', 'terms_accepted_at'], ['users', 'tokens_valid_after'],
-        ['loyalty_ledger', 'created_at'], ['loyalty_ledger', 'updated_at'], ['loyalty_ledger', 'expires_at'],
-        ['products', 'created_at'], ['products', 'updated_at'],
-        ['addons', 'created_at'], ['addons', 'updated_at'],
-        ['addon_groups', 'created_at'], ['addon_groups', 'updated_at'],
-        ['tables', 'created_at'], ['tables', 'updated_at'],
+        ['orders', 'created_at'],
+        ['orders', 'updated_at'],
+        ['orders', 'cooking_started_at'],
+        ['orders', 'ready_at'],
+        ['orders', 'served_at'],
+        ['orders', 'completed_at'],
+        ['orders', 'cancelled_at'],
+        ['order_items', 'created_at'],
+        ['order_items', 'updated_at'],
+        ['order_items', 'voided_at'],
+        ['bills', 'created_at'],
+        ['bills', 'updated_at'],
+        ['bills', 'paid_at'],
+        ['bills', 'printed_at'],
+        ['customers', 'created_at'],
+        ['customers', 'updated_at'],
+        ['users', 'created_at'],
+        ['users', 'updated_at'],
+        ['users', 'terms_accepted_at'],
+        ['users', 'tokens_valid_after'],
+        ['loyalty_ledger', 'created_at'],
+        ['loyalty_ledger', 'updated_at'],
+        ['loyalty_ledger', 'expires_at'],
+        ['products', 'created_at'],
+        ['products', 'updated_at'],
+        ['addons', 'created_at'],
+        ['addons', 'updated_at'],
+        ['addon_groups', 'created_at'],
+        ['addon_groups', 'updated_at'],
+        ['tables', 'created_at'],
+        ['tables', 'updated_at'],
         ['settings', 'updated_at'],
         ['print_logs', 'printed_at'],
         ['order_item_addons', 'created_at'],
-        ['whatsapp_messages', 'queued_at'], ['whatsapp_messages', 'seen_at'],
-        ['whatsapp_messages', 'typing_at'], ['whatsapp_messages', 'sent_at'],
-        ['whatsapp_messages', 'delivered_at'], ['whatsapp_messages', 'read_at'],
+        ['whatsapp_messages', 'queued_at'],
+        ['whatsapp_messages', 'seen_at'],
+        ['whatsapp_messages', 'typing_at'],
+        ['whatsapp_messages', 'sent_at'],
+        ['whatsapp_messages', 'delivered_at'],
+        ['whatsapp_messages', 'read_at'],
         ['whatsapp_messages', 'failed_at'],
         ['whatsapp_blocklist', 'blocked_at'],
-        ['held_orders', 'created_at'], ['held_orders', 'updated_at'],
-        ['kds_pairing_tokens', 'expires_at'], ['kds_pairing_tokens', 'created_at'],
+        ['held_orders', 'created_at'],
+        ['held_orders', 'updated_at'],
+        ['kds_pairing_tokens', 'expires_at'],
+        ['kds_pairing_tokens', 'created_at'],
         // Outbox tables: normalize timestamp formats for retry ordering.
-        ['cloud_sync_outbox', 'created_at'], ['cloud_sync_outbox', 'updated_at'], ['cloud_sync_outbox', 'next_attempt_at'],
-        ['support_ticket_outbox', 'created_at'], ['support_ticket_outbox', 'updated_at'],
-        ['support_ticket_outbox', 'next_attempt_at'], ['support_ticket_outbox', 'delivered_at'],
+        ['cloud_sync_outbox', 'created_at'],
+        ['cloud_sync_outbox', 'updated_at'],
+        ['cloud_sync_outbox', 'next_attempt_at'],
+        ['support_ticket_outbox', 'created_at'],
+        ['support_ticket_outbox', 'updated_at'],
+        ['support_ticket_outbox', 'next_attempt_at'],
+        ['support_ticket_outbox', 'delivered_at'],
       ];
       for (const [table, column] of normalize) {
         if (!getColumns(db, table).includes(column)) continue;
         // Strip ISO T delimiter to match standard SQLite timestamps.
         db.prepare(
-          `UPDATE ${table} SET ${column} = substr(REPLACE(${column}, 'T', ' '), 1, 19) WHERE ${column} LIKE '%T%'`
+          `UPDATE ${table} SET ${column} = substr(REPLACE(${column}, 'T', ' '), 1, 19) WHERE ${column} LIKE '%T%'`,
         ).run();
       }
     },
@@ -3117,9 +7971,16 @@ export const MIGRATIONS: { version: number; name: string; up: () => void }[] = [
     name: 'normalize_cloud_enabled_flags_to_01',
     up: () => {
       // Normalize boolean string settings to '0' and '1' for cloud sync flags.
-      const flags = ['cloud_sync_enabled', 'cloud_orders_enabled', 'cloud_reports_enabled', 'cloud_command_polling_enabled'];
+      const flags = [
+        'cloud_sync_enabled',
+        'cloud_orders_enabled',
+        'cloud_reports_enabled',
+        'cloud_command_polling_enabled',
+      ];
       const toOne = db.prepare(`UPDATE settings SET value = '1' WHERE key = ? AND value = 'true'`);
-      const toZero = db.prepare(`UPDATE settings SET value = '0' WHERE key = ? AND value = 'false'`);
+      const toZero = db.prepare(
+        `UPDATE settings SET value = '0' WHERE key = ? AND value = 'false'`,
+      );
       for (const key of flags) {
         toOne.run(key);
         toZero.run(key);
@@ -3140,11 +8001,18 @@ export const MIGRATIONS: { version: number; name: string; up: () => void }[] = [
     up: () => {
       // Deactivate bundled demo accounts if passwords were never changed.
       const changedAt = now();
-      const demoUsers = db.prepare(`SELECT id, password FROM users WHERE id IN ('user-demo-manager', 'user-demo-cashier', 'user-demo-chef')`).all() as { id: string; password: string }[];
-      const deactivate = db.prepare('UPDATE users SET is_active = 0, tokens_valid_after = ?, updated_at = ? WHERE id = ?');
+      const demoUsers = db
+        .prepare(
+          `SELECT id, password FROM users WHERE id IN ('user-demo-manager', 'user-demo-cashier', 'user-demo-chef')`,
+        )
+        .all() as { id: string; password: string }[];
+      const deactivate = db.prepare(
+        'UPDATE users SET is_active = 0, tokens_valid_after = ?, updated_at = ? WHERE id = ?',
+      );
       for (const user of demoUsers) {
         try {
-          if (bcrypt.compareSync('demo12345', user.password)) deactivate.run(changedAt, changedAt, user.id);
+          if (bcrypt.compareSync('demo12345', user.password))
+            deactivate.run(changedAt, changedAt, user.id);
         } catch {
           // Skip corrupt hashes without failing migration.
           console.warn(`[DB] Could not inspect demo credential for ${user.id}`);
@@ -3181,9 +8049,15 @@ export const MIGRATIONS: { version: number; name: string; up: () => void }[] = [
           detected_at TEXT NOT NULL
         );
       `);
-      const rows = db.prepare('SELECT id, payment_details FROM bills WHERE payment_details IS NOT NULL').all() as { id: string; payment_details: string }[];
-      const insert = db.prepare('INSERT OR IGNORE INTO payment_transaction_refs (method, transaction_id, bill_id, created_at) VALUES (?, ?, ?, ?)');
-      const conflictInsert = db.prepare('INSERT INTO payment_transaction_ref_conflicts (method, transaction_id, bill_id, created_at, detected_at) VALUES (?, ?, ?, ?, ?)');
+      const rows = db
+        .prepare('SELECT id, payment_details FROM bills WHERE payment_details IS NOT NULL')
+        .all() as { id: string; payment_details: string }[];
+      const insert = db.prepare(
+        'INSERT OR IGNORE INTO payment_transaction_refs (method, transaction_id, bill_id, created_at) VALUES (?, ?, ?, ?)',
+      );
+      const conflictInsert = db.prepare(
+        'INSERT INTO payment_transaction_ref_conflicts (method, transaction_id, bill_id, created_at, detected_at) VALUES (?, ?, ?, ?, ?)',
+      );
       const seenRefs = new Map<string, { billId: string; createdAt: string }>();
       const detectedAt = now();
       for (const row of rows) {
@@ -3191,11 +8065,23 @@ export const MIGRATIONS: { version: number; name: string; up: () => void }[] = [
           const parsed = JSON.parse(row.payment_details);
           const payments = Array.isArray(parsed) ? parsed : [parsed];
           for (const payment of payments) {
-            if (payment && typeof payment.method === 'string' && typeof payment.transaction_id === 'string' && payment.transaction_id.trim() !== '') {
+            if (
+              payment &&
+              typeof payment.method === 'string' &&
+              typeof payment.transaction_id === 'string' &&
+              payment.transaction_id.trim() !== ''
+            ) {
               const createdAt = payment.timestamp || detectedAt;
               const key = `${payment.method}\u0000${payment.transaction_id}`;
               const previous = seenRefs.get(key);
-              if (previous && previous.billId !== row.id) conflictInsert.run(payment.method, payment.transaction_id, row.id, previous.createdAt, detectedAt);
+              if (previous && previous.billId !== row.id)
+                conflictInsert.run(
+                  payment.method,
+                  payment.transaction_id,
+                  row.id,
+                  previous.createdAt,
+                  detectedAt,
+                );
               else seenRefs.set(key, { billId: row.id, createdAt });
               insert.run(payment.method, payment.transaction_id, row.id, createdAt);
             }
@@ -3234,20 +8120,23 @@ export const MIGRATIONS: { version: number; name: string; up: () => void }[] = [
           detected_at TEXT NOT NULL
         );
       `);
-      const duplicateRows = db.prepare(`
+      const duplicateRows = db
+        .prepare(`
         SELECT method, transaction_id, bill_id, created_at
         FROM payment_transaction_refs
         WHERE transaction_id IN (
           SELECT transaction_id FROM payment_transaction_refs
           GROUP BY transaction_id HAVING COUNT(*) > 1
         )
-      `).all() as { method: string; transaction_id: string; bill_id: string; created_at: string }[];
+      `)
+        .all() as { method: string; transaction_id: string; bill_id: string; created_at: string }[];
       const recordConflict = db.prepare(`
         INSERT INTO payment_transaction_ref_conflicts (method, transaction_id, bill_id, created_at, detected_at)
         VALUES (?, ?, ?, ?, ?)
       `);
       const detectedAt = now();
-      for (const row of duplicateRows) recordConflict.run(row.method, row.transaction_id, row.bill_id, row.created_at, detectedAt);
+      for (const row of duplicateRows)
+        recordConflict.run(row.method, row.transaction_id, row.bill_id, row.created_at, detectedAt);
       db.exec(`
         CREATE TABLE payment_transaction_refs_global (
           transaction_id TEXT PRIMARY KEY,
@@ -3291,25 +8180,47 @@ export const MIGRATIONS: { version: number; name: string; up: () => void }[] = [
           (method, transaction_id, bill_id, created_at)
         VALUES (?, ?, ?, ?)
       `);
-      const findRef = db.prepare('SELECT bill_id, created_at FROM payment_transaction_refs_method WHERE method = ? AND transaction_id = ?');
+      const findRef = db.prepare(
+        'SELECT bill_id, created_at FROM payment_transaction_refs_method WHERE method = ? AND transaction_id = ?',
+      );
       const addRef = (method: string, transactionId: string, billId: string, createdAt: string) => {
-        const existing = findRef.get(method, transactionId) as { bill_id: string; created_at: string } | undefined;
+        const existing = findRef.get(method, transactionId) as
+          | { bill_id: string; created_at: string }
+          | undefined;
         if (existing && String(existing.bill_id) !== String(billId)) {
           recordConflict.run(method, transactionId, billId, createdAt, detectedAt);
           return;
         }
         insertRef.run(method, transactionId, billId, createdAt);
       };
-      const existingRefs = db.prepare('SELECT method, transaction_id, bill_id, created_at FROM payment_transaction_refs').all() as { method: string; transaction_id: string; bill_id: string; created_at: string }[];
-      for (const ref of existingRefs) addRef(ref.method, ref.transaction_id, ref.bill_id, ref.created_at);
-      const rows = db.prepare('SELECT id, payment_details FROM bills WHERE payment_details IS NOT NULL ORDER BY id').all() as { id: string; payment_details: string }[];
+      const existingRefs = db
+        .prepare('SELECT method, transaction_id, bill_id, created_at FROM payment_transaction_refs')
+        .all() as { method: string; transaction_id: string; bill_id: string; created_at: string }[];
+      for (const ref of existingRefs)
+        addRef(ref.method, ref.transaction_id, ref.bill_id, ref.created_at);
+      const rows = db
+        .prepare(
+          'SELECT id, payment_details FROM bills WHERE payment_details IS NOT NULL ORDER BY id',
+        )
+        .all() as { id: string; payment_details: string }[];
       for (const row of rows) {
         try {
           const parsed = JSON.parse(row.payment_details);
           const payments = Array.isArray(parsed) ? parsed : [parsed];
           for (const payment of payments) {
-            if (!payment || typeof payment.method !== 'string' || typeof payment.transaction_id !== 'string' || payment.transaction_id.trim() === '') continue;
-            addRef(payment.method, payment.transaction_id, String(row.id), payment.timestamp || detectedAt);
+            if (
+              !payment ||
+              typeof payment.method !== 'string' ||
+              typeof payment.transaction_id !== 'string' ||
+              payment.transaction_id.trim() === ''
+            )
+              continue;
+            addRef(
+              payment.method,
+              payment.transaction_id,
+              String(row.id),
+              payment.timestamp || detectedAt,
+            );
           }
         } catch {
           // Invalid legacy JSON remains recoverable by the settlement path.
@@ -3345,19 +8256,45 @@ export const MIGRATIONS: { version: number; name: string; up: () => void }[] = [
           PRIMARY KEY (user_id, idempotency_key)
         );
       `);
-      const paymentRows = db.prepare(`
+      const paymentRows = db
+        .prepare(`
         SELECT p.idempotency_key, p.bill_id, p.request_hash, p.response_json, p.created_at,
                'legacy' AS user_id
         FROM payment_idempotency p
-      `).all() as { idempotency_key: string; bill_id: string; request_hash: string; response_json: string; created_at: string; user_id: string }[];
+      `)
+        .all() as {
+        idempotency_key: string;
+        bill_id: string;
+        request_hash: string;
+        response_json: string;
+        created_at: string;
+        user_id: string;
+      }[];
       const insertPayment = db.prepare(`
         INSERT INTO payment_idempotency_scoped
           (user_id, idempotency_key, bill_id, request_hash, response_json, created_at)
         VALUES (?, ?, ?, ?, ?, ?)
       `);
-      for (const row of paymentRows) insertPayment.run(row.user_id || 'legacy', row.idempotency_key, row.bill_id, row.request_hash, row.response_json, row.created_at);
+      for (const row of paymentRows)
+        insertPayment.run(
+          row.user_id || 'legacy',
+          row.idempotency_key,
+          row.bill_id,
+          row.request_hash,
+          row.response_json,
+          row.created_at,
+        );
 
-      const orderRows = db.prepare('SELECT idempotency_key, request_hash, response_json, created_at FROM order_idempotency').all() as { idempotency_key: string; request_hash: string; response_json: string; created_at: string }[];
+      const orderRows = db
+        .prepare(
+          'SELECT idempotency_key, request_hash, response_json, created_at FROM order_idempotency',
+        )
+        .all() as {
+        idempotency_key: string;
+        request_hash: string;
+        response_json: string;
+        created_at: string;
+      }[];
       const insertOrder = db.prepare(`
         INSERT INTO order_idempotency_scoped
           (user_id, idempotency_key, request_hash, response_json, created_at)
@@ -3371,7 +8308,13 @@ export const MIGRATIONS: { version: number; name: string; up: () => void }[] = [
         } catch {
           // Keep the compatibility owner for malformed historical responses.
         }
-        insertOrder.run(userId, row.idempotency_key, row.request_hash, row.response_json, row.created_at);
+        insertOrder.run(
+          userId,
+          row.idempotency_key,
+          row.request_hash,
+          row.response_json,
+          row.created_at,
+        );
       }
       db.exec(`
         DROP TABLE payment_idempotency;
@@ -3387,14 +8330,16 @@ export const MIGRATIONS: { version: number; name: string; up: () => void }[] = [
     name: 'repair_retry_ownership_and_payment_reference_history',
     up: () => {
       // Backfill user ownership on legacy payment idempotency rows.
-      const paymentRows = db.prepare(`
+      const paymentRows = db
+        .prepare(`
         SELECT p.idempotency_key,
                CAST(o.user_id AS TEXT) AS user_id
         FROM payment_idempotency p
         JOIN bills b ON b.id = p.bill_id
         JOIN orders o ON o.id = b.order_id
         WHERE p.user_id = 'legacy' AND o.user_id IS NOT NULL
-      `).all() as { idempotency_key: string; user_id: string }[];
+      `)
+        .all() as { idempotency_key: string; user_id: string }[];
       const updatePayment = db.prepare(`
         UPDATE payment_idempotency SET user_id = ?
         WHERE user_id = 'legacy' AND idempotency_key = ?
@@ -3406,11 +8351,13 @@ export const MIGRATIONS: { version: number; name: string; up: () => void }[] = [
       `);
       for (const row of paymentRows) updatePayment.run(row.user_id, row.idempotency_key);
 
-      const orderRows = db.prepare(`
+      const orderRows = db
+        .prepare(`
         SELECT idempotency_key, response_json
         FROM order_idempotency
         WHERE user_id = 'legacy'
-      `).all() as { idempotency_key: string; response_json: string }[];
+      `)
+        .all() as { idempotency_key: string; response_json: string }[];
       const updateOrder = db.prepare(`
         UPDATE order_idempotency SET user_id = ?
         WHERE user_id = 'legacy' AND idempotency_key = ?
@@ -3423,15 +8370,22 @@ export const MIGRATIONS: { version: number; name: string; up: () => void }[] = [
       for (const row of orderRows) {
         try {
           const response = JSON.parse(row.response_json);
-          if (response?.order?.user_id != null) updateOrder.run(String(response.order.user_id), row.idempotency_key);
+          if (response?.order?.user_id != null)
+            updateOrder.run(String(response.order.user_id), row.idempotency_key);
         } catch {
           // Leave malformed historical responses under the compatibility owner.
         }
       }
 
       // Reconstruct method-scoped references from all bill records.
-      const existingRefs = db.prepare('SELECT method, transaction_id, bill_id, created_at FROM payment_transaction_refs').all() as { method: string; transaction_id: string; bill_id: string; created_at: string }[];
-      const rows = db.prepare('SELECT id, payment_details FROM bills WHERE payment_details IS NOT NULL ORDER BY id').all() as { id: string; payment_details: string }[];
+      const existingRefs = db
+        .prepare('SELECT method, transaction_id, bill_id, created_at FROM payment_transaction_refs')
+        .all() as { method: string; transaction_id: string; bill_id: string; created_at: string }[];
+      const rows = db
+        .prepare(
+          'SELECT id, payment_details FROM bills WHERE payment_details IS NOT NULL ORDER BY id',
+        )
+        .all() as { id: string; payment_details: string }[];
       db.exec(`
         CREATE TABLE payment_transaction_refs_repaired (
           method TEXT NOT NULL,
@@ -3446,7 +8400,9 @@ export const MIGRATIONS: { version: number; name: string; up: () => void }[] = [
           (method, transaction_id, bill_id, created_at)
         VALUES (?, ?, ?, ?)
       `);
-      const findRef = db.prepare('SELECT bill_id FROM payment_transaction_refs_repaired WHERE method = ? AND transaction_id = ?');
+      const findRef = db.prepare(
+        'SELECT bill_id FROM payment_transaction_refs_repaired WHERE method = ? AND transaction_id = ?',
+      );
       const recordConflict = db.prepare(`
         INSERT INTO payment_transaction_ref_conflicts
           (method, transaction_id, bill_id, created_at, detected_at)
@@ -3461,14 +8417,26 @@ export const MIGRATIONS: { version: number; name: string; up: () => void }[] = [
         }
         insertRef.run(method, transactionId, billId, createdAt);
       };
-      for (const ref of existingRefs) addRef(ref.method, ref.transaction_id, ref.bill_id, ref.created_at);
+      for (const ref of existingRefs)
+        addRef(ref.method, ref.transaction_id, ref.bill_id, ref.created_at);
       for (const row of rows) {
         try {
           const parsed = JSON.parse(row.payment_details);
           const payments = Array.isArray(parsed) ? parsed : [parsed];
           for (const payment of payments) {
-            if (!payment || typeof payment.method !== 'string' || typeof payment.transaction_id !== 'string' || payment.transaction_id.trim() === '') continue;
-            addRef(payment.method, payment.transaction_id, String(row.id), payment.timestamp || detectedAt);
+            if (
+              !payment ||
+              typeof payment.method !== 'string' ||
+              typeof payment.transaction_id !== 'string' ||
+              payment.transaction_id.trim() === ''
+            )
+              continue;
+            addRef(
+              payment.method,
+              payment.transaction_id,
+              String(row.id),
+              payment.timestamp || detectedAt,
+            );
           }
         } catch {
           // Invalid legacy JSON remains recoverable by the settlement path.
@@ -3501,9 +8469,13 @@ export const MIGRATIONS: { version: number; name: string; up: () => void }[] = [
     name: 'persist_station_assignment_scope',
     up: () => {
       if (!getColumns(db, 'users').includes('station_assignments_configured')) {
-        db.exec(`ALTER TABLE users ADD COLUMN station_assignments_configured INTEGER NOT NULL DEFAULT 0`);
+        db.exec(
+          `ALTER TABLE users ADD COLUMN station_assignments_configured INTEGER NOT NULL DEFAULT 0`,
+        );
       }
-      db.exec(`UPDATE users SET station_assignments_configured = 1 WHERE EXISTS (SELECT 1 FROM station_users WHERE station_users.user_id = users.id)`);
+      db.exec(
+        `UPDATE users SET station_assignments_configured = 1 WHERE EXISTS (SELECT 1 FROM station_users WHERE station_users.user_id = users.id)`,
+      );
     },
   },
   {
@@ -3512,9 +8484,13 @@ export const MIGRATIONS: { version: number; name: string; up: () => void }[] = [
     up: () => {
       // Copy tax identification number settings forward to generic keys.
       const copyIfPresent = (oldKey: string, newKey: string) => {
-        const existing = db.prepare('SELECT value FROM settings WHERE key = ?').get(oldKey) as { value: string } | undefined;
+        const existing = db.prepare('SELECT value FROM settings WHERE key = ?').get(oldKey) as
+          | { value: string }
+          | undefined;
         if (existing) {
-          db.prepare('INSERT OR IGNORE INTO settings (key, value, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)').run(newKey, existing.value);
+          db.prepare(
+            'INSERT OR IGNORE INTO settings (key, value, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)',
+          ).run(newKey, existing.value);
         }
       };
       copyIfPresent('gstin', 'tax_registration_number');
@@ -3545,22 +8521,37 @@ export const MIGRATIONS: { version: number; name: string; up: () => void }[] = [
       `);
 
       // Preserve UPI payment method for upgrading stores that have used it previously.
-      const legacyUpi = db.prepare(`
+      const legacyUpi = db
+        .prepare(`
         SELECT 1 FROM bills b, json_each(CASE
           WHEN json_valid(b.payment_details) AND json_type(b.payment_details) = 'array' THEN b.payment_details
           WHEN json_valid(b.payment_details) THEN json_array(b.payment_details)
           ELSE '[]' END) je
         WHERE lower(json_extract(je.value, '$.method')) = 'upi' LIMIT 1
-      `).get();
+      `)
+        .get();
       if (legacyUpi) {
-        db.prepare(`INSERT OR IGNORE INTO payment_methods (name, is_active, sort_order, created_at, updated_at) VALUES ('UPI', 1, 10, ?, ?)`)
-          .run(now(), now());
-        const upiId = Number((db.prepare(`SELECT id FROM payment_methods WHERE name = 'UPI' COLLATE NOCASE`).get() as { id: number }).id);
-        const rows = db.prepare('SELECT id, payment_details FROM bills WHERE payment_details IS NOT NULL').all() as any[];
+        db.prepare(
+          `INSERT OR IGNORE INTO payment_methods (name, is_active, sort_order, created_at, updated_at) VALUES ('UPI', 1, 10, ?, ?)`,
+        ).run(now(), now());
+        const upiId = Number(
+          (
+            db
+              .prepare(`SELECT id FROM payment_methods WHERE name = 'UPI' COLLATE NOCASE`)
+              .get() as { id: number }
+          ).id,
+        );
+        const rows = db
+          .prepare('SELECT id, payment_details FROM bills WHERE payment_details IS NOT NULL')
+          .all() as any[];
         const update = db.prepare('UPDATE bills SET payment_details = ? WHERE id = ?');
         for (const row of rows) {
           let parsed: any;
-          try { parsed = JSON.parse(row.payment_details); } catch { continue; }
+          try {
+            parsed = JSON.parse(row.payment_details);
+          } catch {
+            continue;
+          }
           const lines = Array.isArray(parsed) ? parsed : [parsed];
           let changed = false;
           for (const line of lines) {
@@ -3579,8 +8570,10 @@ export const MIGRATIONS: { version: number; name: string; up: () => void }[] = [
     version: 59,
     name: 'split_checks_by_item_quantity',
     up: () => {
-      if (!getColumns(db, 'bills').includes('split_group_id')) db.exec('ALTER TABLE bills ADD COLUMN split_group_id TEXT');
-      if (!getColumns(db, 'bills').includes('split_label')) db.exec('ALTER TABLE bills ADD COLUMN split_label TEXT');
+      if (!getColumns(db, 'bills').includes('split_group_id'))
+        db.exec('ALTER TABLE bills ADD COLUMN split_group_id TEXT');
+      if (!getColumns(db, 'bills').includes('split_label'))
+        db.exec('ALTER TABLE bills ADD COLUMN split_label TEXT');
       db.exec(`
         CREATE TABLE IF NOT EXISTS bill_items (
           bill_id INTEGER NOT NULL,
@@ -3687,7 +8680,9 @@ export const MIGRATIONS: { version: number; name: string; up: () => void }[] = [
     name: 'persist_order_item_inventory_deductions',
     up: () => {
       if (!getColumns(db, 'order_items').includes('inventory_deducted_quantity')) {
-        db.exec(`ALTER TABLE order_items ADD COLUMN inventory_deducted_quantity REAL NOT NULL DEFAULT 0`);
+        db.exec(
+          `ALTER TABLE order_items ADD COLUMN inventory_deducted_quantity REAL NOT NULL DEFAULT 0`,
+        );
       }
       db.prepare(`
         UPDATE order_items
@@ -3819,13 +8814,17 @@ export const MIGRATIONS: { version: number; name: string; up: () => void }[] = [
       `);
 
       // Migrate bill_template string setting to structured JSON identity format.
-      const current = db.prepare("SELECT value FROM settings WHERE key = 'bill_template'").get() as { value: string } | undefined;
+      const current = db.prepare("SELECT value FROM settings WHERE key = 'bill_template'").get() as
+        | { value: string }
+        | undefined;
       const rawValue = typeof current?.value === 'string' ? current.value.trim() : '';
       if (rawValue.length > 0 && !(rawValue.startsWith('{') && rawValue.endsWith('}'))) {
         let upgraded: string | null = null;
         if (['classic', 'compact'].includes(rawValue.toLowerCase())) {
           upgraded = JSON.stringify({ source: 'core', id: rawValue.toLowerCase() });
-        } else if (db.prepare('SELECT 1 FROM installed_print_templates WHERE template_id = ?').get(rawValue)) {
+        } else if (
+          db.prepare('SELECT 1 FROM installed_print_templates WHERE template_id = ?').get(rawValue)
+        ) {
           upgraded = JSON.stringify({ source: 'pack', id: rawValue });
         }
         if (upgraded) {
@@ -3842,13 +8841,24 @@ export const MIGRATIONS: { version: number; name: string; up: () => void }[] = [
     name: 'normalize_merchant_template_payloads',
     up: () => {
       // Normalize merchant template payloads to canonical serialization and update checksums.
-      const rows = db.prepare(`
+      const rows = db
+        .prepare(`
         SELECT id, payload_json, previous_payload_json, checksum
         FROM merchant_print_templates
-      `).all() as { id: string; payload_json: string; previous_payload_json: string | null; checksum: string }[];
+      `)
+        .all() as {
+        id: string;
+        payload_json: string;
+        previous_payload_json: string | null;
+        checksum: string;
+      }[];
       let normalized = 0;
       for (const row of rows) {
-        if (crypto.createHash('sha256').update(row.payload_json, 'utf8').digest('hex') !== row.checksum) continue;
+        if (
+          crypto.createHash('sha256').update(row.payload_json, 'utf8').digest('hex') !==
+          row.checksum
+        )
+          continue;
         const validation = validateMerchantTemplateText(row.payload_json);
         if (!validation.ok) continue;
         const payloadJson = serializeMerchantTemplatePayload(validation.payload);
@@ -3859,7 +8869,8 @@ export const MIGRATIONS: { version: number; name: string; up: () => void }[] = [
             previousPayloadJson = serializeMerchantTemplatePayload(previousValidation.payload);
           }
         }
-        if (payloadJson === row.payload_json && previousPayloadJson === row.previous_payload_json) continue;
+        if (payloadJson === row.payload_json && previousPayloadJson === row.previous_payload_json)
+          continue;
         db.prepare(`
           UPDATE merchant_print_templates
           SET payload_json = ?, previous_payload_json = ?, checksum = ?
@@ -3872,7 +8883,9 @@ export const MIGRATIONS: { version: number; name: string; up: () => void }[] = [
         );
         normalized++;
       }
-      console.log(`[MIGRATION v73] normalized ${normalized} merchant template payload(s); ${rows.length - normalized} already canonical or left untouched`);
+      console.log(
+        `[MIGRATION v73] normalized ${normalized} merchant template payload(s); ${rows.length - normalized} already canonical or left untouched`,
+      );
     },
   },
   {
@@ -3894,7 +8907,9 @@ export const MIGRATIONS: { version: number; name: string; up: () => void }[] = [
     name: 'add_printer_cash_drawer_pulse',
     up: () => {
       if (!getColumns(db, 'printers').includes('cash_drawer_pulse_enabled')) {
-        db.exec(`ALTER TABLE printers ADD COLUMN cash_drawer_pulse_enabled INTEGER NOT NULL DEFAULT 0`);
+        db.exec(
+          `ALTER TABLE printers ADD COLUMN cash_drawer_pulse_enabled INTEGER NOT NULL DEFAULT 0`,
+        );
       }
     },
   },
@@ -3940,13 +8955,19 @@ export const MIGRATIONS: { version: number; name: string; up: () => void }[] = [
       const columns = db.prepare(`PRAGMA table_info(products)`).all() as Array<{ name: string }>;
       const hasColumn = (name: string) => columns.some((column) => column.name === name);
       if (!hasColumn('sale_unit')) {
-        db.exec(`ALTER TABLE products ADD COLUMN sale_unit TEXT NOT NULL DEFAULT 'each' CHECK (sale_unit IN ('each', 'kg', 'g', 'lb'))`);
+        db.exec(
+          `ALTER TABLE products ADD COLUMN sale_unit TEXT NOT NULL DEFAULT 'each' CHECK (sale_unit IN ('each', 'kg', 'g', 'lb'))`,
+        );
       }
       if (!hasColumn('allow_fractional_quantity')) {
-        db.exec(`ALTER TABLE products ADD COLUMN allow_fractional_quantity INTEGER NOT NULL DEFAULT 0`);
+        db.exec(
+          `ALTER TABLE products ADD COLUMN allow_fractional_quantity INTEGER NOT NULL DEFAULT 0`,
+        );
       }
       if (!hasColumn('weight_precision')) {
-        db.exec(`ALTER TABLE products ADD COLUMN weight_precision INTEGER NOT NULL DEFAULT 3 CHECK (weight_precision BETWEEN 0 AND 4)`);
+        db.exec(
+          `ALTER TABLE products ADD COLUMN weight_precision INTEGER NOT NULL DEFAULT 3 CHECK (weight_precision BETWEEN 0 AND 4)`,
+        );
       }
     },
   },
@@ -3986,12 +9007,14 @@ export const MIGRATIONS: { version: number; name: string; up: () => void }[] = [
       const columns = getColumns(db, 'printers');
       if (!columns.includes('cash_drawer_pulse_enabled')) return;
       // Mirror default receipt printer selection when migrating setting.
-      const receiptPrinter = db.prepare(`
+      const receiptPrinter = db
+        .prepare(`
         SELECT cash_drawer_pulse_enabled FROM printers
         WHERE connection_type != 'webusb'
         ORDER BY is_default DESC, name
         LIMIT 1
-      `).get() as { cash_drawer_pulse_enabled?: number } | undefined;
+      `)
+        .get() as { cash_drawer_pulse_enabled?: number } | undefined;
       if (receiptPrinter?.cash_drawer_pulse_enabled === 1) {
         db.prepare(`
           INSERT OR IGNORE INTO settings (key, value, updated_at)
@@ -4046,7 +9069,7 @@ export const MIGRATIONS: { version: number; name: string; up: () => void }[] = [
     version: 82,
     name: 'add_order_audit_log',
     up: () => {
-      // Append-only actor log for order/item mutations (docs/business-decisions.md).
+      // Append-only actor log for order/item mutations (docs/reference/product-invariants.md).
       db.exec(`
         CREATE TABLE IF NOT EXISTS order_audit_log (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -4094,7 +9117,9 @@ export const MIGRATIONS: { version: number; name: string; up: () => void }[] = [
           WHERE movement_type = 'opening_float' AND voided_at IS NULL;
       `);
       const columns = new Set(
-        (db.prepare(`PRAGMA table_info(cash_closures)`).all() as { name: string }[]).map((column) => column.name),
+        (db.prepare(`PRAGMA table_info(cash_closures)`).all() as { name: string }[]).map(
+          (column) => column.name,
+        ),
       );
       const addColumn = (name: string, definition: string) => {
         if (!columns.has(name)) {
@@ -4106,6 +9131,1266 @@ export const MIGRATIONS: { version: number; name: string; up: () => void }[] = [
       addColumn('pay_out_cents', 'pay_out_cents INTEGER NOT NULL DEFAULT 0');
       addColumn('safe_drop_cents', 'safe_drop_cents INTEGER NOT NULL DEFAULT 0');
       addColumn('cash_movements_json', "cash_movements_json TEXT NOT NULL DEFAULT '[]'");
+    },
+  },
+  {
+    version: 85,
+    name: 'add_inventory_movements',
+    up: () => {
+      const negativeStockedProduct = db
+        .prepare(`
+        SELECT id, stock_quantity
+        FROM products
+        WHERE stock_quantity < 0
+        ORDER BY id
+        LIMIT 1
+      `)
+        .get() as { id: string; stock_quantity: number } | undefined;
+      if (negativeStockedProduct) {
+        throw new Error(
+          `Cannot migrate inventory movements while product ${negativeStockedProduct.id} has negative stock_quantity (${negativeStockedProduct.stock_quantity}). Correct the stock quantity and retry the migration.`,
+        );
+      }
+
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS inventory_movements (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          product_id TEXT NOT NULL REFERENCES products(id),
+          quantity_delta REAL NOT NULL CHECK (quantity_delta <> 0),
+          movement_type TEXT NOT NULL CHECK (movement_type IN ('sale', 'cancel_restore', 'adjustment')),
+          reference_type TEXT,
+          reference_id TEXT,
+          reason TEXT,
+          actor_user_id TEXT NOT NULL REFERENCES users(id),
+          stock_after REAL NOT NULL,
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE INDEX IF NOT EXISTS idx_inventory_movements_product_created
+          ON inventory_movements(product_id, created_at, id);
+        CREATE INDEX IF NOT EXISTS idx_inventory_movements_reference
+          ON inventory_movements(reference_type, reference_id);
+        CREATE INDEX IF NOT EXISTS idx_inventory_movements_created
+          ON inventory_movements(created_at, id);
+      `);
+
+      const stockedProducts = db
+        .prepare(`
+        SELECT id, stock_quantity
+        FROM products
+        WHERE COALESCE(stock_quantity, 0) <> 0
+        ORDER BY id
+      `)
+        .all() as { id: string; stock_quantity: number }[];
+      if (stockedProducts.length === 0) return;
+
+      const actor = db
+        .prepare(`
+        SELECT id
+        FROM users
+        ORDER BY CASE WHEN role = 'owner' THEN 0 ELSE 1 END, created_at, id
+        LIMIT 1
+      `)
+        .get() as { id: string } | undefined;
+      if (!actor)
+        throw new Error('Cannot backfill inventory movements without an existing staff actor');
+
+      const createdAt = now();
+      const insertOpeningMovement = db.prepare(`
+        INSERT INTO inventory_movements (
+          product_id, quantity_delta, movement_type, reference_type, reference_id,
+          reason, actor_user_id, stock_after, created_at
+        ) VALUES (?, ?, 'adjustment', 'opening_balance', ?, ?, ?, ?, ?)
+      `);
+      for (const product of stockedProducts) {
+        insertOpeningMovement.run(
+          product.id,
+          product.stock_quantity,
+          product.id,
+          'Opening balance migrated to inventory ledger',
+          actor.id,
+          product.stock_quantity,
+          createdAt,
+        );
+      }
+    },
+  },
+  {
+    version: 86,
+    name: 'add_inventory_import_provenance',
+    up: () => {
+      const columns = new Set(
+        (db.prepare('PRAGMA table_info(inventory_movements)').all() as { name: string }[]).map(
+          (column) => column.name,
+        ),
+      );
+      const addColumn = (name: string, definition: string) => {
+        if (!columns.has(name)) {
+          db.exec(`ALTER TABLE inventory_movements ADD COLUMN ${definition}`);
+          columns.add(name);
+        }
+      };
+      addColumn('imported_by_user_id', 'imported_by_user_id TEXT REFERENCES users(id)');
+      addColumn('import_batch_id', 'import_batch_id TEXT');
+      addColumn('source_actor_user_id', 'source_actor_user_id TEXT');
+      addColumn('source_reference_type', 'source_reference_type TEXT');
+      addColumn('source_reference_id', 'source_reference_id TEXT');
+      addColumn('source_reason', 'source_reason TEXT');
+      addColumn('source_created_at', 'source_created_at TEXT');
+    },
+  },
+  {
+    version: 87,
+    name: 'add_volume_units_and_inventory_links',
+    up: () => {
+      const productColumns = getColumns(db, 'products');
+      const needsRebuild =
+        !productColumns.includes('inventory_product_id') ||
+        !productColumns.includes('inventory_deduction_quantity');
+      const saleUnitSql = db
+        .prepare(`
+        SELECT sql FROM sqlite_master
+        WHERE type = 'table' AND name = 'products'
+      `)
+        .get() as { sql: string } | undefined;
+      const needsWideSaleUnit = !!saleUnitSql && !/sale_unit[^)]*'ml'/.test(saleUnitSql.sql);
+
+      if (needsRebuild || needsWideSaleUnit) {
+        // SQLite cannot ALTER a column CHECK constraint; rebuild products with
+        // volume units and the 1-to-1 inventory-link columns in one pass.
+        const productIndexes = (
+          db
+            .prepare(`
+          SELECT name, sql FROM sqlite_master
+          WHERE type = 'index' AND tbl_name = 'products' AND sql IS NOT NULL
+        `)
+            .all() as { name: string; sql: string }[]
+        ).filter((index) => index.name.startsWith('idx_products_'));
+        db.exec(`
+          PRAGMA foreign_keys = OFF;
+          CREATE TABLE products_volume_migration (
+            id TEXT PRIMARY KEY,
+            category_id TEXT,
+            name TEXT NOT NULL,
+            description TEXT,
+            price REAL NOT NULL DEFAULT 0,
+            cost REAL DEFAULT 0,
+            sku TEXT,
+            barcode TEXT,
+            sale_unit TEXT NOT NULL DEFAULT 'each' CHECK (sale_unit IN ('each', 'kg', 'g', 'lb', 'ml', 'cl', 'l', 'fl oz', 'oz')),
+            allow_fractional_quantity INTEGER NOT NULL DEFAULT 0,
+            weight_precision INTEGER NOT NULL DEFAULT 3 CHECK (weight_precision BETWEEN 0 AND 4),
+            image_url TEXT,
+            is_active INTEGER DEFAULT 1,
+            sort_order INTEGER DEFAULT 0,
+            track_inventory INTEGER DEFAULT 0,
+            stock_quantity REAL DEFAULT 0,
+            low_stock_threshold REAL DEFAULT 5,
+            tax_type TEXT DEFAULT 'none',
+            tax_rate REAL DEFAULT 0,
+            tax_category_id TEXT DEFAULT NULL,
+            tax_behavior TEXT DEFAULT 'country_default',
+            cb_percent REAL DEFAULT 0,
+            tags TEXT,
+            inventory_product_id TEXT DEFAULT NULL REFERENCES products(id),
+            inventory_deduction_quantity REAL DEFAULT 1,
+            deleted_at TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (category_id) REFERENCES categories(id)
+          );
+          INSERT INTO products_volume_migration (
+            id, category_id, name, description, price, cost, sku, barcode,
+            sale_unit, allow_fractional_quantity, weight_precision, image_url,
+            is_active, sort_order, track_inventory, stock_quantity, low_stock_threshold,
+            tax_type, tax_rate, tax_category_id, tax_behavior, cb_percent, tags,
+            inventory_product_id, inventory_deduction_quantity, deleted_at, created_at, updated_at
+          )
+          SELECT
+            id, category_id, name, description, price, cost, sku, barcode,
+            sale_unit, allow_fractional_quantity, weight_precision, image_url,
+            is_active, sort_order, track_inventory, stock_quantity, low_stock_threshold,
+            tax_type, tax_rate, tax_category_id, tax_behavior, cb_percent, tags,
+            ${productColumns.includes('inventory_product_id') ? 'inventory_product_id' : 'NULL'},
+            ${productColumns.includes('inventory_deduction_quantity') ? 'inventory_deduction_quantity' : '1'},
+            deleted_at, created_at, updated_at
+          FROM products;
+          DROP TABLE products;
+          ALTER TABLE products_volume_migration RENAME TO products;
+          PRAGMA foreign_keys = ON;
+        `);
+        for (const index of productIndexes) {
+          db.exec(index.sql);
+        }
+      }
+
+      if (!getColumns(db, 'order_items').includes('inventory_product_id')) {
+        db.exec(`ALTER TABLE order_items ADD COLUMN inventory_product_id TEXT DEFAULT NULL`);
+      }
+    },
+  },
+  {
+    version: 88,
+    name: 'add_supplies_and_recipes',
+    up: () => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS supplies (
+          id TEXT PRIMARY KEY,
+          name TEXT NOT NULL,
+          base_unit TEXT NOT NULL CHECK (base_unit IN ('each', 'g', 'kg', 'ml', 'l')),
+          stock_quantity REAL NOT NULL DEFAULT 0,
+          low_stock_threshold REAL,
+          is_active INTEGER NOT NULL DEFAULT 1,
+          deleted_at TEXT,
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE INDEX IF NOT EXISTS idx_supplies_name ON supplies(name COLLATE NOCASE);
+        CREATE INDEX IF NOT EXISTS idx_supplies_deleted ON supplies(deleted_at);
+
+        CREATE TABLE IF NOT EXISTS supply_movements (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          supply_id TEXT NOT NULL REFERENCES supplies(id),
+          quantity_delta REAL NOT NULL,
+          movement_type TEXT NOT NULL CHECK (movement_type IN ('receive', 'count', 'adjustment', 'waste', 'recipe_depletion', 'recipe_restore')),
+          unit TEXT NOT NULL CHECK (unit IN ('each', 'g', 'kg', 'ml', 'l')),
+          stock_after REAL NOT NULL,
+          reason TEXT,
+          actor_user_id TEXT NOT NULL REFERENCES users(id),
+          reference_type TEXT,
+          reference_id TEXT,
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE INDEX IF NOT EXISTS idx_supply_movements_supply_created
+          ON supply_movements(supply_id, created_at, id);
+        CREATE INDEX IF NOT EXISTS idx_supply_movements_reference
+          ON supply_movements(reference_type, reference_id);
+        CREATE INDEX IF NOT EXISTS idx_supply_movements_created
+          ON supply_movements(created_at, id);
+
+        CREATE TABLE IF NOT EXISTS recipes (
+          id TEXT PRIMARY KEY,
+          product_id TEXT NOT NULL REFERENCES products(id),
+          yield_quantity REAL NOT NULL DEFAULT 1 CHECK (yield_quantity > 0),
+          is_active INTEGER NOT NULL DEFAULT 1,
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_recipes_product
+          ON recipes(product_id);
+
+        CREATE TABLE IF NOT EXISTS recipe_items (
+          id TEXT PRIMARY KEY,
+          recipe_id TEXT NOT NULL REFERENCES recipes(id) ON DELETE CASCADE,
+          supply_id TEXT NOT NULL REFERENCES supplies(id),
+          quantity REAL NOT NULL CHECK (quantity > 0),
+          unit TEXT NOT NULL CHECK (unit IN ('each', 'g', 'kg', 'ml', 'l')),
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE INDEX IF NOT EXISTS idx_recipe_items_recipe ON recipe_items(recipe_id);
+      `);
+    },
+  },
+  {
+    version: 89,
+    name: 'add_order_item_recipe_snapshot',
+    up: () => {
+      if (!getColumns(db, 'order_items').includes('recipe_snapshot')) {
+        db.exec(`ALTER TABLE order_items ADD COLUMN recipe_snapshot TEXT DEFAULT NULL`);
+      }
+    },
+  },
+  {
+    version: 90,
+    name: 'add_cash_sessions',
+    up: () => {
+      // Shift lifecycle, open state (#279, approach A). Close rows stay
+      // final in `cash_closures` (scope='session'); an open session has no
+      // count and no Z number yet, so it lives here until close writes the
+      // closure row and points back via `closure_id`.
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS cash_sessions (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          opened_by TEXT NOT NULL REFERENCES users(id),
+          opened_by_name TEXT NOT NULL DEFAULT '',
+          opened_at TEXT NOT NULL,
+          opening_float_cents INTEGER NOT NULL DEFAULT 0 CHECK (opening_float_cents >= 0),
+          status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'closed')),
+          closed_at TEXT,
+          closed_by TEXT REFERENCES users(id),
+          closure_id INTEGER REFERENCES cash_closures(id)
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS cash_sessions_one_open
+          ON cash_sessions(status) WHERE status = 'open';
+      `);
+      // Seeded here (not only in seedInstallDefaults) so pre-v90 upgrades
+      // get the rows too — same pattern as v83's opt-in toggle.
+      insertSettingIfMissing('require_open_shift', 'false');
+      insertSettingIfMissing('stale_session_days', '7');
+    },
+  },
+  {
+    version: 91,
+    name: 'add_cash_session_ownership',
+    up: () => {
+      if (!getColumns(db, 'cash_drawer_movements').includes('cash_session_id')) {
+        db.exec(`ALTER TABLE cash_drawer_movements ADD COLUMN cash_session_id INTEGER`);
+      }
+      if (!getColumns(db, 'refunds').includes('cash_session_id')) {
+        db.exec(`ALTER TABLE refunds ADD COLUMN cash_session_id INTEGER`);
+      }
+      db.exec(
+        `CREATE INDEX IF NOT EXISTS idx_cash_drawer_movements_session ON cash_drawer_movements(cash_session_id)`,
+      );
+      db.exec(`CREATE INDEX IF NOT EXISTS idx_refunds_session ON refunds(cash_session_id)`);
+    },
+  },
+  {
+    version: 92,
+    name: 'add_table_reservation_customer',
+    up: () => {
+      if (!getColumns(db, 'tables').includes('reservation_customer_id')) {
+        db.exec(
+          'ALTER TABLE tables ADD COLUMN reservation_customer_id TEXT REFERENCES customers(id) ON DELETE SET NULL',
+        );
+      }
+      db.exec(`
+        CREATE TRIGGER IF NOT EXISTS clear_table_reservation_customer_on_status_change
+        AFTER UPDATE OF status ON tables
+        WHEN NEW.status != 'reserved' AND NEW.reservation_customer_id IS NOT NULL
+        BEGIN
+          UPDATE tables SET reservation_customer_id = NULL WHERE id = NEW.id;
+        END;
+      `);
+    },
+  },
+  {
+    version: 93,
+    name: 'add_configurable_permissions',
+    up: () => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS role_permission_overrides (
+          role TEXT NOT NULL ${USER_ROLE_SQL_CHECK},
+          permission_id TEXT NOT NULL,
+          effect TEXT NOT NULL CHECK (effect IN ('allow', 'deny')),
+          updated_by TEXT NOT NULL REFERENCES users(id),
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          PRIMARY KEY (role, permission_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_role_permission_overrides_role
+          ON role_permission_overrides(role);
+
+        CREATE TABLE IF NOT EXISTS user_permission_overrides (
+          user_id TEXT NOT NULL REFERENCES users(id),
+          permission_id TEXT NOT NULL,
+          effect TEXT NOT NULL CHECK (effect IN ('allow', 'deny')),
+          updated_by TEXT NOT NULL REFERENCES users(id),
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          PRIMARY KEY (user_id, permission_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_user_permission_overrides_user
+          ON user_permission_overrides(user_id);
+
+        CREATE TABLE IF NOT EXISTS authorization_audit_log (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          batch_id TEXT NOT NULL,
+          actor_user_id TEXT NOT NULL REFERENCES users(id),
+          target_type TEXT NOT NULL CHECK (target_type IN ('role', 'user')),
+          target_id TEXT NOT NULL,
+          permission_id TEXT NOT NULL,
+          previous_effect TEXT CHECK (previous_effect IS NULL OR previous_effect IN ('allow', 'deny')),
+          next_effect TEXT CHECK (next_effect IS NULL OR next_effect IN ('allow', 'deny')),
+          details_json TEXT,
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE INDEX IF NOT EXISTS idx_authorization_audit_created
+          ON authorization_audit_log(created_at, id);
+        CREATE INDEX IF NOT EXISTS idx_authorization_audit_target
+          ON authorization_audit_log(target_type, target_id, id);
+      `);
+    },
+  },
+  {
+    version: 94,
+    name: 'add_order_delivery_address',
+    up: () => {
+      // A fresh install gets this column from the CREATE TABLE, so the ALTER is
+      // guarded the way the online_platform migration guards its own columns.
+      const orderColumns = getColumns(db, 'orders');
+      if (!orderColumns.includes('delivery_address')) {
+        db.exec(`ALTER TABLE orders ADD COLUMN delivery_address TEXT DEFAULT NULL`);
+      }
+      // On by default: delivery documents show the number unless the merchant
+      // turns it off. See docs/reference/product-invariants.md.
+      db.prepare('INSERT OR IGNORE INTO settings (key, value, updated_at) VALUES (?, ?, ?)').run(
+        'bill_delivery_show_customer_phone_always',
+        'true',
+        now(),
+      );
+    },
+  },
+  {
+    version: 95,
+    name: 'add_local_diagnostics_log',
+    up: () => {
+      // Local, operator-readable failure log. Nothing here is transmitted; the
+      // diagnostics screen reads it and the copy-for-support bundle quotes it.
+      insertSettingIfMissing('diagnostics_transmission_enabled', 'false');
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS local_diagnostics (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          event_code TEXT NOT NULL,
+          severity TEXT NOT NULL,
+          error_class TEXT NOT NULL,
+          signature TEXT NOT NULL,
+          summary TEXT NOT NULL,
+          metadata_json TEXT,
+          occurred_at TEXT NOT NULL,
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE INDEX IF NOT EXISTS idx_local_diagnostics_created
+          ON local_diagnostics(created_at, id);
+      `);
+    },
+  },
+  {
+    version: 96,
+    name: 'add_whatsapp_z_report_kind',
+    up: () => {
+      db.exec(`
+        ALTER TABLE whatsapp_messages RENAME TO whatsapp_messages_v95;
+        CREATE TABLE whatsapp_messages (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          bill_id INTEGER REFERENCES bills(id),
+          customer_id TEXT REFERENCES customers(id),
+          phone_e164 TEXT NOT NULL,
+          direction TEXT NOT NULL CHECK (direction IN ('outbound','inbound')),
+          kind TEXT NOT NULL DEFAULT 'manual_reply'
+            CHECK (kind IN ('bill_receipt','manual_reply','auto_followup','z_report')),
+          status TEXT NOT NULL DEFAULT 'queued'
+            CHECK (status IN ('queued','seen','typing','sent','delivered','read','failed')),
+          body TEXT NOT NULL,
+          external_message_id TEXT,
+          error TEXT,
+          queued_at TEXT DEFAULT CURRENT_TIMESTAMP,
+          seen_at TEXT,
+          typing_at TEXT,
+          sent_at TEXT,
+          delivered_at TEXT,
+          read_at TEXT,
+          failed_at TEXT,
+          created_by_user_id TEXT
+        );
+        INSERT INTO whatsapp_messages (
+          id, bill_id, customer_id, phone_e164, direction, kind, status, body,
+          external_message_id, error, queued_at, seen_at, typing_at, sent_at,
+          delivered_at, read_at, failed_at, created_by_user_id
+        )
+        SELECT
+          id, bill_id, customer_id, phone_e164, direction, kind, status, body,
+          external_message_id, error, queued_at, seen_at, typing_at, sent_at,
+          delivered_at, read_at, failed_at, created_by_user_id
+        FROM whatsapp_messages_v95;
+        DROP TABLE whatsapp_messages_v95;
+        CREATE INDEX idx_whatsapp_messages_phone
+          ON whatsapp_messages(phone_e164, queued_at DESC);
+        CREATE INDEX idx_whatsapp_messages_status
+          ON whatsapp_messages(status, queued_at DESC);
+        CREATE INDEX idx_whatsapp_messages_bill
+          ON whatsapp_messages(bill_id);
+        CREATE INDEX idx_whatsapp_messages_inbound_unread
+          ON whatsapp_messages(direction, status, queued_at DESC)
+          WHERE direction = 'inbound' AND status NOT IN ('read','failed');
+      `);
+    },
+  },
+  {
+    version: 97,
+    name: 'add_kitchen_delivery_settlement_setting',
+    up: () => {
+      insertSettingIfMissing('require_kitchen_delivered_before_settlement', 'false');
+    },
+  },
+  {
+    version: 98,
+    name: 'add_category_addon_groups',
+    up: () => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS category_addon_groups (
+          category_id TEXT NOT NULL,
+          addon_group_id TEXT NOT NULL,
+          PRIMARY KEY (category_id, addon_group_id),
+          FOREIGN KEY (category_id) REFERENCES categories(id) ON DELETE CASCADE,
+          FOREIGN KEY (addon_group_id) REFERENCES addon_groups(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_category_addon_groups_category ON category_addon_groups(category_id);
+        CREATE INDEX IF NOT EXISTS idx_category_addon_groups_group ON category_addon_groups(addon_group_id);
+      `);
+    },
+  },
+  {
+    version: 99,
+    name: 'add_charges_breakdown_and_custom_charges_setting',
+    up: () => {
+      // Additive only: existing orders/bills keep a NULL charges_breakdown and
+      // fall back to the dedicated service_charge/packaging_charge columns.
+      const orderColumns = getColumns(db, 'orders');
+      if (!orderColumns.includes('charges_breakdown')) {
+        db.exec(`ALTER TABLE orders ADD COLUMN charges_breakdown TEXT`);
+      }
+      const billColumns = getColumns(db, 'bills');
+      if (!billColumns.includes('charges_breakdown')) {
+        db.exec(`ALTER TABLE bills ADD COLUMN charges_breakdown TEXT`);
+      }
+      insertSettingIfMissing('custom_charges', '[]');
+    },
+  },
+  {
+    version: 100,
+    name: 'add_product_variants_table',
+    up: () => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS product_variants (
+          id TEXT PRIMARY KEY,
+          product_id TEXT NOT NULL,
+          name TEXT NOT NULL,
+          sku TEXT,
+          barcode TEXT,
+          price REAL NOT NULL,
+          online_price REAL DEFAULT NULL,
+          cost_price REAL DEFAULT NULL,
+          track_inventory INTEGER DEFAULT 0,
+          stock_quantity REAL DEFAULT 0,
+          low_stock_threshold REAL DEFAULT NULL,
+          inventory_product_id TEXT DEFAULT NULL REFERENCES products(id),
+          inventory_deduction_quantity REAL DEFAULT 1,
+          is_active INTEGER DEFAULT 1,
+          sort_order INTEGER DEFAULT 0,
+          created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+          updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+          FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_product_variants_product ON product_variants(product_id);
+        CREATE INDEX IF NOT EXISTS idx_product_variants_barcode ON product_variants(barcode);
+      `);
+
+      if (!getColumns(db, 'order_items').includes('variant_id')) {
+        db.exec(`ALTER TABLE order_items ADD COLUMN variant_id TEXT DEFAULT NULL`);
+      }
+      if (!getColumns(db, 'products').includes('dietary_tags')) {
+        db.exec(`ALTER TABLE products ADD COLUMN dietary_tags TEXT DEFAULT NULL`);
+      }
+    },
+  },
+  {
+    version: 101,
+    name: 'add_variant_id_to_inventory_movements',
+    up: () => {
+      if (!getColumns(db, 'inventory_movements').includes('variant_id')) {
+        db.exec(`ALTER TABLE inventory_movements ADD COLUMN variant_id TEXT DEFAULT NULL`);
+      }
+    },
+  },
+  {
+    version: 102,
+    name: 'add_inventory_variant_id_to_order_items',
+    up: () => {
+      if (!getColumns(db, 'order_items').includes('inventory_variant_id')) {
+        db.exec(`ALTER TABLE order_items ADD COLUMN inventory_variant_id TEXT DEFAULT NULL`);
+      }
+    },
+  },
+  {
+    version: 103,
+    name: 'add_order_delivery_collection_details',
+    up: () => {
+      // Additive only: NULL reads as an unknown expected method and no note,
+      // which is exactly what every existing delivery order recorded.
+      const orderColumns = getColumns(db, 'orders');
+      if (!orderColumns.includes('expected_payment_method')) {
+        db.exec(`ALTER TABLE orders ADD COLUMN expected_payment_method TEXT DEFAULT NULL`);
+      }
+      if (!orderColumns.includes('delivery_note')) {
+        db.exec(`ALTER TABLE orders ADD COLUMN delivery_note TEXT DEFAULT NULL`);
+      }
+    },
+  },
+  {
+    version: 104,
+    name: 'add_addon_inventory',
+    up: () => {
+      // Additive only, like every catalog column so far: existing add-ons keep
+      // an untracked, zero-stock pool until a merchant switches tracking on.
+      const addonColumns = getColumns(db, 'addons');
+      const addAddonColumn = (name: string, definition: string) => {
+        if (addonColumns.includes(name)) return;
+        db.exec(`ALTER TABLE addons ADD COLUMN ${definition}`);
+        addonColumns.push(name);
+      };
+      addAddonColumn('track_inventory', 'track_inventory INTEGER DEFAULT 0');
+      addAddonColumn('stock_quantity', 'stock_quantity REAL DEFAULT 0');
+      addAddonColumn('low_stock_threshold', 'low_stock_threshold REAL DEFAULT 0');
+
+      if (!getColumns(db, 'order_item_addons').includes('inventory_deducted_quantity')) {
+        db.exec(
+          `ALTER TABLE order_item_addons ADD COLUMN inventory_deducted_quantity REAL NOT NULL DEFAULT 0`,
+        );
+      }
+      if (!getColumns(db, 'inventory_movements').includes('addon_id')) {
+        db.exec(`ALTER TABLE inventory_movements ADD COLUMN addon_id TEXT DEFAULT NULL`);
+      }
+
+      // An add-on pool has no owning product, so the ledger can no longer
+      // require product_id. Rebuild once: SQLite cannot relax a NOT NULL
+      // constraint in place. Every existing row is copied column by column, so
+      // a column this migration does not know about fails the copy loudly
+      // instead of being dropped.
+      const productIdColumn = (
+        db.prepare('PRAGMA table_info(inventory_movements)').all() as {
+          name: string;
+          notnull: number;
+        }[]
+      ).find((column) => column.name === 'product_id');
+      if (productIdColumn?.notnull === 1) {
+        db.exec(`
+          ALTER TABLE inventory_movements RENAME TO inventory_movements_v103;
+          CREATE TABLE inventory_movements (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            product_id TEXT DEFAULT NULL REFERENCES products(id),
+            quantity_delta REAL NOT NULL CHECK (quantity_delta <> 0),
+            movement_type TEXT NOT NULL CHECK (movement_type IN ('sale', 'cancel_restore', 'adjustment')),
+            reference_type TEXT,
+            reference_id TEXT,
+            reason TEXT,
+            actor_user_id TEXT NOT NULL REFERENCES users(id),
+            stock_after REAL NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            imported_by_user_id TEXT REFERENCES users(id),
+            import_batch_id TEXT,
+            source_actor_user_id TEXT,
+            source_reference_type TEXT,
+            source_reference_id TEXT,
+            source_reason TEXT,
+            source_created_at TEXT,
+            variant_id TEXT DEFAULT NULL,
+            addon_id TEXT DEFAULT NULL
+          );
+          INSERT INTO inventory_movements (
+            id, product_id, quantity_delta, movement_type, reference_type, reference_id,
+            reason, actor_user_id, stock_after, created_at,
+            imported_by_user_id, import_batch_id,
+            source_actor_user_id, source_reference_type, source_reference_id,
+            source_reason, source_created_at, variant_id, addon_id
+          )
+          SELECT
+            id, product_id, quantity_delta, movement_type, reference_type, reference_id,
+            reason, actor_user_id, stock_after, created_at,
+            imported_by_user_id, import_batch_id,
+            source_actor_user_id, source_reference_type, source_reference_id,
+            source_reason, source_created_at, variant_id, addon_id
+          FROM inventory_movements_v103;
+          DROP TABLE inventory_movements_v103;
+          CREATE INDEX IF NOT EXISTS idx_inventory_movements_product_created
+            ON inventory_movements(product_id, created_at, id);
+          CREATE INDEX IF NOT EXISTS idx_inventory_movements_reference
+            ON inventory_movements(reference_type, reference_id);
+          CREATE INDEX IF NOT EXISTS idx_inventory_movements_created
+            ON inventory_movements(created_at, id);
+        `);
+      }
+    },
+  },
+  {
+    version: 105,
+    name: 'add_held_order_charge_selections',
+    up: () => {
+      // Additive only: a cart held before these columns existed carries no
+      // charge decisions, and an empty selection list says exactly that.
+      const heldOrderColumns = getColumns(db, 'held_orders');
+      const addHeldOrderColumn = (name: string, definition: string) => {
+        if (heldOrderColumns.includes(name)) return;
+        db.exec(`ALTER TABLE held_orders ADD COLUMN ${definition}`);
+        heldOrderColumns.push(name);
+      };
+      addHeldOrderColumn('waived_charge_ids', `waived_charge_ids TEXT NOT NULL DEFAULT '[]'`);
+      addHeldOrderColumn('opted_in_charge_ids', `opted_in_charge_ids TEXT NOT NULL DEFAULT '[]'`);
+    },
+  },
+  {
+    version: 106,
+    name: 'add_order_expected_payment_method_id',
+    up: () => {
+      // A historical identity marker, deliberately not a foreign key: deleting
+      // or renaming the configured method must never rewrite what an order
+      // said it expected. Rows that predate the column stay NULL - an old
+      // `expected_payment_method` string was never an identity and must not be
+      // guessed into one.
+      if (!getColumns(db, 'orders').includes('expected_payment_method_id')) {
+        db.exec('ALTER TABLE orders ADD COLUMN expected_payment_method_id INTEGER DEFAULT NULL');
+      }
+    },
+  },
+  {
+    version: 107,
+    name: 'add_variant_recipe_multiplier',
+    up: () => {
+      // Additive only: every existing variant consumes exactly one base recipe
+      // portion, which is what it did before the column existed. The multiplier
+      // scales ingredient depletion; it is not the linked-product stock factor.
+      if (!getColumns(db, 'product_variants').includes('recipe_multiplier')) {
+        db.exec(
+          'ALTER TABLE product_variants ADD COLUMN recipe_multiplier REAL NOT NULL DEFAULT 1 CHECK (recipe_multiplier > 0)',
+        );
+      }
+    },
+  },
+  {
+    version: 108,
+    name: 'add_expense_records',
+    up: () => {
+      // Additive only: expense categories, immutable expenses, their
+      // payment/reversal ledger, and the idempotency receipts that make the
+      // expense mutations replayable. No existing table is touched.
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS expense_categories (
+          id TEXT PRIMARY KEY,
+          name TEXT NOT NULL,
+          name_key TEXT NOT NULL,
+          is_active INTEGER NOT NULL DEFAULT 1 CHECK (is_active IN (0, 1)),
+          created_by TEXT NOT NULL REFERENCES users(id),
+          updated_by TEXT NOT NULL REFERENCES users(id),
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_expense_categories_name_key
+          ON expense_categories(name_key);
+
+        CREATE TABLE IF NOT EXISTS expenses (
+          id TEXT PRIMARY KEY,
+          category_id TEXT NOT NULL REFERENCES expense_categories(id),
+          category_name TEXT NOT NULL,
+          description TEXT NOT NULL,
+          payee TEXT,
+          notes TEXT,
+          amount_minor INTEGER NOT NULL CHECK (amount_minor > 0),
+          currency_code TEXT NOT NULL CHECK (length(currency_code) = 3),
+          incurred_on TEXT NOT NULL CHECK (incurred_on GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'),
+          created_by TEXT NOT NULL REFERENCES users(id),
+          created_at TEXT NOT NULL,
+          replaces_expense_id TEXT REFERENCES expenses(id),
+          voided_at TEXT,
+          voided_by TEXT REFERENCES users(id),
+          void_reason TEXT
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_expenses_replaces_unique
+          ON expenses(replaces_expense_id) WHERE replaces_expense_id IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS idx_expenses_incurred ON expenses(incurred_on, id);
+        CREATE INDEX IF NOT EXISTS idx_expenses_category ON expenses(category_id, incurred_on, id);
+
+        CREATE TABLE IF NOT EXISTS expense_payments (
+          id TEXT PRIMARY KEY,
+          expense_id TEXT NOT NULL REFERENCES expenses(id),
+          amount_minor INTEGER NOT NULL CHECK (amount_minor > 0),
+          method TEXT NOT NULL CHECK (method IN ('cash', 'card', 'bank_transfer', 'other')),
+          business_date TEXT NOT NULL CHECK (business_date GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'),
+          reversal_of TEXT REFERENCES expense_payments(id),
+          reason TEXT,
+          cash_movement_id INTEGER REFERENCES cash_drawer_movements(id),
+          created_by TEXT NOT NULL REFERENCES users(id),
+          created_at TEXT NOT NULL,
+          CHECK ((reversal_of IS NULL AND reason IS NULL) OR (reversal_of IS NOT NULL AND reason IS NOT NULL))
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_expense_payments_reversal_unique
+          ON expense_payments(reversal_of) WHERE reversal_of IS NOT NULL;
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_expense_payments_cash_movement
+          ON expense_payments(cash_movement_id) WHERE cash_movement_id IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS idx_expense_payments_expense
+          ON expense_payments(expense_id, created_at, id);
+
+        CREATE TABLE IF NOT EXISTS expense_mutations (
+          actor_user_id TEXT NOT NULL REFERENCES users(id),
+          idempotency_key TEXT NOT NULL,
+          operation TEXT NOT NULL,
+          resource_id TEXT NOT NULL,
+          request_hash TEXT NOT NULL,
+          response_json TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          PRIMARY KEY (actor_user_id, idempotency_key)
+        );
+      `);
+    },
+  },
+  {
+    version: 109,
+    name: 'add_expense_payment_reference',
+    up: () => {
+      // Optional operator reference on a recorded expense payment (slip,
+      // transfer, or receipt number). Nullable and additive, so existing
+      // payment rows stay valid unchanged.
+      if (!getColumns(db, 'expense_payments').includes('reference')) {
+        db.exec('ALTER TABLE expense_payments ADD COLUMN reference TEXT');
+      }
+    },
+  },
+  {
+    version: 110,
+    name: 'enable_safe_diagnostics_transmission_once',
+    up: () => {
+      const getSetting = (key: string) =>
+        (
+          db.prepare('SELECT value FROM settings WHERE key = ?').get(key) as
+            | { value: string }
+            | undefined
+        )?.value;
+      const consent = getSetting('diagnostics_consent');
+      const explicit = getSetting('diagnostics_settings_explicit') === 'true';
+      const transmission = getSetting('diagnostics_transmission_enabled');
+      const hasExistingUsers =
+        (db.prepare('SELECT COUNT(*) AS n FROM users').get() as { n: number }).n > 0;
+      insertSettingIfMissing('diagnostics_settings_explicit', 'false');
+      insertSettingIfMissing('diagnostics_consent_sync_pending', 'false');
+      if (consent === 'false') {
+        upsertSetting('diagnostics_settings_explicit', 'true');
+        upsertSetting('diagnostics_consent_sync_pending', 'true');
+      } else if (explicit && transmission === 'false') {
+        upsertSetting('diagnostics_consent_sync_pending', 'true');
+      } else if (!explicit && hasExistingUsers) {
+        // Legacy false had no reliable provenance; enable once for existing
+        // installs unless the merchant had explicitly refused diagnostics consent.
+        // Fresh installs stay opted out until the operator chooses.
+        upsertSetting('diagnostics_transmission_enabled', 'true');
+      }
+      if (
+        getSetting('diagnostics_consent_sync_pending') === 'true' &&
+        !getSetting('diagnostics_consent_change_id')
+      ) {
+        upsertSetting('diagnostics_consent_change_id', crypto.randomUUID());
+      }
+    },
+  },
+  {
+    version: 111,
+    name: 'add_hourly_diagnostics_aggregates_and_delivery_gaps',
+    up: () => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS diagnostics_hourly_aggregates (
+          aggregate_key TEXT PRIMARY KEY,
+          capture_point TEXT NOT NULL,
+          reason_code TEXT NOT NULL,
+          classification TEXT NOT NULL CHECK (classification IN ('expected_rejection', 'unexpected_failure')),
+          operation TEXT NOT NULL,
+          stage TEXT NOT NULL,
+          outcome TEXT NOT NULL CHECK (outcome IN ('not_applied', 'applied', 'partial', 'unknown', 'not_applicable')),
+          window_start TEXT NOT NULL,
+          count INTEGER NOT NULL CHECK (count > 0),
+          first_occurred_at TEXT NOT NULL,
+          last_occurred_at TEXT NOT NULL,
+          app_version TEXT NOT NULL,
+          app_build TEXT NOT NULL,
+          platform TEXT NOT NULL CHECK (platform IN ('win32', 'darwin', 'linux', 'unknown')),
+          examples_json TEXT NOT NULL DEFAULT '[]',
+          facts_json TEXT NOT NULL DEFAULT '{}',
+          updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_diagnostics_hourly_window
+          ON diagnostics_hourly_aggregates(window_start, updated_at);
+        CREATE TABLE IF NOT EXISTS diagnostics_delivery_gaps (
+          reason_code TEXT PRIMARY KEY CHECK (reason_code IN ('queue_eviction', 'permanent_rejection', 'invalid_ack', 'report_id_mismatch', 'local_retention')),
+          count INTEGER NOT NULL CHECK (count >= 0),
+          first_occurred_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          last_occurred_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          updated_at TEXT NOT NULL
+        );
+      `);
+    },
+  },
+  {
+    version: 112,
+    name: 'pin_diagnostics_transport_and_permanent_rejections',
+    up: () => {
+      const columns = getColumns(db, 'store_diagnostics_outbox');
+      if (!columns.includes('transport')) {
+        db.exec(
+          "ALTER TABLE store_diagnostics_outbox ADD COLUMN transport TEXT NOT NULL DEFAULT 'signed'",
+        );
+      }
+      if (!columns.includes('permanent_failure')) {
+        db.exec(
+          'ALTER TABLE store_diagnostics_outbox ADD COLUMN permanent_failure INTEGER NOT NULL DEFAULT 0 CHECK (permanent_failure IN (0, 1))',
+        );
+      }
+    },
+  },
+  {
+    version: 113,
+    name: 'customer_display_tokens',
+    up: () => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS customer_display_tokens (
+          id TEXT PRIMARY KEY,
+          token_hash TEXT NOT NULL UNIQUE,
+          label TEXT NOT NULL,
+          created_by TEXT,
+          created_at TEXT NOT NULL,
+          last_seen_at TEXT,
+          revoked_at TEXT
+        );
+      `);
+    },
+  },
+  {
+    version: 114,
+    name: 'add_order_audit_log_item_index',
+    up: () => {
+      db.exec(`
+        CREATE INDEX IF NOT EXISTS idx_order_audit_log_item ON order_audit_log(order_item_id);
+      `);
+    },
+  },
+  {
+    version: 115,
+    name: 'add_order_and_customer_search_fts',
+    up: () => {
+      db.exec(`
+        CREATE VIRTUAL TABLE IF NOT EXISTS orders_search_fts USING fts5(
+          order_number,
+          content='orders',
+          content_rowid='id',
+          tokenize='trigram'
+        );
+        CREATE TRIGGER IF NOT EXISTS trg_orders_search_ai AFTER INSERT ON orders BEGIN
+          INSERT INTO orders_search_fts(rowid, order_number) VALUES (new.id, new.order_number);
+        END;
+        CREATE TRIGGER IF NOT EXISTS trg_orders_search_ad AFTER DELETE ON orders BEGIN
+          INSERT INTO orders_search_fts(orders_search_fts, rowid, order_number) VALUES('delete', old.id, old.order_number);
+        END;
+        CREATE TRIGGER IF NOT EXISTS trg_orders_search_au AFTER UPDATE OF order_number ON orders BEGIN
+          INSERT INTO orders_search_fts(orders_search_fts, rowid, order_number) VALUES('delete', old.id, old.order_number);
+          INSERT INTO orders_search_fts(rowid, order_number) VALUES (new.id, new.order_number);
+        END;
+
+        CREATE VIRTUAL TABLE IF NOT EXISTS customers_search_fts USING fts5(
+          name,
+          phone,
+          phone_digits,
+          content='customers',
+          content_rowid='rowid',
+          tokenize='trigram'
+        );
+        CREATE TRIGGER IF NOT EXISTS trg_customers_search_ai AFTER INSERT ON customers BEGIN
+          INSERT INTO customers_search_fts(rowid, name, phone, phone_digits) VALUES (new.rowid, new.name, new.phone, new.phone_digits);
+        END;
+        CREATE TRIGGER IF NOT EXISTS trg_customers_search_ad AFTER DELETE ON customers BEGIN
+          INSERT INTO customers_search_fts(customers_search_fts, rowid, name, phone, phone_digits) VALUES('delete', old.rowid, old.name, old.phone, old.phone_digits);
+        END;
+        CREATE TRIGGER IF NOT EXISTS trg_customers_search_au AFTER UPDATE OF name, phone, phone_digits ON customers BEGIN
+          INSERT INTO customers_search_fts(customers_search_fts, rowid, name, phone, phone_digits) VALUES('delete', old.rowid, old.name, old.phone, old.phone_digits);
+          INSERT INTO customers_search_fts(rowid, name, phone, phone_digits) VALUES (new.rowid, new.name, new.phone, new.phone_digits);
+        END;
+
+        INSERT INTO orders_search_fts(rowid, order_number)
+        SELECT id, order_number FROM orders;
+
+        INSERT INTO customers_search_fts(rowid, name, phone, phone_digits)
+        SELECT rowid, name, phone, phone_digits FROM customers;
+      `);
+    },
+  },
+  {
+    version: 116,
+    name: 'add_order_item_price_override',
+    up: () => {
+      const columns = getColumns(db, 'order_items');
+      const add = (name: string, definition: string) => {
+        if (!columns.includes(name))
+          db.exec(`ALTER TABLE order_items ADD COLUMN ${name} ${definition}`);
+      };
+      add('price_overridden', 'INTEGER NOT NULL DEFAULT 0');
+      add('original_unit_price', 'REAL');
+      add('price_override_reason', 'TEXT');
+      add('price_overridden_by', 'TEXT');
+      add('price_overridden_at', 'TEXT');
+      db.exec(`
+        CREATE INDEX IF NOT EXISTS idx_order_items_price_overridden
+          ON order_items(price_overridden_at) WHERE price_overridden = 1;
+      `);
+    },
+  },
+  {
+    version: 117,
+    name: 'add_ingredient_cost_tracking',
+    up: () => {
+      const supplyColumns = getColumns(db, 'supplies');
+      if (!supplyColumns.includes('unit_cost')) {
+        db.exec('ALTER TABLE supplies ADD COLUMN unit_cost REAL DEFAULT NULL');
+      }
+
+      const movementColumns = getColumns(db, 'supply_movements');
+      const addMovementCol = (name: string, definition: string) => {
+        if (!movementColumns.includes(name)) {
+          db.exec(`ALTER TABLE supply_movements ADD COLUMN ${name} ${definition}`);
+        }
+      };
+      addMovementCol('unit_cost', 'REAL DEFAULT NULL');
+      addMovementCol('total_cost', 'REAL DEFAULT NULL');
+      addMovementCol('unit_cost_after', 'REAL DEFAULT NULL');
+
+      const orderItemColumns = getColumns(db, 'order_items');
+      const addOrderItemCol = (name: string, definition: string) => {
+        if (!orderItemColumns.includes(name)) {
+          db.exec(`ALTER TABLE order_items ADD COLUMN ${name} ${definition}`);
+        }
+      };
+      addOrderItemCol('ingredient_cost', 'REAL DEFAULT NULL');
+      addOrderItemCol('ingredient_cost_known', 'INTEGER NOT NULL DEFAULT 0');
+    },
+  },
+  {
+    version: 118,
+    name: 'add_printer_text_size',
+    up: () => {
+      if (!getColumns(db, 'printers').includes('text_size')) {
+        db.exec(
+          `ALTER TABLE printers ADD COLUMN text_size TEXT NOT NULL DEFAULT 'normal' CHECK (text_size IN ('normal', 'large', 'extra_large'))`,
+        );
+      }
+    },
+  },
+  {
+    version: 119,
+    name: 'add_auth_audit_log',
+    up: () => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS auth_audit_log (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          user_id TEXT,
+          event_type TEXT NOT NULL,
+          outcome TEXT NOT NULL CHECK (outcome IN ('success', 'failure', 'rate_limited')),
+          ip_address TEXT,
+          details_json TEXT,
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE INDEX IF NOT EXISTS idx_auth_audit_log_user_created
+          ON auth_audit_log(user_id, created_at, id);
+      `);
+    },
+  },
+  {
+    version: 120,
+    name: 'add_per_staff_cash_sessions',
+    up: () => {
+      db.exec(`
+        DROP INDEX IF EXISTS cash_sessions_one_open;
+        CREATE UNIQUE INDEX IF NOT EXISTS cash_sessions_one_open_per_user
+          ON cash_sessions(opened_by) WHERE status = 'open';
+      `);
+      insertSettingIfMissing('one_shift_per_staff', 'false');
+    },
+  },
+  {
+    version: 121,
+    name: 'add_whatsapp_message_attempts',
+    up: () => {
+      if (getTables(db).includes('whatsapp_message_attempts')) {
+        const fks = db.prepare('PRAGMA foreign_key_list(whatsapp_message_attempts)').all() as {
+          table: string;
+        }[];
+        if (fks.some((fk) => fk.table !== 'whatsapp_messages')) {
+          db.exec(`
+            ALTER TABLE whatsapp_message_attempts RENAME TO whatsapp_message_attempts_recreate;
+            CREATE TABLE whatsapp_message_attempts (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              message_id INTEGER NOT NULL REFERENCES whatsapp_messages(id) ON DELETE CASCADE,
+              external_message_id TEXT NOT NULL UNIQUE,
+              created_at TEXT NOT NULL
+            );
+            INSERT OR IGNORE INTO whatsapp_message_attempts (id, message_id, external_message_id, created_at)
+            SELECT a.id, a.message_id, a.external_message_id, a.created_at
+            FROM whatsapp_message_attempts_recreate a
+            JOIN whatsapp_messages m ON m.id = a.message_id;
+            DROP TABLE whatsapp_message_attempts_recreate;
+          `);
+        }
+      }
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS whatsapp_message_attempts (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          message_id INTEGER NOT NULL REFERENCES whatsapp_messages(id) ON DELETE CASCADE,
+          external_message_id TEXT NOT NULL UNIQUE,
+          created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_whatsapp_message_attempts_message_id
+          ON whatsapp_message_attempts(message_id);
+      `);
+      backfillWhatsAppMessageAttempts(db);
+    },
+  },
+  {
+    version: 122,
+    name: 'add_whatsapp_daily_sales_and_day_close_dispatch',
+    up: () => {
+      const hasAttemptsTable = getTables(db).includes('whatsapp_message_attempts');
+      const existingCols = new Set(
+        (db.prepare('PRAGMA table_info(whatsapp_messages)').all() as { name: string }[]).map(
+          (col) => col.name,
+        ),
+      );
+      const selectCashClosureExpr = existingCols.has('cash_closure_id')
+        ? 'cash_closure_id'
+        : 'NULL';
+
+      if (hasAttemptsTable) {
+        db.exec(`
+          DROP TABLE IF EXISTS whatsapp_message_attempts_v122_bak;
+          CREATE TABLE whatsapp_message_attempts_v122_bak (
+            id INTEGER PRIMARY KEY,
+            message_id INTEGER NOT NULL,
+            external_message_id TEXT NOT NULL,
+            created_at TEXT NOT NULL
+          );
+          INSERT INTO whatsapp_message_attempts_v122_bak (id, message_id, external_message_id, created_at)
+          SELECT id, message_id, external_message_id, created_at
+          FROM whatsapp_message_attempts;
+          DROP TABLE whatsapp_message_attempts;
+        `);
+      }
+
+      db.exec(`
+        DROP TABLE IF EXISTS whatsapp_messages_v122;
+        CREATE TABLE whatsapp_messages_v122 (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          bill_id INTEGER REFERENCES bills(id),
+          customer_id TEXT REFERENCES customers(id),
+          phone_e164 TEXT NOT NULL,
+          direction TEXT NOT NULL CHECK (direction IN ('outbound','inbound')),
+          kind TEXT NOT NULL DEFAULT 'manual_reply'
+            CHECK (kind IN ('bill_receipt','manual_reply','auto_followup','z_report','daily_sales_report')),
+          status TEXT NOT NULL DEFAULT 'queued'
+            CHECK (status IN ('queued','seen','typing','sent','delivered','read','failed')),
+          body TEXT NOT NULL,
+          external_message_id TEXT,
+          error TEXT,
+          queued_at TEXT DEFAULT CURRENT_TIMESTAMP,
+          seen_at TEXT,
+          typing_at TEXT,
+          sent_at TEXT,
+          delivered_at TEXT,
+          read_at TEXT,
+          failed_at TEXT,
+          created_by_user_id TEXT,
+          cash_closure_id INTEGER REFERENCES cash_closures(id) ON DELETE SET NULL
+        );
+
+        INSERT INTO whatsapp_messages_v122 (
+          id, bill_id, customer_id, phone_e164, direction, kind, status, body,
+          external_message_id, error, queued_at, seen_at, typing_at, sent_at,
+          delivered_at, read_at, failed_at, created_by_user_id, cash_closure_id
+        )
+        SELECT
+          id, bill_id, customer_id, phone_e164, direction, kind, status, body,
+          external_message_id, error, queued_at, seen_at, typing_at, sent_at,
+          delivered_at, read_at, failed_at, created_by_user_id, ${selectCashClosureExpr}
+        FROM whatsapp_messages;
+
+        DROP TABLE whatsapp_messages;
+        ALTER TABLE whatsapp_messages_v122 RENAME TO whatsapp_messages;
+
+        CREATE INDEX IF NOT EXISTS idx_whatsapp_messages_phone
+          ON whatsapp_messages(phone_e164, queued_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_whatsapp_messages_status
+          ON whatsapp_messages(status, queued_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_whatsapp_messages_bill
+          ON whatsapp_messages(bill_id);
+        CREATE INDEX IF NOT EXISTS idx_whatsapp_messages_inbound_unread
+          ON whatsapp_messages(direction, status, queued_at DESC)
+          WHERE direction = 'inbound' AND status NOT IN ('read','failed');
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_whatsapp_messages_auto_z_closure
+          ON whatsapp_messages(cash_closure_id)
+          WHERE cash_closure_id IS NOT NULL AND created_by_user_id = 'rule:z_report_day_close';
+      `);
+
+      if (hasAttemptsTable) {
+        db.exec(`
+          CREATE TABLE whatsapp_message_attempts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            message_id INTEGER NOT NULL REFERENCES whatsapp_messages(id) ON DELETE CASCADE,
+            external_message_id TEXT NOT NULL UNIQUE,
+            created_at TEXT NOT NULL
+          );
+          INSERT OR IGNORE INTO whatsapp_message_attempts (id, message_id, external_message_id, created_at)
+          SELECT a.id, a.message_id, a.external_message_id, a.created_at
+          FROM whatsapp_message_attempts_v122_bak a
+          JOIN whatsapp_messages m ON m.id = a.message_id;
+          DROP TABLE whatsapp_message_attempts_v122_bak;
+          CREATE INDEX IF NOT EXISTS idx_whatsapp_message_attempts_message_id
+            ON whatsapp_message_attempts(message_id);
+        `);
+      }
+    },
+  },
+  {
+    version: 123,
+    name: 'add_scheduled_orders',
+    up: () => {
+      const orderColumns = getColumns(db, 'orders');
+      if (!orderColumns.includes('scheduled_for')) {
+        db.exec('ALTER TABLE orders ADD COLUMN scheduled_for TEXT DEFAULT NULL');
+      }
+      if (!orderColumns.includes('release_status')) {
+        db.exec(
+          "ALTER TABLE orders ADD COLUMN release_status TEXT NOT NULL DEFAULT 'released' CHECK (release_status IN ('scheduled', 'released', 'blocked'))",
+        );
+      }
+      if (!orderColumns.includes('released_at')) {
+        db.exec('ALTER TABLE orders ADD COLUMN released_at TEXT DEFAULT NULL');
+      }
+      if (!orderColumns.includes('release_blocked_reason')) {
+        db.exec('ALTER TABLE orders ADD COLUMN release_blocked_reason TEXT DEFAULT NULL');
+      }
+      db.exec(
+        "CREATE INDEX IF NOT EXISTS idx_orders_release_due ON orders(release_status, scheduled_for) WHERE release_status IN ('scheduled', 'blocked')",
+      );
+    },
+  },
+  {
+    version: 124,
+    name: 'multi_counter_ordering',
+    up: () => {
+      const orderColumns = getColumns(db, 'orders');
+      if (!orderColumns.includes('checkout_stage')) {
+        db.exec(
+          "ALTER TABLE orders ADD COLUMN checkout_stage TEXT NOT NULL DEFAULT 'paid' CHECK (checkout_stage IN ('building', 'awaiting_payment', 'paid'))",
+        );
+      }
+      if (!orderColumns.includes('dispatch_policy')) {
+        db.exec(
+          "ALTER TABLE orders ADD COLUMN dispatch_policy TEXT NOT NULL DEFAULT 'immediate' CHECK (dispatch_policy IN ('immediate', 'on_payment'))",
+        );
+      }
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS counters (
+          id TEXT PRIMARY KEY,
+          name TEXT NOT NULL,
+          role TEXT NOT NULL CHECK (role IN ('ordering', 'payment', 'combined')),
+          is_active INTEGER NOT NULL DEFAULT 1,
+          sort_order INTEGER NOT NULL DEFAULT 0,
+          created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+          updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE INDEX IF NOT EXISTS idx_counters_active ON counters(is_active, sort_order);
+        CREATE INDEX IF NOT EXISTS idx_orders_checkout_queue ON orders(checkout_stage, release_status) WHERE status NOT IN ('cancelled', 'completed');
+      `);
+      insertSettingIfMissing('multi_counter_enabled', 'false');
+    },
+  },
+  {
+    version: 125,
+    name: 'add_printer_profile_id',
+    up: () => {
+      if (!getColumns(db, 'printers').includes('profile_id')) {
+        db.exec('ALTER TABLE printers ADD COLUMN profile_id TEXT DEFAULT NULL');
+      }
     },
   },
 ];
@@ -4122,8 +10407,11 @@ export const FACTORPOS_MIGRATIONS: { id: string; up: () => void }[] = [
   {
     id: '2026-09-28-add-daily-close-token-number',
     up: () => {
+      if (!getTables(db).includes('orders')) return;
       const columns = new Set(
-        (db.prepare(`PRAGMA table_info(orders)`).all() as { name: string }[]).map((column) => column.name),
+        (db.prepare(`PRAGMA table_info(orders)`).all() as { name: string }[]).map(
+          (column) => column.name,
+        ),
       );
       if (!columns.has('token_number')) {
         db.exec('ALTER TABLE orders ADD COLUMN token_number INTEGER');
@@ -4164,18 +10452,26 @@ function ensureFactorposMigrationTable(): void {
 
 function getAppliedFactorposMigrationIds(): Set<string> {
   ensureFactorposMigrationTable();
-  return new Set((db.prepare('SELECT id FROM _factorpos_migrations').all() as { id: string }[]).map((row) => row.id));
+  return new Set(
+    (db.prepare('SELECT id FROM _factorpos_migrations').all() as { id: string }[]).map(
+      (row) => row.id,
+    ),
+  );
 }
 
 function hasColumn(table: string, column: string): boolean {
-  return (db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[]).some((row) => row.name === column);
+  return (db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[]).some(
+    (row) => row.name === column,
+  );
 }
 
 /** Returns the legacy FactorPOS numbered migrations present at the top of this database's version. */
 function findLegacyFactorposVersions(current: number): typeof LEGACY_FACTORPOS_NUMBERED_MIGRATIONS {
   const found: typeof LEGACY_FACTORPOS_NUMBERED_MIGRATIONS = [];
   let version = current;
-  for (const legacy of [...LEGACY_FACTORPOS_NUMBERED_MIGRATIONS].sort((a, b) => b.version - a.version)) {
+  for (const legacy of [...LEGACY_FACTORPOS_NUMBERED_MIGRATIONS].sort(
+    (a, b) => b.version - a.version,
+  )) {
     if (legacy.version !== version) continue;
     const [table, column] = legacy.appliedColumn;
     if (!hasColumn(table, column)) break;
@@ -4192,13 +10488,24 @@ function repairLegacyFactorposVersions(): boolean {
   const legacy = findLegacyFactorposVersions(current);
   if (legacy.length === 0) return false;
   const repairedVersion = current - legacy.length;
-  console.log(`[DB] Moving FactorPOS migrations off upstream numbering: v${current} → v${repairedVersion}`);
+  console.log(
+    `[DB] Moving FactorPOS migrations off upstream numbering: v${current} → v${repairedVersion}`,
+  );
   syncBackupBeforeMigration(current, repairedVersion);
   db.transaction(() => {
     ensureFactorposMigrationTable();
-    const insert = db.prepare('INSERT OR IGNORE INTO _factorpos_migrations (id, applied_at) VALUES (?, ?)');
+    const insert = db.prepare(
+      'INSERT OR IGNORE INTO _factorpos_migrations (id, applied_at) VALUES (?, ?)',
+    );
     for (const entry of legacy) insert.run(entry.id, new Date().toISOString());
     db.pragma(`user_version = ${repairedVersion}`);
+    // A database restored directly from a backup also carries the old number in _flo_meta.
+    if (getTables(db).includes('_flo_meta')) {
+      db.prepare("UPDATE _flo_meta SET value = ? WHERE key = 'schema_version' AND value = ?").run(
+        String(repairedVersion),
+        String(current),
+      );
+    }
   })();
   return true;
 }
@@ -4207,7 +10514,7 @@ function runFactorposMigrations(alreadyBackedUp: boolean): void {
   const applied = getAppliedFactorposMigrationIds();
   const pending = FACTORPOS_MIGRATIONS.filter((migration) => !applied.has(migration.id));
   if (pending.length === 0) return;
-  if (!alreadyBackedUp) {
+  if (!alreadyBackedUp && !buildingIdealSchema) {
     const version = getCurrentSchemaVersion();
     console.log(`[DB] Triggering auto-backup before ${pending.length} FactorPOS migration(s)...`);
     syncBackupBeforeMigration(version, version);
@@ -4221,6 +10528,25 @@ function runFactorposMigrations(alreadyBackedUp: boolean): void {
   }
 }
 
+export function backfillWhatsAppMessageAttempts(
+  targetDb: Database.Database = db,
+  options?: { reset?: boolean },
+): void {
+  if (!getTables(targetDb).includes('whatsapp_message_attempts')) return;
+  if (options?.reset) {
+    targetDb.exec('DELETE FROM whatsapp_message_attempts');
+  }
+  if (!getTables(targetDb).includes('whatsapp_messages')) return;
+  targetDb.exec(`
+    INSERT OR IGNORE INTO whatsapp_message_attempts (message_id, external_message_id, created_at)
+    SELECT id, TRIM(external_message_id), COALESCE(sent_at, typing_at, queued_at, CURRENT_TIMESTAMP)
+    FROM whatsapp_messages
+    WHERE direction = 'outbound'
+      AND external_message_id IS NOT NULL
+      AND TRIM(external_message_id) != ''
+  `);
+}
+
 function syncBackupBeforeMigration(fromVersion: number, toVersion: number): void {
   if (buildingIdealSchema) return;
   let targetPath = '';
@@ -4232,7 +10558,10 @@ function syncBackupBeforeMigration(fromVersion: number, toVersion: number): void
       fs.mkdirSync(backupDir, { recursive: true });
     }
     const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-    targetPath = path.join(backupDir, `flo-backup-${timestamp}-pre-v${fromVersion}-to-v${toVersion}.db`);
+    targetPath = path.join(
+      backupDir,
+      `flo-backup-${timestamp}-pre-v${fromVersion}-to-v${toVersion}.db`,
+    );
 
     if (fs.existsSync(dbPath)) {
       db.pragma('wal_checkpoint(TRUNCATE)');
@@ -4255,9 +10584,15 @@ function syncBackupBeforeMigration(fromVersion: number, toVersion: number): void
       `);
       // Record schema version on snapshot so it correctly reflects pre-migration state.
       backupDb.pragma(`user_version = ${fromVersion}`);
-      backupDb.prepare(`INSERT OR REPLACE INTO _flo_meta (key, value) VALUES (?, ?)`).run('schema_version', String(fromVersion));
-      backupDb.prepare(`INSERT OR REPLACE INTO _flo_meta (key, value) VALUES (?, ?)`).run('backup_created_at', new Date().toISOString());
-      backupDb.prepare(`INSERT OR REPLACE INTO _flo_meta (key, value) VALUES (?, ?)`).run('app_version', app.getVersion());
+      backupDb
+        .prepare(`INSERT OR REPLACE INTO _flo_meta (key, value) VALUES (?, ?)`)
+        .run('schema_version', String(fromVersion));
+      backupDb
+        .prepare(`INSERT OR REPLACE INTO _flo_meta (key, value) VALUES (?, ?)`)
+        .run('backup_created_at', new Date().toISOString());
+      backupDb
+        .prepare(`INSERT OR REPLACE INTO _flo_meta (key, value) VALUES (?, ?)`)
+        .run('app_version', app.getVersion());
     } finally {
       backupDb?.close();
     }
@@ -4267,73 +10602,124 @@ function syncBackupBeforeMigration(fromVersion: number, toVersion: number): void
     }
 
     completed = true;
-    console.log(`[DB] Auto-backup before migrating v${fromVersion} → v${toVersion} created at ${targetPath}`);
+    console.log(
+      `[DB] Auto-backup before migrating v${fromVersion} → v${toVersion} created at ${targetPath}`,
+    );
   } catch (err: any) {
     console.error(`[DB] Auto-backup before migration failed:`, err.message);
-    throw new Error(`Pre-migration backup failed; refusing to migrate the database: ${err.message}`);
+    throw new Error(
+      `Pre-migration backup failed; refusing to migrate the database: ${err.message}`,
+    );
   } finally {
     if (!completed && targetPath) {
       for (const filePath of [targetPath, `${targetPath}-wal`, `${targetPath}-shm`]) {
-        try { if (pathEntryExists(filePath)) fs.unlinkSync(filePath); } catch { }
+        try {
+          if (pathEntryExists(filePath)) fs.unlinkSync(filePath);
+        } catch {}
       }
     }
   }
 }
 
+export function getLatestSupportedSchemaVersion(): number {
+  return MIGRATIONS.length > 0 ? MIGRATIONS[MIGRATIONS.length - 1].version : 0;
+}
+
 export class SchemaVersionMismatchError extends Error {
-  constructor(public readonly dbVersion: number, public readonly appVersion: number) {
+  constructor(
+    public readonly dbVersion: number,
+    public readonly appVersion: number,
+    public readonly dbAppVersion: string | null = null,
+  ) {
     super(
       `Database schema (v${dbVersion}) is newer than this app version supports (v${appVersion}). ` +
-      `This usually means another device or a previous update already upgraded this database. ` +
-      `Please update Flo Cafe to the latest version before continuing.`
+        `This usually means another device or a previous update already upgraded this database. ` +
+        `Please update Flo Cafe to the latest version before continuing.`,
     );
     this.name = 'SchemaVersionMismatchError';
   }
 }
 
-function runMigrations(): void {
-  const repaired = buildingIdealSchema ? false : repairLegacyFactorposVersions();
-  const migrated = runUpstreamMigrations();
-  runFactorposMigrations(repaired || migrated);
+export function isSchemaVersionMismatchError(error: unknown): error is SchemaVersionMismatchError {
+  return error instanceof SchemaVersionMismatchError;
+}
+
+/**
+ * FactorPOS wrapper: repairs legacy FactorPOS-numbered databases, runs the
+ * upstream numbered migrations, then the FactorPOS-owned ones.
+ */
+function runMigrations(targetVersion?: number, skipPreMigrationBackup = false): void {
+  const repaired =
+    buildingIdealSchema || targetVersion !== undefined ? false : repairLegacyFactorposVersions();
+  const migrated = runUpstreamMigrations(targetVersion, skipPreMigrationBackup || repaired);
+  runFactorposMigrations(repaired || migrated || skipPreMigrationBackup);
 }
 
 /** Runs pending upstream numbered migrations; returns true when a pre-migration backup was taken. */
-function runUpstreamMigrations(): boolean {
+function runUpstreamMigrations(targetVersion?: number, skipPreMigrationBackup = false): boolean {
   const current = getCurrentSchemaVersion();
-  const target = MIGRATIONS.length > 0 ? MIGRATIONS[MIGRATIONS.length - 1].version : 0;
+  const maxSupported = MIGRATIONS.length > 0 ? MIGRATIONS[MIGRATIONS.length - 1].version : 0;
+  const target = targetVersion !== undefined ? targetVersion : maxSupported;
   const verboseMigrationLogs = process.env.FLOCAFE_TEST_VERBOSE === '1';
 
-  if (current > target) {
+  const metaInfo = readCanonicalMetaVersionInfo(db ?? getDatabase());
+  const effectiveCurrent =
+    metaInfo.schemaVersion !== null && metaInfo.schemaVersion > target
+      ? Math.max(current, metaInfo.schemaVersion)
+      : current;
+
+  if (effectiveCurrent > target) {
     // Fail startup if database schema version is newer than supported by this build.
-    throw new SchemaVersionMismatchError(current, target);
+    throw new SchemaVersionMismatchError(
+      effectiveCurrent,
+      target,
+      metaInfo.schemaVersion === effectiveCurrent ? metaInfo.appVersion : null,
+    );
   }
 
   if (current === target) {
-    console.log(`[DB] Schema up to date (v${current})`);
+    if (target >= RUNTIME_KDS_INDEX_MIN_SCHEMA_VERSION) ensureRuntimeIndexes();
+    if (!buildingIdealSchema) console.log(`[DB] Schema up to date (v${current})`);
     return false;
   }
 
-  console.log(`[DB] Schema: v${current} → v${target}`);
+  if (!buildingIdealSchema) console.log(`[DB] Schema: v${current} → v${target}`);
 
   // Create automatic pre-migration backup before running pending batch.
-  console.log(`[DB] Triggering auto-backup before migrating v${current} → v${target}...`);
-  syncBackupBeforeMigration(current, target);
+  if (!buildingIdealSchema && !skipPreMigrationBackup) {
+    console.log(`[DB] Triggering auto-backup before migrating v${current} → v${target}...`);
+    syncBackupBeforeMigration(current, target);
+  }
 
   for (const migration of MIGRATIONS) {
     if (migration.version <= current) continue;
+    if (migration.version > target) break;
 
-    if (verboseMigrationLogs) {
+    if (verboseMigrationLogs && !buildingIdealSchema) {
       console.log(`[DB] Applying migration v${migration.version}: ${migration.name}`);
     }
     db.transaction(() => {
       migration.up();
       db.pragma(`user_version = ${migration.version}`);
     })();
-    if (verboseMigrationLogs) {
+    if (verboseMigrationLogs && !buildingIdealSchema) {
       console.log(`[DB] Migration v${migration.version} complete`);
     }
   }
-  return true;
+
+  if (target >= RUNTIME_KDS_INDEX_MIN_SCHEMA_VERSION) ensureRuntimeIndexes();
+  return !buildingIdealSchema && !skipPreMigrationBackup;
+}
+
+function ensureRuntimeIndexes(): void {
+  if (db.readonly) return;
+  const hasOrderItems = db
+    .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'order_items'")
+    .get();
+  if (!hasOrderItems) return;
+  db.exec(
+    "CREATE INDEX IF NOT EXISTS idx_order_items_active_kds ON order_items(status, order_id) WHERE status IN ('pending', 'preparing', 'ready');",
+  );
 }
 
 // Initial schema definition for brand-new installs (migration v1).
@@ -4366,7 +10752,7 @@ function createSchema(): void {
       cost REAL DEFAULT 0,
       sku TEXT,
       barcode TEXT,
-      sale_unit TEXT NOT NULL DEFAULT 'each' CHECK (sale_unit IN ('each', 'kg', 'g', 'lb')),
+      sale_unit TEXT NOT NULL DEFAULT 'each' CHECK (sale_unit IN ('each', 'kg', 'g', 'lb', 'ml', 'cl', 'l', 'fl oz', 'oz')),
       allow_fractional_quantity INTEGER NOT NULL DEFAULT 0,
       weight_precision INTEGER NOT NULL DEFAULT 3 CHECK (weight_precision BETWEEN 0 AND 4),
       image_url TEXT,
@@ -4382,6 +10768,8 @@ function createSchema(): void {
       -- Defaults to 0 so fresh and upgraded installs have identical schema.
       cb_percent REAL DEFAULT 0,
       tags TEXT,
+      inventory_product_id TEXT DEFAULT NULL REFERENCES products(id),
+      inventory_deduction_quantity REAL DEFAULT 1,
       deleted_at TEXT,
       created_at TEXT DEFAULT CURRENT_TIMESTAMP,
       updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
@@ -4423,6 +10811,16 @@ function createSchema(): void {
       PRIMARY KEY (product_id, addon_group_id)
     );
 
+    CREATE TABLE IF NOT EXISTS category_addon_groups (
+      category_id TEXT NOT NULL,
+      addon_group_id TEXT NOT NULL,
+      PRIMARY KEY (category_id, addon_group_id),
+      FOREIGN KEY (category_id) REFERENCES categories(id) ON DELETE CASCADE,
+      FOREIGN KEY (addon_group_id) REFERENCES addon_groups(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_category_addon_groups_category ON category_addon_groups(category_id);
+    CREATE INDEX IF NOT EXISTS idx_category_addon_groups_group ON category_addon_groups(addon_group_id);
+
     CREATE TABLE IF NOT EXISTS kitchen_stations (
       id TEXT PRIMARY KEY,
       name TEXT NOT NULL,
@@ -4460,7 +10858,8 @@ function createSchema(): void {
       kitchen_station_id TEXT,
       is_active INTEGER DEFAULT 1,
       created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-      updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+      updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      reservation_customer_id TEXT REFERENCES customers(id) ON DELETE SET NULL
     );
 
     CREATE TABLE IF NOT EXISTS customers (
@@ -4507,11 +10906,15 @@ function createSchema(): void {
       customer_id TEXT,
       user_id TEXT,
       type TEXT DEFAULT 'takeaway',
+      delivery_address TEXT DEFAULT NULL,
+      expected_payment_method TEXT DEFAULT NULL,
+      delivery_note TEXT DEFAULT NULL,
       guest_count INTEGER,
       special_instructions TEXT,
       packaging_charge REAL DEFAULT 0,
       delivery_charge REAL DEFAULT 0,
       service_charge REAL DEFAULT 0,
+      charges_breakdown TEXT,
       status TEXT DEFAULT 'pending',
       subtotal REAL DEFAULT 0,
       tax_amount REAL DEFAULT 0,
@@ -4546,6 +10949,7 @@ function createSchema(): void {
       unit_price REAL NOT NULL,
       quantity INTEGER NOT NULL DEFAULT 1,
       inventory_deducted_quantity REAL NOT NULL DEFAULT 0,
+      inventory_product_id TEXT DEFAULT NULL,
       subtotal REAL NOT NULL,
       tax_amount REAL DEFAULT 0,
       tax_breakdown TEXT,
@@ -4579,6 +10983,7 @@ function createSchema(): void {
       delivery_charge REAL DEFAULT 0,
       packaging_charge REAL DEFAULT 0,
       service_charge REAL DEFAULT 0,
+      charges_breakdown TEXT,
       round_off REAL DEFAULT 0,
       total REAL DEFAULT 0,
       paid_amount REAL DEFAULT 0,
@@ -4629,6 +11034,8 @@ function createSchema(): void {
       is_default INTEGER DEFAULT 0,
       cash_drawer_pulse_enabled INTEGER NOT NULL DEFAULT 0,
       paper_width TEXT DEFAULT '80mm',
+      text_size TEXT NOT NULL DEFAULT 'normal' CHECK (text_size IN ('normal', 'large', 'extra_large')),
+      profile_id TEXT DEFAULT NULL,
       created_at TEXT DEFAULT CURRENT_TIMESTAMP,
       updated_at TEXT DEFAULT CURRENT_TIMESTAMP
     );
@@ -4882,7 +11289,7 @@ function createWhatsAppSchema(): void {
       phone_e164 TEXT NOT NULL,
       direction TEXT NOT NULL CHECK (direction IN ('outbound','inbound')),
       kind TEXT NOT NULL DEFAULT 'manual_reply'
-        CHECK (kind IN ('bill_receipt','manual_reply','auto_followup')),
+        CHECK (kind IN ('bill_receipt','manual_reply','auto_followup','z_report')),
       status TEXT NOT NULL DEFAULT 'queued'
         CHECK (status IN ('queued','seen','typing','sent','delivered','read','failed')),
       body TEXT NOT NULL,
@@ -4943,6 +11350,9 @@ function seedWhatsAppDefaults(): void {
   insertSettingIfMissing('whatsapp_disclosure_version', '1');
   // Group chat filtering is enabled by default to prevent sending receipts to groups.
   insertSettingIfMissing('whatsapp_filter_groups', 'true');
+  insertSettingIfMissing('receipt_logo', '');
+  insertSettingIfMissing('receipt_logo_raster', '');
+  insertSettingIfMissing('bill_show_logo', 'false');
 }
 
 function seedInstallDefaults(): void {
@@ -4951,17 +11361,25 @@ function seedInstallDefaults(): void {
 
   insert('business_name', '');
   insert('business_type', 'restaurant');
-  insert('country', 'IN');
-  insert('currency', 'INR');
-  insert('currency_symbol', '₹');
-  insert('timezone', 'Asia/Kolkata');
+  // country/currency/currency_symbol/timezone are deliberately not seeded here:
+  // they come only from the signup wizard (docs/reference/product-invariants.md,
+  // "Regional settings come from signup, never from a fallback"). Until setup
+  // completes, resolveRegionalSnapshot() throws RegionalNotConfiguredError
+  // rather than a caller substituting a default country.
   insert('business_day_start_time', '00:00');
+  // Shift enforcement ships default-off (#279, approach A): sales work with
+  // no open session unless the owner opts in. Stale auto-close threshold in days.
+  insert('require_open_shift', 'false');
+  insert('one_shift_per_staff', 'false');
+  insert('stale_session_days', '7');
   insert('address', '');
   insert('phone', '');
   insert('email', '');
   insert('business_address', '');
   insert('business_phone', '');
   insert('instagram_handle', '');
+  insert('receipt_logo', '');
+  insert('receipt_logo_raster', '');
   insert('tax_registered', 'false');
   insert('tax_registration_number', '');
   insert('state_code', '');
@@ -4971,6 +11389,9 @@ function seedInstallDefaults(): void {
   insert('tables_required', 'true');
   insert('service_model', 'finedine');
   insert('setup_profile', '');
+  // Unified charges & fees engine: JSON array of ChargeDefinition objects.
+  // Validated only by the dedicated /settings/charges endpoints.
+  insert('custom_charges', '[]');
   insert('cloud_server_url', DEFAULT_CLOUD_SERVER_URL);
   insert('cloud_connected', 'false');
   insert('cloud_sync_enabled', '1');
@@ -4980,15 +11401,20 @@ function seedInstallDefaults(): void {
   insert('cloud_registration_status', 'unregistered');
   insert('anonymous_data_consent', 'true');
   insert('telemetry_enabled', 'true');
-  insert('telemetry_scope', 'usage_stats,country,app_version,platform,session_duration,feature_usage,error_diagnostics');
+  insert(
+    'telemetry_scope',
+    'usage_stats,country,app_version,platform,session_duration,feature_usage,error_diagnostics',
+  );
   insert('diagnostics_consent', 'true');
   insert('kds_enabled', 'true');
+  insert('require_kitchen_delivered_before_settlement', 'false');
   insert('server_app_enabled', 'true');
   insert('kot_printing_enabled', 'true');
   insert('server_app_bill_printing_enabled', 'false');
   insert('printer_trim_decimals', 'false');
   insert('bill_template', 'classic');
   insert('bill_footer_message', '');
+  insert('bill_show_logo', 'false');
   insert('bill_show_name', 'true');
   insert('bill_show_address', 'true');
   insert('bill_show_phone', 'true');
@@ -4996,7 +11422,9 @@ function seedInstallDefaults(): void {
   insert('bill_show_tax_breakdown', 'true');
   insert('bill_show_customer_name', 'true');
   insert('bill_show_customer_phone', 'true');
+  insert('bill_delivery_show_customer_phone_always', 'true');
   insert('bill_show_table_number', 'true');
+  insert('bill_show_large_order_number', 'true');
   insert('order_number_prefix', 'ORD');
   insert('order_number_include_date', 'true');
   insert('order_number_reset_daily', 'true');
@@ -5005,6 +11433,8 @@ function seedInstallDefaults(): void {
   insert('invoice_number_reset_period', 'daily');
   insert('invoice_financial_year_start_month', '4');
   insert('invoice_financial_year_start_day', '1');
+  insert('refund_manager_enabled', 'true');
+  insert('refund_manager_window', '1h');
 
   seedCloudSyncDefaults();
 
@@ -5016,7 +11446,8 @@ const SHORT_ID_CHARS = 'abcdefghijklmnopqrstuvwxyz0123456789';
 export function generateShortId(table: string, length = 6): string {
   for (let attempt = 0; attempt < 20; attempt++) {
     let id = '';
-    for (let i = 0; i < length; i++) id += SHORT_ID_CHARS[Math.floor(Math.random() * SHORT_ID_CHARS.length)];
+    for (let i = 0; i < length; i++)
+      id += SHORT_ID_CHARS[Math.floor(Math.random() * SHORT_ID_CHARS.length)];
     if (!db.prepare(`SELECT 1 FROM ${table} WHERE id = ?`).get(id)) return id;
   }
   throw new Error(`generateShortId: could not find unique id for ${table} after 20 attempts`);
@@ -5037,10 +11468,12 @@ export function nextZNumber(): number {
 function getNextSequence(name: string, date: string): number {
   return db.transaction(() => {
     // Try to update existing row
-    const updated = db.prepare(`
+    const updated = db
+      .prepare(`
       UPDATE sequences SET current_value = current_value + 1
       WHERE name = ? AND date = ?
-    `).run(name, date);
+    `)
+      .run(name, date);
 
     if (updated.changes === 0) {
       // Row doesn't exist for today, insert it
@@ -5051,17 +11484,20 @@ function getNextSequence(name: string, date: string): number {
         return 1;
       } catch (insertError) {
         // Retry update if concurrent insert won race; preserve insert error if stuck.
-        const retry = db.prepare(`
+        const retry = db
+          .prepare(`
           UPDATE sequences SET current_value = current_value + 1
           WHERE name = ? AND date = ?
-        `).run(name, date);
+        `)
+          .run(name, date);
         if (retry.changes === 0) {
           throw new Error(`Failed to generate sequence for ${name}`, { cause: insertError });
         }
       }
     }
 
-    const row = db.prepare('SELECT current_value FROM sequences WHERE name = ? AND date = ?')
+    const row = db
+      .prepare('SELECT current_value FROM sequences WHERE name = ? AND date = ?')
       .get(name, date) as any;
     return row?.current_value ?? 0;
   })();
@@ -5070,7 +11506,7 @@ function getNextSequence(name: string, date: string): number {
 /** YYYYMMDD for "now" in the given IANA timezone (falls back to UTC if the zone is invalid). */
 export function dateStampInTimezone(timezone: string): string {
   try {
-    const parts = new Intl.DateTimeFormat('en-CA', {
+    const parts = dateTimeFormat('en-CA', {
       timeZone: timezone,
       year: 'numeric',
       month: '2-digit',
@@ -5087,7 +11523,7 @@ type InvoiceResetPeriod = 'never' | 'daily' | 'monthly' | 'financial_year';
 
 function datePartsInTimezone(timezone: string): { year: number; month: number; day: number } {
   try {
-    const parts = new Intl.DateTimeFormat('en-CA', {
+    const parts = dateTimeFormat('en-CA', {
       timeZone: timezone,
       year: 'numeric',
       month: '2-digit',
@@ -5100,13 +11536,16 @@ function datePartsInTimezone(timezone: string): { year: number; month: number; d
     if (Number.isInteger(year) && Number.isInteger(month) && Number.isInteger(day)) {
       return { year, month, day };
     }
-  } catch { }
+  } catch {}
 
   const [year, month, day] = new Date().toISOString().slice(0, 10).split('-').map(Number);
   return { year, month, day };
 }
 
-function clampFinancialYearStart(monthValue: string | null | undefined, dayValue: string | null | undefined) {
+function clampFinancialYearStart(
+  monthValue: string | null | undefined,
+  dayValue: string | null | undefined,
+) {
   const month = Number.parseInt(monthValue || '4', 10);
   const day = Number.parseInt(dayValue || '1', 10);
   return {
@@ -5117,12 +11556,18 @@ function clampFinancialYearStart(monthValue: string | null | undefined, dayValue
 
 function financialYearSegment(timezone: string, startMonth: number, startDay: number): string {
   const current = datePartsInTimezone(timezone);
-  const startsThisYear = current.month > startMonth || (current.month === startMonth && current.day >= startDay);
+  const startsThisYear =
+    current.month > startMonth || (current.month === startMonth && current.day >= startDay);
   const startYear = startsThisYear ? current.year : current.year - 1;
   return `FY${startYear}-${String((startYear + 1) % 100).padStart(2, '0')}`;
 }
 
-function invoicePeriodSegment(period: InvoiceResetPeriod, timezone: string, startMonth: number, startDay: number): string {
+function invoicePeriodSegment(
+  period: InvoiceResetPeriod,
+  timezone: string,
+  startMonth: number,
+  startDay: number,
+): string {
   const date = dateStampInTimezone(timezone);
   if (period === 'monthly') return date.slice(0, 6);
   if (period === 'financial_year') return financialYearSegment(timezone, startMonth, startDay);
@@ -5134,18 +11579,91 @@ function sanitizedNumberPrefix(value: string | null | undefined, fallback: strin
   return (value ?? fallback).replace(/[^A-Za-z0-9]/g, '');
 }
 
+// Order/bill numbering buckets and displayed date/period segments on a
+// tenant-local day. A missing timezone must not silently fall through to the
+// date helpers' own UTC fallback — at a local day/month/year boundary that
+// produces the wrong period segment and sequence bucket for the identifier.
+// Resolves through the country profile when the stored timezone is missing
+// or invalid, matching resolveRegionalSnapshot's own contract — only throws
+// RegionalNotConfiguredError when the country itself is unresolvable.
+function requireTenantTimezone(): string {
+  return resolveRegionalSnapshot({
+    country: getSettingValue('country') ?? undefined,
+    currency: getSettingValue('currency') ?? undefined,
+    timezone: getSettingValue('timezone') ?? undefined,
+  }).timezone;
+}
+
+/** A series that restarts every day repeats its counter, so the date is what keeps each number unique. */
+export function orderNumberIncludesDate(includeDate: boolean, resetDaily: boolean): boolean {
+  return includeDate || resetDaily;
+}
+
+/** A series that restarts every period repeats its counter, so the period is what keeps each number unique. */
+export function invoiceNumberIncludesPeriod(includePeriod: boolean, resetPeriod: string): boolean {
+  return includePeriod || resetPeriod !== 'never';
+}
+
+// Longer suffixes are foreign numbers; lifting the counter to them could exhaust its integer range.
+const MAX_COUNTER_DIGITS = 9;
+
+/**
+ * Draws the next counter value for `bucket` and formats it as `<head>NNNN`. A candidate that is
+ * already issued (settings changed mid-day, a reused prefix, restored or imported rows) lifts the
+ * counter past the highest number issued under the same head instead of failing the sale.
+ */
+function allocateUniqueNumber(
+  sequence: string,
+  bucket: string,
+  table: 'orders' | 'bills',
+  column: 'order_number' | 'bill_number',
+  headParts: string[],
+): string {
+  const head = headParts.length ? `${headParts.join('-')}-` : '';
+  const isIssued = db.prepare(`SELECT 1 FROM ${table} WHERE ${column} = ?`);
+  const highestIssued = db.prepare(`
+    SELECT MAX(CAST(substr(${column}, ?) AS INTEGER)) AS highest
+    FROM ${table}
+    WHERE ${column} GLOB ? AND substr(${column}, ?) NOT GLOB '*[^0-9]*'
+      AND length(${column}) - ? <= ${MAX_COUNTER_DIGITS}
+  `);
+  const liftCounter = db.prepare(
+    'UPDATE sequences SET current_value = MAX(current_value, ?) WHERE name = ? AND date = ?',
+  );
+
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const candidate = head + String(getNextSequence(sequence, bucket)).padStart(4, '0');
+    if (!isIssued.get(candidate)) return candidate;
+    const row = highestIssued.get(
+      head.length + 1,
+      `${head}[0-9]*`,
+      head.length + 1,
+      head.length,
+    ) as { highest: number | null } | undefined;
+    liftCounter.run(row?.highest ?? 0, sequence, bucket);
+  }
+  throw new Error(`Could not allocate a unique ${column}`);
+}
+
 export function generateOrderNumber(): string {
   const prefix = sanitizedNumberPrefix(getSettingValue('order_number_prefix'), 'ORD');
-  const includeDate = getSettingValue('order_number_include_date') !== 'false';
   const resetDaily = getSettingValue('order_number_reset_daily') !== 'false';
-  const timezone = getSettingValue('timezone') || 'Asia/Kolkata';
+  const includeDate = orderNumberIncludesDate(
+    getSettingValue('order_number_include_date') !== 'false',
+    resetDaily,
+  );
+  const timezone = requireTenantTimezone();
 
   // Per-day bucket when reset daily, otherwise a single bucket.
-  const bucket = resetDaily ? dateStampInTimezone(timezone) : 'ALL';
-  const next = getNextSequence('orders', bucket);
-
-  const dateSegment = includeDate ? dateStampInTimezone(timezone) : '';
-  return [prefix, dateSegment, String(next).padStart(4, '0')].filter(Boolean).join('-');
+  const dateStamp = dateStampInTimezone(timezone);
+  const bucket = resetDaily ? dateStamp : 'ALL';
+  return allocateUniqueNumber(
+    'orders',
+    bucket,
+    'orders',
+    'order_number',
+    [prefix, includeDate ? dateStamp : ''].filter(Boolean),
+  );
 }
 
 function tokenBusinessDate(instant: Date = new Date()): string {
@@ -5165,20 +11683,35 @@ export function resetTokenNumber(businessDate: string = tokenBusinessDate()): vo
 
 export function generateBillNumber(): string {
   const prefix = sanitizedNumberPrefix(getSettingValue('invoice_number_prefix'), 'INV');
-  const includePeriod = getSettingValue('invoice_number_include_period') !== 'false';
   const configuredPeriod = getSettingValue('invoice_number_reset_period') || 'daily';
-  const resetPeriod: InvoiceResetPeriod = ['never', 'daily', 'monthly', 'financial_year'].includes(configuredPeriod)
-    ? configuredPeriod as InvoiceResetPeriod
+  const resetPeriod: InvoiceResetPeriod = ['never', 'daily', 'monthly', 'financial_year'].includes(
+    configuredPeriod,
+  )
+    ? (configuredPeriod as InvoiceResetPeriod)
     : 'daily';
-  const timezone = getSettingValue('timezone') || 'Asia/Kolkata';
+  const includePeriod = invoiceNumberIncludesPeriod(
+    getSettingValue('invoice_number_include_period') !== 'false',
+    resetPeriod,
+  );
+  const timezone = requireTenantTimezone();
   const fyStart = clampFinancialYearStart(
     getSettingValue('invoice_financial_year_start_month'),
     getSettingValue('invoice_financial_year_start_day'),
   );
-  const periodSegment = invoicePeriodSegment(resetPeriod === 'never' ? 'daily' : resetPeriod, timezone, fyStart.month, fyStart.day);
+  const periodSegment = invoicePeriodSegment(
+    resetPeriod === 'never' ? 'daily' : resetPeriod,
+    timezone,
+    fyStart.month,
+    fyStart.day,
+  );
   const bucket = resetPeriod === 'never' ? 'ALL' : periodSegment;
-  const next = getNextSequence('bills', bucket);
-  return [prefix, includePeriod ? periodSegment : '', String(next).padStart(4, '0')].filter(Boolean).join('-');
+  return allocateUniqueNumber(
+    'bills',
+    bucket,
+    'bills',
+    'bill_number',
+    [prefix, includePeriod ? periodSegment : ''].filter(Boolean),
+  );
 }
 
 export function now(): string {
@@ -5186,10 +11719,120 @@ export function now(): string {
   return new Date().toISOString().replace('T', ' ').replace(/\..*$/, '');
 }
 
-/** Records who performed an order/item mutation (docs/business-decisions.md). */
+let lastAuthLogicalMs = 0;
+
+function readPersistedMaxTokensValidAfterMs(): number {
+  if (!db) return 0;
+  let maxMs = 0;
+  try {
+    const row = db
+      .prepare(
+        `SELECT
+           MAX(CASE WHEN tokens_valid_after NOT LIKE '+%' THEN tokens_valid_after END) AS max_four_digit,
+           MAX(CASE WHEN tokens_valid_after LIKE '+%' THEN tokens_valid_after END) AS max_extended
+         FROM users
+         WHERE tokens_valid_after IS NOT NULL`,
+      )
+      .get() as { max_four_digit?: string | null; max_extended?: string | null } | undefined;
+    for (const candidateRaw of [row?.max_four_digit, row?.max_extended]) {
+      if (!candidateRaw) continue;
+      const raw = candidateRaw.trim();
+      const parsedMs = parseDbTimestamp(raw).getTime();
+      if (
+        Number.isSafeInteger(parsedMs) &&
+        parsedMs > 0 &&
+        parsedMs <= MAX_AUTH_CLOCK_HIGH_WATER_MS
+      ) {
+        const candidateMs = /\.\d+/.test(raw) ? parsedMs : parsedMs + 999;
+        if (candidateMs <= MAX_AUTH_CLOCK_HIGH_WATER_MS) {
+          maxMs = Math.max(maxMs, candidateMs);
+        }
+      }
+    }
+  } catch {}
+  try {
+    const settingRow = db
+      .prepare('SELECT value FROM settings WHERE key = ?')
+      .get(AUTH_CLOCK_HIGH_WATER_SETTING_KEY) as { value?: string | null } | undefined;
+    const highWaterMs = parseValidAuthClockHighWaterMs(settingRow?.value);
+    if (highWaterMs !== null) {
+      maxMs = Math.max(maxMs, highWaterMs);
+    }
+  } catch {}
+  return maxMs;
+}
+
+export function resetAuthClockForTests(): void {
+  lastAuthLogicalMs = 0;
+}
+
+/** Monotonic millisecond clock shared by JWT issuance and `tokens_valid_after` updates. */
+export function nextAuthTimestampMs(): number {
+  const rawWallMs = Date.now();
+  const wallMs =
+    Number.isSafeInteger(rawWallMs) && rawWallMs > 0
+      ? Math.min(rawWallMs, MAX_AUTH_CLOCK_HIGH_WATER_MS)
+      : 1;
+  const persistedMaxMs = readPersistedMaxTokensValidAfterMs();
+  const boundedLastNextMs =
+    lastAuthLogicalMs > 0 ? Math.min(lastAuthLogicalMs + 1, MAX_JS_DATE_NON_BOUNDARY_MS) : 0;
+  const boundedPersistedNextMs =
+    persistedMaxMs > 0 ? Math.min(persistedMaxMs + 1, MAX_JS_DATE_NON_BOUNDARY_MS) : 0;
+  let nextMs = Math.max(wallMs, boundedLastNextMs, boundedPersistedNextMs);
+  // Avoid exact `.000` second boundaries so sub-second `iat` remains distinct from legacy integer `iat`.
+  if (nextMs % 1000 === 0) {
+    nextMs += 1;
+  }
+  if (nextMs > MAX_JS_DATE_NON_BOUNDARY_MS) {
+    nextMs = MAX_JS_DATE_NON_BOUNDARY_MS;
+  }
+  lastAuthLogicalMs = nextMs;
+  if (db) {
+    const persistedHighWaterMs = Math.min(nextMs, MAX_AUTH_CLOCK_HIGH_WATER_MS);
+    try {
+      db.prepare(
+        `INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+         WHERE settings.value IS NULL
+            OR settings.value = ''
+            OR length(settings.value) > 16
+            OR settings.value GLOB '*[^0-9]*'
+            OR CAST(settings.value AS INTEGER) <= 0
+            OR CAST(settings.value AS INTEGER) > ?
+            OR CAST(settings.value AS INTEGER) < CAST(excluded.value AS INTEGER)`,
+      ).run(
+        AUTH_CLOCK_HIGH_WATER_SETTING_KEY,
+        String(persistedHighWaterMs),
+        now(),
+        MAX_AUTH_CLOCK_HIGH_WATER_MS,
+      );
+    } catch (error) {
+      console.warn('[DB] Could not persist auth clock high-water mark:', error);
+    }
+  }
+  return nextMs;
+}
+
+/** Monotonic sub-second `iat` claim (in seconds) for JWT issuance. */
+export function nextTokenIatSeconds(): number {
+  return nextAuthTimestampMs() / 1000;
+}
+
+/** Monotonic UTC millisecond timestamp (`YYYY-MM-DD HH:MM:SS.SSS`) for `users.tokens_valid_after`. */
+export function nextTokensValidAfterTimestamp(): string {
+  return new Date(nextAuthTimestampMs()).toISOString().replace('T', ' ').replace('Z', '');
+}
+
+/** Records who performed an order/item mutation (docs/reference/product-invariants.md). */
 export function recordOrderAudit(
   db: ReturnType<typeof getDatabase>,
-  params: { orderId: number | string; orderItemId?: number | string | null; actorUserId: string; action: string; details?: Record<string, unknown> },
+  params: {
+    orderId: number | string;
+    orderItemId?: number | string | null;
+    actorUserId: string;
+    action: string;
+    details?: Record<string, unknown>;
+  },
 ): void {
   db.prepare(`
     INSERT INTO order_audit_log (order_id, order_item_id, actor_user_id, action, details_json, created_at)
@@ -5204,11 +11847,39 @@ export function recordOrderAudit(
   );
 }
 
+/** Records an authentication event (e.g. PIN sign-in success, failure, or rate-limit lockout). */
+export function recordAuthAudit(
+  dbInstance: ReturnType<typeof getDatabase>,
+  params: {
+    userId: string | null;
+    eventType: string;
+    outcome: 'success' | 'failure' | 'rate_limited';
+    ipAddress?: string | null;
+    details?: Record<string, unknown>;
+  },
+): void {
+  dbInstance
+    .prepare(`
+      INSERT INTO auth_audit_log (user_id, event_type, outcome, ip_address, details_json, created_at)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `)
+    .run(
+      params.userId ?? null,
+      params.eventType,
+      params.outcome,
+      params.ipAddress ?? null,
+      params.details ? JSON.stringify(params.details) : null,
+      now(),
+    );
+}
+
 /** Parse DB timestamp into Date, ensuring space-delimited timestamps parse as UTC. */
 export function parseDbTimestamp(ts: string | null | undefined): Date {
   if (!ts) return new Date(NaN);
   // Space form: append a Z so V8 parses it as UTC instead of machine-local.
-  return /^\d{4}-\d{2}-\d{2} /.test(ts) ? new Date(`${ts.replace(' ', 'T')}Z`) : new Date(ts);
+  return /^(?:\d{4}|\+\d{6})-\d{2}-\d{2} /.test(ts)
+    ? new Date(`${ts.replace(' ', 'T')}Z`)
+    : new Date(ts);
 }
 
 /** "Today" as a `YYYY-MM-DD` string in UTC for non-tenant uses. */
@@ -5216,94 +11887,41 @@ export function utcTodayDate(): string {
   return new Date().toISOString().slice(0, 10);
 }
 
-function parseStartTimeOffsetMs(startTime: string = '00:00'): number {
-  const match = /^([01]\d|2[0-3]):([0-5]\d)$/.exec(startTime.trim());
-  if (!match) return 0;
-  const hours = Number(match[1]);
-  const minutes = Number(match[2]);
-  return (hours * 60 + minutes) * 60 * 1000;
-}
+// The business-day rule lives in shared/business-date.ts so the renderer cannot
+// restate it. These re-exports keep the existing importer surface for one
+// release: every remaining import of a business-date symbol from this module is
+// visible in review instead of hidden behind a silent copy. Delete them and
+// repoint the importers in a follow-on, or the move is cosmetic.
+export { dayBoundsInTimezone, utcDayBounds };
 
-function calendarDateInTimezone(instant: Date, timezone: string): string {
-  try {
-    const parts = new Intl.DateTimeFormat('en-US', {
-      timeZone: timezone,
-      year: 'numeric',
-      month: '2-digit',
-      day: '2-digit',
-    }).formatToParts(instant);
-    const get = (type: string) => parts.find((part) => part.type === type)?.value ?? '';
-    return `${get('year')}-${get('month')}-${get('day')}`;
-  } catch {
-    return instant.toISOString().slice(0, 10);
-  }
-}
-
-/** Return the business date represented by an instant in an IANA timezone with an optional day start offset. */
-export function localDateInTimezone(instant: Date, timezone: string, startTime: string = '00:00'): string {
-  if (parseStartTimeOffsetMs(startTime) === 0) return calendarDateInTimezone(instant, timezone);
-
-  const calendarDate = calendarDateInTimezone(instant, timezone);
-  const [start] = dayBoundsInTimezone(calendarDate, timezone, startTime);
-  if (instant >= parseDbTimestamp(start)) return calendarDate;
-
-  const [year, month, day] = calendarDate.split('-').map(Number);
-  return new Date(Date.UTC(year, month - 1, day - 1)).toISOString().slice(0, 10);
-}
-
-function timezoneOffsetMilliseconds(instant: Date, timezone: string): number {
-  const parts = new Intl.DateTimeFormat('en-US', {
-    timeZone: timezone,
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit',
-    hourCycle: 'h23',
-  }).formatToParts(instant);
-  const get = (type: string) => Number(parts.find((part) => part.type === type)?.value);
-  return Date.UTC(get('year'), get('month') - 1, get('day'), get('hour'), get('minute'), get('second')) - instant.getTime();
-}
-
-/** Half-open UTC ranges `[start, end)` for one date in the tenant timezone with an optional day start offset. */
-export function dayBoundsInTimezone(date: string, timezone: string, startTime: string = '00:00'): [string, string] {
-  const [y, m, d] = date.split('-').map(Number);
-  const format = (instant: Date) => instant.toISOString().replace('T', ' ').replace(/\..*$/, '');
-  const offsetMinutes = parseStartTimeOffsetMs(startTime) / 60000;
-  const startHour = Math.floor(offsetMinutes / 60);
-  const startMinute = offsetMinutes % 60;
-  try {
-    const toUtc = (localWallTime: number): Date => {
-      let instant = new Date(localWallTime);
-      for (let attempt = 0; attempt < 3; attempt++) {
-        instant = new Date(localWallTime - timezoneOffsetMilliseconds(instant, timezone));
-      }
-      return instant;
-    };
-    return [
-      format(toUtc(Date.UTC(y, m - 1, d, startHour, startMinute))),
-      format(toUtc(Date.UTC(y, m - 1, d + 1, startHour, startMinute))),
-    ];
-  } catch {
-    return utcDayBounds(date, startTime);
-  }
-}
-
-/** Half-open UTC range strings `[start, end)` for a UTC calendar date with an optional day start offset. */
-export function utcDayBounds(date: string, startTime: string = '00:00'): [string, string] {
-  const [y, m, d] = date.split('-').map(Number);
-  const offsetMs = parseStartTimeOffsetMs(startTime);
-  const start = new Date(Date.UTC(y, m - 1, d, 0, 0, 0) + offsetMs);
-  const end = new Date(start.getTime() + 24 * 3600 * 1000);
-  const fmt = (dt: Date) => dt.toISOString().replace('T', ' ').replace(/\..*$/, '');
-  return [fmt(start), fmt(end)];
+/** Deprecated positional alias of `businessDateForInstant`, kept so the existing
+ *  `localDateInTimezone(instant, timezone, startTime)` importers keep their exact
+ *  signature for one release. A bare rename would have changed the argument order
+ *  of a live export without any of those callers changing. */
+export function localDateInTimezone(
+  instant: Date,
+  timezone: string,
+  startTime: string = '00:00',
+): string {
+  return businessDateForInstant({ instant, timezone, startTime });
 }
 
 /** Verify a user PIN against the stored pin_hash. */
-export function verifyPin(storedHash: string | null | undefined, inputPin: string | number): boolean {
+export function verifyPin(
+  storedHash: string | null | undefined,
+  inputPin: string | number,
+): boolean {
   if (!storedHash || !inputPin) return false;
   return bcrypt.compareSync(String(inputPin), storedHash);
+}
+
+/** Verify a user PIN against the stored pin_hash asynchronously without blocking the event loop. */
+export async function verifyPinAsync(
+  storedHash: string | null | undefined,
+  inputPin: string | number,
+): Promise<boolean> {
+  if (!storedHash || !inputPin) return false;
+  return bcrypt.compare(String(inputPin), storedHash);
 }
 
 // Duration a voided in-progress item remains visible on KDS boards before dropping off.
@@ -5315,26 +11933,221 @@ export function isVoidedItemKdsVisible(voidedAt: string | null | undefined): boo
   return Date.now() - parseDbTimestamp(voidedAt).getTime() < KDS_VOIDED_ITEM_VISIBILITY_MS;
 }
 
+export const ACTIVE_RELEASED_KDS_ORDER_IDS_SQL = `
+  SELECT id FROM orders
+  WHERE release_status = 'released' AND status IN ('pending', 'preparing', 'ready', 'served')
+  UNION
+  SELECT active_o.id FROM orders active_o
+  JOIN order_items active_oi ON active_oi.order_id = active_o.id
+    AND active_oi.status NOT IN ('served', 'cancelled')
+  WHERE active_o.release_status = 'released'
+    AND active_o.status NOT IN ('pending', 'preparing', 'ready', 'served', 'cancelled')
+`;
+
+export const UNRELEASED_KDS_ORDER_ITEM_ERROR =
+  'Scheduled order has not been released to the kitchen yet';
+
+export function getKdsItemParentOrderState(
+  dbInstance: ReturnType<typeof getDatabase>,
+  orderId: number | string,
+): 'released' | 'unreleased' | 'missing' {
+  const parentOrder = dbInstance
+    .prepare('SELECT id, release_status FROM orders WHERE id = ?')
+    .get(orderId) as { id: number; release_status?: string | null } | undefined;
+  if (!parentOrder) return 'missing';
+  if (parentOrder.release_status && parentOrder.release_status !== 'released') {
+    return 'unreleased';
+  }
+  return 'released';
+}
+
+export function hasActiveUnservedOrderItems(
+  dbInstance: ReturnType<typeof getDatabase>,
+  orderId: number | string,
+): boolean {
+  const row = dbInstance
+    .prepare(
+      "SELECT 1 FROM order_items WHERE order_id = ? AND status IN ('pending', 'preparing', 'ready') LIMIT 1",
+    )
+    .get(orderId);
+  return Boolean(row);
+}
+
+export function isOrderSettledAndNonRefunded(
+  dbInstance: ReturnType<typeof getDatabase>,
+  orderId: number | string,
+): boolean {
+  const orderRow = dbInstance
+    .prepare('SELECT id, total, round_off FROM orders WHERE id = ?')
+    .get(orderId) as { id: number; total?: number | null; round_off?: number | null } | undefined;
+  if (!orderRow) return false;
+
+  const billRows = dbInstance
+    .prepare(
+      `SELECT b.total, b.round_off, b.paid_amount, b.balance, b.payment_status, b.payment_details,
+              COALESCE((SELECT SUM(r.amount_cents) FROM refunds r WHERE r.bill_id = b.id), 0) AS refunded_cents
+       FROM bills b
+       WHERE b.order_id = ?`,
+    )
+    .all(orderId) as Array<{
+    total?: number | null;
+    round_off?: number | null;
+    paid_amount?: number | null;
+    balance?: number | null;
+    payment_status?: string | null;
+    payment_details?: unknown;
+    refunded_cents?: number | null;
+  }>;
+  if (billRows.length === 0) return false;
+  for (const bill of billRows) {
+    if (bill.payment_status !== 'paid') return false;
+    if (Math.round(Number(bill.refunded_cents || 0)) > 0) return false;
+  }
+
+  const regionalRows = dbInstance
+    .prepare("SELECT key, value FROM settings WHERE key IN ('currency', 'country')")
+    .all() as Array<{ key: string; value: string }>;
+  const regionalSettings = Object.fromEntries(regionalRows.map((row) => [row.key, row.value]));
+  const tenantCurrency = resolveTenantCurrency(
+    regionalSettings.currency,
+    regionalSettings.country || '',
+  );
+  const minorFactor = getCurrencyMinorUnitFactor(tenantCurrency);
+
+  let billedCoverageMinor = 0;
+  for (const bill of billRows) {
+    const totalMinor = Math.max(0, Math.round(Number(bill.total || 0) * minorFactor));
+    const roundOffMinor = Math.round(Number(bill.round_off || 0) * minorFactor);
+    const unroundedTotalMinor = Math.max(0, totalMinor - roundOffMinor);
+    const paidMinor = Math.max(0, Math.round(Number(bill.paid_amount || 0) * minorFactor));
+    const fallbackBalance = Math.max(0, Number(bill.total || 0) - Number(bill.paid_amount || 0));
+    const storedBalanceMinor = Math.max(
+      0,
+      Math.round(Number(bill.balance ?? fallbackBalance) * minorFactor),
+    );
+    let parsedPaymentDetails: Array<{ amount?: unknown }> = [];
+    if (typeof bill.payment_details === 'string' && bill.payment_details.trim()) {
+      try {
+        const parsed = JSON.parse(bill.payment_details);
+        if (Array.isArray(parsed)) parsedPaymentDetails = parsed;
+      } catch {
+        parsedPaymentDetails = [];
+      }
+    } else if (Array.isArray(bill.payment_details)) {
+      parsedPaymentDetails = bill.payment_details as Array<{ amount?: unknown }>;
+    }
+    const detailsPaidMinor = parsedPaymentDetails.reduce(
+      (sum, entry) => sum + Math.max(0, Math.round(Number(entry?.amount || 0) * minorFactor)),
+      0,
+    );
+    const recordedPaidMinor = Math.max(paidMinor, detailsPaidMinor);
+    if (storedBalanceMinor > 0 || recordedPaidMinor < totalMinor) return false;
+
+    billedCoverageMinor += Math.max(totalMinor, unroundedTotalMinor);
+  }
+
+  const orderTotalMinor = Math.max(0, Math.round(Number(orderRow.total || 0) * minorFactor));
+  const orderRoundOffMinor = Math.round(Number(orderRow.round_off || 0) * minorFactor);
+  const effectiveOrderTargetMinor = Math.min(
+    orderTotalMinor,
+    Math.max(0, orderTotalMinor - orderRoundOffMinor),
+  );
+  return billedCoverageMinor >= effectiveOrderTargetMinor;
+}
+
+export function completeSettledReleasedOrderIfServed(
+  dbInstance: ReturnType<typeof getDatabase>,
+  orderId: number | string,
+  changedAt: string = now(),
+): boolean {
+  const orderRow = dbInstance
+    .prepare('SELECT id, status, release_status, table_id, type FROM orders WHERE id = ?')
+    .get(orderId) as
+    | {
+        id: number;
+        status: string;
+        release_status?: string | null;
+        table_id?: string | null;
+        type?: string | null;
+      }
+    | undefined;
+  if (!orderRow) return false;
+  if (orderRow.status === 'completed' || orderRow.status === 'cancelled') return false;
+  if (orderRow.release_status && orderRow.release_status !== 'released') return false;
+  if (orderRow.type === 'dine_in' && orderRow.table_id) return false;
+  if (hasActiveUnservedOrderItems(dbInstance, orderId)) return false;
+
+  const hasServedItem = dbInstance
+    .prepare("SELECT 1 FROM order_items WHERE order_id = ? AND status = 'served' LIMIT 1")
+    .get(orderId);
+  if (!hasServedItem) return false;
+  if (!isOrderSettledAndNonRefunded(dbInstance, orderId)) return false;
+
+  const updated = dbInstance
+    .prepare(
+      `UPDATE orders
+       SET status = 'completed',
+           completed_at = COALESCE(completed_at, ?),
+           updated_at = ?
+       WHERE id = ? AND status NOT IN ('completed', 'cancelled')`,
+    )
+    .run(changedAt, changedAt, orderId);
+  if (updated.changes !== 1) return false;
+
+  if (orderRow.table_id) {
+    dbInstance
+      .prepare("UPDATE tables SET status = 'available', updated_at = ? WHERE id = ?")
+      .run(changedAt, orderRow.table_id);
+  }
+  return true;
+}
+
 /** Remove customer/payment/order-financial fields from category-scoped KDS payloads. */
 export function projectKdsOrder(order: any, restricted: boolean): any {
   if (!restricted) return order;
   const allowedFields = [
-    'id', 'order_number', 'type', 'guest_count',
-    'special_instructions', 'status', 'created_at', 'updated_at',
-    'table_name', 'table_number', 'floor', 'section',
+    'id',
+    'order_number',
+    'type',
+    'guest_count',
+    'special_instructions',
+    'status',
+    'created_at',
+    'updated_at',
+    'table_name',
+    'table_number',
+    'floor',
+    'section',
   ];
-  return Object.fromEntries(allowedFields.filter((field) => field in order).map((field) => [field, order[field]]));
+  return Object.fromEntries(
+    allowedFields.filter((field) => field in order).map((field) => [field, order[field]]),
+  );
 }
 
 /** Keep category-scoped KDS lines limited to kitchen-operational fields. */
 export function projectKdsItem(item: any, restricted: boolean): any {
   if (!restricted) return item;
   const allowedFields = [
-    'id', 'order_id', 'product_id', 'product_name', 'product_sku',
-    'quantity', 'status', 'special_instructions', 'created_at', 'updated_at',
-    'order_number', 'type', 'table_name', 'order_status', 'order_notes', 'order_time',
+    'id',
+    'order_id',
+    'product_id',
+    'product_name',
+    'product_sku',
+    'quantity',
+    'status',
+    'special_instructions',
+    'created_at',
+    'updated_at',
+    'order_number',
+    'type',
+    'table_name',
+    'order_status',
+    'order_notes',
+    'order_time',
   ];
-  const projected = Object.fromEntries(allowedFields.filter((field) => field in item).map((field) => [field, item[field]]));
+  const projected = Object.fromEntries(
+    allowedFields.filter((field) => field in item).map((field) => [field, item[field]]),
+  );
   if (Array.isArray(item.addons)) {
     projected.addons = item.addons.map((addon: any) => {
       const safeAddon: Record<string, any> = {};
@@ -5348,14 +12161,23 @@ export function projectKdsItem(item: any, restricted: boolean): any {
 }
 
 /** Avoid exposing printer/network credentials in restricted KDS station metadata. */
-export function projectKdsStation(station: any, restricted: boolean, userCategoryIds: string[] = []): any {
+export function projectKdsStation(
+  station: any,
+  restricted: boolean,
+  userCategoryIds: string[] = [],
+): any {
   if (!restricted) return station;
   const allowedFields = ['id', 'name', 'description', 'category_ids', 'sort_order', 'is_active'];
-  const projected = Object.fromEntries(allowedFields.filter((field) => field in station).map((field) => [field, station[field]]));
+  const projected = Object.fromEntries(
+    allowedFields.filter((field) => field in station).map((field) => [field, station[field]]),
+  );
   if (typeof projected.category_ids === 'string' && userCategoryIds.length > 0) {
     try {
       const parsed = JSON.parse(projected.category_ids);
-      if (Array.isArray(parsed)) projected.category_ids = JSON.stringify(parsed.filter((id) => userCategoryIds.includes(String(id))));
+      if (Array.isArray(parsed))
+        projected.category_ids = JSON.stringify(
+          parsed.filter((id) => userCategoryIds.includes(String(id))),
+        );
     } catch {
       projected.category_ids = '[]';
     }
@@ -5367,21 +12189,41 @@ export function projectKdsStation(station: any, restricted: boolean, userCategor
 export function insertOrderItemAddons(
   dbInstance: Database.Database,
   orderItemId: number | bigint,
-  addons: { id?: string; name?: string; price?: number; quantity?: number }[] | null | undefined,
-  createdAt: string
+  addons:
+    | {
+        id?: string;
+        name?: string;
+        price?: number;
+        quantity?: number;
+        inventory_deducted_quantity?: number;
+      }[]
+    | null
+    | undefined,
+  createdAt: string,
 ): void {
   if (!addons || !Array.isArray(addons) || addons.length === 0) return;
   const addonExists = dbInstance.prepare('SELECT 1 FROM addons WHERE id = ?');
   const insertAddon = dbInstance.prepare(`
-    INSERT INTO order_item_addons (order_item_id, addon_id, addon_name, price, quantity, created_at)
-    VALUES (?, ?, ?, ?, ?, ?)
+    INSERT INTO order_item_addons (order_item_id, addon_id, addon_name, price, quantity, inventory_deducted_quantity, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
   `);
   for (const addon of addons) {
     if (!addon || !addon.name) continue;
     // Fall back to NULL addon_id if missing from catalog to prevent FK failure.
     const linkedAddonId = addon.id && addonExists.get(addon.id) ? addon.id : null;
     const qty = Math.max(1, Math.floor(Number(addon.quantity) || 1));
-    insertAddon.run(orderItemId, linkedAddonId, addon.name, addon.price || 0, qty, createdAt);
+    // The snapshot of what this line took out of the add-on pool, so a later
+    // cancel returns exactly this much instead of whatever the catalog says.
+    const deductedQuantity = Math.max(0, Number(addon.inventory_deducted_quantity) || 0);
+    insertAddon.run(
+      orderItemId,
+      linkedAddonId,
+      addon.name,
+      addon.price || 0,
+      qty,
+      deductedQuantity,
+      createdAt,
+    );
   }
 }
 
@@ -5389,7 +12231,11 @@ export function insertOrderItemAddons(
 export function parseItemJson(item: any): any {
   const tryParse = (val: any) => {
     if (typeof val !== 'string') return val;
-    try { return JSON.parse(val); } catch { return val; }
+    try {
+      return JSON.parse(val);
+    } catch {
+      return val;
+    }
   };
   return {
     ...item,
@@ -5397,30 +12243,108 @@ export function parseItemJson(item: any): any {
     modifier_selection: tryParse(item.modifier_selection),
     tax_breakdown: tryParse(item.tax_breakdown),
     tax_snapshot: tryParse(item.tax_snapshot),
+    recipe_snapshot: tryParse(item.recipe_snapshot),
   };
 }
 
-/** Resolves selected addons for a batch of order_items rows from order_item_addons. */
+/** Resolves selected addons and item audit metadata for a batch of order_items rows. */
 export function attachEffectiveAddons<T extends { id: number }>(
   dbInstance: Database.Database,
-  items: T[]
-): (T & { addons: { id: string | null; name: string; price: number; quantity: number }[] })[] {
-  if (items.length === 0) return items as (T & { addons: { id: string | null; name: string; price: number; quantity: number }[] })[];
+  items: T[],
+): (T & {
+  addons: { id: string | null; name: string; price: number; quantity: number }[];
+  edit_version: number;
+  superseded?: boolean;
+})[] {
+  if (items.length === 0)
+    return items as (T & {
+      addons: { id: string | null; name: string; price: number; quantity: number }[];
+      edit_version: number;
+      superseded?: boolean;
+    })[];
 
   const ids = items.map((item) => item.id);
-  const placeholders = ids.map(() => '?').join(',');
-  const rows = dbInstance.prepare(
-    `SELECT * FROM order_item_addons WHERE order_item_id IN (${placeholders}) ORDER BY id`
-  ).all(...ids) as { order_item_id: number; addon_id: string | null; addon_name: string; price: number; quantity: number }[];
+  const CHUNK_SIZE = 400;
 
-  const byItem = new Map<number, { id: string | null; name: string; price: number; quantity: number }[]>();
-  for (const row of rows) {
-    const list = byItem.get(row.order_item_id) || [];
-    list.push({ id: row.addon_id, name: row.addon_name, price: row.price, quantity: row.quantity });
-    byItem.set(row.order_item_id, list);
+  const byItem = new Map<
+    number,
+    { id: string | null; name: string; price: number; quantity: number }[]
+  >();
+  for (let offset = 0; offset < ids.length; offset += CHUNK_SIZE) {
+    const chunk = ids.slice(offset, offset + CHUNK_SIZE);
+    const placeholders = chunk.map(() => '?').join(',');
+    const rows = dbInstance
+      .prepare(
+        `SELECT * FROM order_item_addons WHERE order_item_id IN (${placeholders}) ORDER BY id`,
+      )
+      .all(...chunk) as {
+      order_item_id: number;
+      addon_id: string | null;
+      addon_name: string;
+      price: number;
+      quantity: number;
+    }[];
+    for (const row of rows) {
+      const list = byItem.get(row.order_item_id) || [];
+      list.push({
+        id: row.addon_id,
+        name: row.addon_name,
+        price: row.price,
+        quantity: row.quantity,
+      });
+      byItem.set(row.order_item_id, list);
+    }
   }
 
-  return items.map((item) => ({ ...item, addons: byItem.get(item.id) || [] }));
+  const editVersionByItem = new Map<number, number>();
+  const supersededItemIds = new Set<number>();
+  try {
+    for (let offset = 0; offset < ids.length; offset += CHUNK_SIZE) {
+      const chunk = ids.slice(offset, offset + CHUNK_SIZE);
+      const placeholders = chunk.map(() => '?').join(',');
+      const auditRows = dbInstance
+        .prepare(
+          `SELECT id, order_item_id, action, details_json FROM order_audit_log WHERE order_item_id IN (${placeholders}) ORDER BY id`,
+        )
+        .all(...chunk) as {
+        id: number;
+        order_item_id: number | string | null;
+        action: string;
+        details_json: string | null;
+      }[];
+      for (const audit of auditRows) {
+        const itemId = Number(audit.order_item_id);
+        if (!Number.isFinite(itemId)) continue;
+        const prev = editVersionByItem.get(itemId) ?? 0;
+        if (audit.id > prev) editVersionByItem.set(itemId, audit.id);
+        if (audit.action === 'item_edited' && audit.details_json) {
+          try {
+            const details = JSON.parse(audit.details_json) as { superseded?: unknown } | null;
+            if (details?.superseded === true) {
+              supersededItemIds.add(itemId);
+            }
+          } catch {
+            // Ignore malformed audit details_json.
+          }
+        }
+      }
+    }
+  } catch {
+    // Partial test schemas without order_audit_log default to edit_version 0.
+  }
+
+  return items.map((item) => {
+    const itemId = Number(item.id);
+    const status = (item as { status?: string }).status;
+    const isSuperseded =
+      supersededItemIds.has(itemId) && (status === 'cancelled' || status === 'voided');
+    return {
+      ...item,
+      addons: byItem.get(item.id) || [],
+      edit_version: editVersionByItem.get(itemId) ?? 0,
+      ...(isSuperseded ? { superseded: true } : {}),
+    };
+  });
 }
 
 /** Parse JSON text columns on bill/order rows returned from SQLite. */
@@ -5428,7 +12352,11 @@ export function parseRowJson(row: any): any {
   if (!row) return row;
   const tryParse = (val: any) => {
     if (typeof val !== 'string') return val;
-    try { return JSON.parse(val); } catch { return val; }
+    try {
+      return JSON.parse(val);
+    } catch {
+      return val;
+    }
   };
 
   // tax_breakdown is stored as an array of per-item breakdowns (array of arrays).
@@ -5437,8 +12365,8 @@ export function parseRowJson(row: any): any {
   if (Array.isArray(taxBreakdown) && taxBreakdown.length > 0 && Array.isArray(taxBreakdown[0])) {
     let fractionDigits = 2;
     try {
-      fractionDigits = getCurrencyFractionDigits(getSettingValue('currency') || 'INR');
-    } catch { }
+      fractionDigits = getCurrencyFractionDigits(getSettingValue('currency') || '');
+    } catch {}
     const merged: Record<string, { title: string; rate: number; amount: number }> = {};
     for (const itemBreakdown of taxBreakdown) {
       if (!Array.isArray(itemBreakdown)) continue;
@@ -5450,10 +12378,12 @@ export function parseRowJson(row: any): any {
         merged[key].amount += line.amount;
       }
     }
-    taxBreakdown = Object.values(merged).filter((line) => line.amount !== 0).map((line) => ({
-      ...line,
-      amount: Number(line.amount.toFixed(fractionDigits)),
-    }));
+    taxBreakdown = Object.values(merged)
+      .filter((line) => line.amount !== 0)
+      .map((line) => ({
+        ...line,
+        amount: Number(line.amount.toFixed(fractionDigits)),
+      }));
   }
 
   return {

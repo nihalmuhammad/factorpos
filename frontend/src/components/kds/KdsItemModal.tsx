@@ -9,6 +9,7 @@ import {
   type KitchenStatus,
   type KdsOrderItem,
 } from '@/hooks/useKdsConnection';
+import { formatItemHeading } from '@/lib/printer/item-heading';
 
 export interface KdsItemModalProps {
   item: KdsOrderItem;
@@ -18,16 +19,24 @@ export interface KdsItemModalProps {
   onUpdateStatus: (itemId: number, status: KitchenStatus) => void;
 }
 
-export function KdsItemModal({ item, orderNumber, updating, onClose, onUpdateStatus }: KdsItemModalProps) {
+export function KdsItemModal({
+  item,
+  orderNumber,
+  updating,
+  onClose,
+  onUpdateStatus,
+}: KdsItemModalProps) {
   const t = useTranslations('kds');
   const tCommon = useTranslations('common');
   const statusLabel = (s: KitchenStatus) => t(STATUS_CONFIG[normalizeKitchenStatus(s)].labelKey);
   const currentStatus = normalizeKitchenStatus(item.status);
   // 'voided' status is locked and excluded from sequential status transitions.
   const isVoided = currentStatus === 'voided';
-  const currentIdx = isVoided ? -1 : STATUS_ORDER.indexOf(currentStatus as Exclude<KitchenStatus, 'voided'>);
-  const next = !isVoided ? STATUS_ORDER[currentIdx + 1] ?? null : null;
-  const prev = !isVoided ? STATUS_ORDER[currentIdx - 1] ?? null : null;
+  const currentIdx = isVoided
+    ? -1
+    : STATUS_ORDER.indexOf(currentStatus as Exclude<KitchenStatus, 'voided'>);
+  const next = !isVoided ? (STATUS_ORDER[currentIdx + 1] ?? null) : null;
+  const prev = !isVoided ? (STATUS_ORDER[currentIdx - 1] ?? null) : null;
 
   return (
     <div
@@ -43,15 +52,22 @@ export function KdsItemModal({ item, orderNumber, updating, onClose, onUpdateSta
       >
         <div className="flex items-start justify-between gap-3">
           <div className="flex-1 min-w-0">
-            <p className="text-xs text-gray-400 font-medium mb-1">
+            <p className="text-xs text-slate-700 dark:text-slate-300 font-medium mb-1">
               {t('modalOrderNumber', { orderNumber })}
             </p>
-            <h2 id="kds-item-modal-title" className={`text-2xl font-bold leading-tight ${isVoided ? 'text-gray-400 line-through' : 'text-foreground'}`}>{item.product_name}</h2>
+            <h2
+              id="kds-item-modal-title"
+              className={`text-2xl font-bold leading-tight ${isVoided ? 'text-slate-700 dark:text-slate-200 line-through' : 'text-foreground'}`}
+            >
+              {formatItemHeading(item.product_name, item.variant_selection)}
+            </h2>
             <div className="flex items-center gap-2 mt-1.5">
               <span className={`text-sm font-bold ${STATUS_CONFIG[currentStatus].text}`}>
                 {item.quantity}×
               </span>
-              <span className={`inline-flex items-center gap-1 text-xs font-medium px-2 py-0.5 rounded-full ${STATUS_CONFIG[currentStatus].bg} ${STATUS_CONFIG[currentStatus].text}`}>
+              <span
+                className={`inline-flex items-center gap-1 text-xs font-medium px-2 py-0.5 rounded-full ${STATUS_CONFIG[currentStatus].bg} ${STATUS_CONFIG[currentStatus].text}`}
+              >
                 <div className={`w-1.5 h-1.5 rounded-full ${STATUS_CONFIG[currentStatus].color}`} />
                 {statusLabel(currentStatus)}
               </span>
@@ -59,7 +75,7 @@ export function KdsItemModal({ item, orderNumber, updating, onClose, onUpdateSta
           </div>
           <button
             onClick={onClose}
-            className="w-9 h-9 rounded-full bg-muted flex items-center justify-center text-muted-foreground hover:bg-gray-200 shrink-0"
+            className="w-9 h-9 rounded-full bg-muted flex items-center justify-center text-slate-700 dark:text-slate-300 hover:bg-muted/80 hover:text-foreground shrink-0"
             aria-label={tCommon('close')}
           >
             <X size={18} />
@@ -67,17 +83,18 @@ export function KdsItemModal({ item, orderNumber, updating, onClose, onUpdateSta
         </div>
 
         {item.addons && item.addons.length > 0 && (
-          <div className="bg-blue-50 rounded-xl p-3">
-            <p className="text-xs font-semibold text-blue-700 mb-1.5 uppercase tracking-wide">
+          <div className="bg-blue-50 dark:bg-blue-950/60 border-s-4 border-blue-500 rounded-e-xl p-3">
+            <p className="text-xs font-semibold text-blue-900 dark:text-blue-200 mb-1.5 uppercase tracking-wide">
               {t('addonsLabel')}
             </p>
             <div className="flex flex-wrap gap-1.5">
               {item.addons.map((addon, i) => (
                 <span
                   key={`${addon.id ?? addon.name}-${i}`}
-                  className="text-sm bg-card text-blue-700 px-2.5 py-1 rounded-lg border border-blue-200 font-medium"
+                  className="text-sm bg-blue-100/90 text-blue-900 dark:bg-blue-900/60 dark:text-blue-200 px-2.5 py-1 rounded-lg font-medium"
                 >
-                  + {addon.name}{(addon.quantity || 1) > 1 ? ` ×${addon.quantity}` : ''}
+                  + {addon.name}
+                  {(addon.quantity || 1) > 1 ? ` ×${addon.quantity}` : ''}
                 </span>
               ))}
             </div>
@@ -85,11 +102,13 @@ export function KdsItemModal({ item, orderNumber, updating, onClose, onUpdateSta
         )}
 
         {item.special_instructions && (
-          <div className="bg-red-50 rounded-xl p-3">
-            <p className="text-xs font-semibold text-red-700 mb-1 uppercase tracking-wide">
+          <div className="bg-red-50 dark:bg-red-950/60 border-s-4 border-red-500 rounded-e-xl p-3">
+            <p className="text-xs font-semibold text-red-900 dark:text-red-200 mb-1 uppercase tracking-wide">
               {t('specialInstructionsLabel')}
             </p>
-            <p className="text-sm text-red-700 italic font-medium break-words">{item.special_instructions}</p>
+            <p className="text-sm text-red-900 dark:text-red-200 italic font-medium break-words">
+              {item.special_instructions}
+            </p>
           </div>
         )}
 
@@ -101,17 +120,22 @@ export function KdsItemModal({ item, orderNumber, updating, onClose, onUpdateSta
               return (
                 <div key={s} className="flex items-center gap-1.5">
                   <div
-                    className={`flex items-center gap-1 text-xs font-medium px-2 py-1 rounded-full ${
+                    className={`flex items-center gap-1 text-xs px-2 py-1 rounded-full ${
                       isCurrent
-                        ? `${STATUS_CONFIG[s].bg} ${STATUS_CONFIG[s].text} ring-2 ring-current`
+                        ? `${STATUS_CONFIG[s].bg} ${STATUS_CONFIG[s].text} shadow-xs ring-1 ring-border/60 font-semibold`
                         : isPast
-                          ? 'bg-muted text-gray-400 line-through'
-                          : 'bg-muted text-gray-400'
+                          ? 'bg-muted text-slate-700 dark:text-slate-300 line-through font-medium'
+                          : 'bg-muted text-slate-700 dark:text-slate-300 font-medium'
                     }`}
                   >
                     {statusLabel(s)}
                   </div>
-                  {i < STATUS_ORDER.length - 1 && <ChevronRight size={12} className="text-gray-300 shrink-0 rtl-flip" />}
+                  {i < STATUS_ORDER.length - 1 && (
+                    <ChevronRight
+                      size={12}
+                      className="text-slate-700 dark:text-slate-300 shrink-0 rtl-flip"
+                    />
+                  )}
                 </div>
               );
             })}
@@ -120,7 +144,7 @@ export function KdsItemModal({ item, orderNumber, updating, onClose, onUpdateSta
 
         <div className="flex flex-col gap-3">
           {isVoided ? (
-            <div className="text-center py-4 text-red-500 text-base font-medium">
+            <div className="text-center py-4 text-red-700 dark:text-red-300 text-base font-medium">
               {t('itemVoidedLocked')}
             </div>
           ) : (
@@ -138,14 +162,14 @@ export function KdsItemModal({ item, orderNumber, updating, onClose, onUpdateSta
                 <button
                   onClick={() => onUpdateStatus(item.id, prev)}
                   disabled={updating}
-                  className="w-full py-4 rounded-2xl text-muted-foreground text-base font-semibold border-2 border-border bg-muted hover:bg-muted transition-all active:scale-95 disabled:opacity-50 flex items-center justify-center gap-2"
+                  className="w-full py-4 rounded-2xl text-slate-700 dark:text-slate-200 text-base font-semibold border-2 border-border bg-muted hover:bg-accent transition-all active:scale-95 disabled:opacity-50 flex items-center justify-center gap-2"
                 >
                   <ChevronLeft size={18} className="rtl-flip" />
                   {t('backTo', { status: statusLabel(prev) })}
                 </button>
               )}
               {!next && (
-                <div className="text-center py-4 text-gray-400 text-base font-medium">
+                <div className="text-center py-4 text-slate-700 dark:text-slate-300 text-base font-medium">
                   {t('deliveredDone')}
                 </div>
               )}

@@ -1,11 +1,11 @@
 @import "tailwindcss";
 @import "tw-animate-css";
-@import "shadcn/tailwind.css";
+@import "./shadcn-tailwind.css";
 
 @custom-variant dark (&:is(.dark *));
 
 :root {
-  --font-sans: "Geist", system-ui, sans-serif;
+  --font-sans: "Geist", "Noto Sans Devanagari", "Nirmala UI", "Kohinoor Devanagari", "Devanagari Sangam MN", "Noto Sans Gurmukhi", "Raavi", "Kohinoor Gurmukhi", "Gurmukhi Sangam MN", "Noto Sans Telugu", "Kohinoor Telugu", "Telugu Sangam MN", system-ui, sans-serif;
   --font-mono: "Geist Mono", monospace;
   --radius: 0.625rem;
   --background: oklch(1 0 0);
@@ -26,6 +26,11 @@
   --border: oklch(0.922 0 0);
   --input: oklch(0.922 0 0);
   --ring: oklch(0.708 0 0);
+  /* Semantic surfaces: new UI uses these instead of raw gray or indigo
+   * utilities. Existing raw-color usage migrates only when that page is
+   * already being touched, not as a standalone sweep. */
+  --panel: var(--card);
+  --selected-row: #e8ebff;
   --chart-1: oklch(0.646 0.222 41.116);
   --chart-2: oklch(0.6 0.118 184.704);
   --chart-3: oklch(0.398 0.07 227.392);
@@ -64,13 +69,44 @@ input[type="number"] {
   appearance: textfield;
 }
 
-.touch-target {
-  min-height: 44px;
-  min-width: 44px;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  touch-action: manipulation;
+@layer components {
+  .touch-target {
+    min-height: 44px;
+    min-width: 44px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    touch-action: manipulation;
+  }
+}
+
+/* Short viewports: the cart column becomes the single scroll owner, so order
+ * type, totals and checkout stay reachable however long the item list is. */
+@media (max-height: 500px) {
+  .pos-cart-shell {
+    overflow-y: auto;
+  }
+
+  .pos-cart-shell > * {
+    flex: 0 0 auto;
+  }
+
+  .pos-cart-items {
+    flex: 1 0 auto;
+    min-height: 7.5rem;
+    overflow-y: visible;
+  }
+}
+
+/* Short viewports: management pages drop their bounded list windows so pinned
+ * headers and tabs cannot leave their records in an unusable strip. */
+@media (max-height: 560px) {
+  .dashboard-scroll-shell,
+  .dashboard-scroll-frame,
+  .dashboard-scroll-pane {
+    display: block;
+    height: auto;
+  }
 }
 
 /* Desktop title bar: native-overlay mode supplies the caption buttons through
@@ -84,7 +120,6 @@ input[type="number"] {
   min-block-size: var(--flo-titlebar-height);
   align-items: center;
   overflow: hidden;
-  border-block-end: 1px solid var(--border);
   background: var(--background);
   color: var(--foreground);
   -webkit-app-region: drag;
@@ -110,13 +145,15 @@ html[data-flo-window-focused='false'] .flo-title-bar {
   padding-inline: 0.75rem;
 }
 
-/* macOS uses native traffic lights on the top-left (occupying ~68px).
- * Traffic lights stay physically on the left even in RTL locales.
- * Safe area spans full width with 96px left padding (leaving 28px gap after green light) and 0.75rem right padding. */
+/* macOS reserves 96px leading space for traffic lights only when windowed;
+ * in native fullscreen traffic lights hide and safe-area padding reverts to normal. */
 html[data-flo-platform='darwin'] .flo-title-bar__safe-area {
   left: 0;
   right: 0;
   inline-size: 100%;
+}
+
+html[data-flo-platform='darwin']:not([data-flo-window-fullscreen='true']) .flo-title-bar__safe-area {
   padding-left: 96px;
   padding-right: 0.75rem;
 }
@@ -174,6 +211,49 @@ body:has(.flo-title-bar__fallback-controls) .flo-title-bar__safe-area {
   color: #ffffff;
 }
 
+/* Windows/Linux application menu: Electron never draws a menu bar for a
+ * frameless window, so the title bar renders the top-level labels and each
+ * click pops that entry's real submenu from the main-process menu. macOS
+ * renders nothing here and keeps its native menu bar. Logical properties keep
+ * the row on the inline-start edge for RTL locales; the buttons are already
+ * no-drag through the shared `.flo-title-bar button` rule above. */
+.flo-title-bar__menu {
+  gap: 0.125rem;
+}
+
+.flo-title-bar__menu-button {
+  padding: 0.25rem 0.5rem;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--foreground);
+  font-size: 0.75rem;
+  line-height: 1rem;
+  white-space: nowrap;
+}
+
+.flo-title-bar__menu-button:hover {
+  background: var(--accent);
+  color: var(--accent-foreground);
+}
+
+/* Dead-center business identity similar to modern desktop title bars (e.g. VS Code). */
+.flo-title-bar__identity {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  max-inline-size: min(45vw, 24rem);
+  pointer-events: none;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  line-height: 1.15;
+  text-align: center;
+  user-select: none;
+}
+
 .flo-title-bar--root-drag {
   position: fixed;
   inset-block-start: 0;
@@ -194,6 +274,17 @@ body:has(.flo-title-bar__fallback-controls) .flo-title-bar__safe-area {
  * logical properties are direction-independent, keeping RTL correct. */
 html[data-flo-desktop-titlebar='true'] {
   --flo-sidebar-block-start: var(--flo-titlebar-height);
+}
+
+[data-testid='scheduled-orders-drawer'],
+[data-testid='payment-queue-drawer'],
+[data-slot='sheet-overlay'],
+[data-slot='sheet-content'],
+[data-slot='drawer-overlay'],
+[data-slot='drawer-content'],
+[role='dialog'] {
+  -webkit-app-region: no-drag;
+  app-region: no-drag;
 }
 
 /* Modern minimalist toast styling (Linear / Sonner aesthetic) */
@@ -233,6 +324,29 @@ html[data-flo-desktop-titlebar='true'] {
   to {
     transform: scaleX(0);
   }
+}
+
+@keyframes flo-display-page-progress {
+  from {
+    transform: scaleX(0);
+  }
+  to {
+    transform: scaleX(1);
+  }
+}
+
+.flo-display-page-timer-bar {
+  inline-size: 100%;
+  block-size: 100%;
+  transform-origin: left center;
+  animation-name: flo-display-page-progress;
+  animation-timing-function: linear;
+  animation-fill-mode: forwards;
+  pointer-events: none;
+}
+
+html[dir='rtl'] .flo-display-page-timer-bar {
+  transform-origin: right center;
 }
 
 .flo-toast-drain {
@@ -317,6 +431,8 @@ div:hover > .flo-toast-drain,
   --color-border: var(--border);
   --color-input: var(--input);
   --color-ring: var(--ring);
+  --color-panel: var(--panel);
+  --color-selected-row: var(--selected-row);
   --color-chart-1: var(--chart-1);
   --color-chart-2: var(--chart-2);
   --color-chart-3: var(--chart-3);
@@ -360,6 +476,8 @@ div:hover > .flo-toast-drain,
   --border: oklch(1 0 0 / 12%);
   --input: oklch(1 0 0 / 18%);
   --ring: oklch(0.556 0 0);
+  --panel: var(--card);
+  --selected-row: oklch(0.24 0.03 264);
   --chart-1: oklch(0.488 0.243 264.376);
   --chart-2: oklch(0.696 0.17 162.48);
   --chart-3: oklch(0.769 0.188 70.08);
@@ -397,8 +515,15 @@ html.dark::-webkit-scrollbar-thumb:hover,
   body {
     @apply bg-background text-foreground;
   }
-  select {
+  select,
+  input[type="date"],
+  input[type="datetime-local"],
+  input[type="month"],
+  input[type="week"],
+  input[type="time"] {
     color-scheme: light;
+  }
+  select {
     background-color: var(--card);
     color: var(--card-foreground);
   }
@@ -407,7 +532,12 @@ html.dark::-webkit-scrollbar-thumb:hover,
     background-color: var(--card);
     color: var(--card-foreground);
   }
-  .dark select {
+  .dark select,
+  .dark input[type="date"],
+  .dark input[type="datetime-local"],
+  .dark input[type="month"],
+  .dark input[type="week"],
+  .dark input[type="time"] {
     color-scheme: dark;
   }
 }

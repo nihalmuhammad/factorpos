@@ -1,0 +1,666 @@
+# Cloud integrations
+
+Every network feature FloCafe has, what it talks to, what enables it, and what happens when the
+network is absent. The principle that keeps all of them optional is
+[0001: offline-first core](../decisions/0001-offline-first-core.md); this page is the current
+inventory, not the rationale.
+
+All outbound work is either an outbox flush or a best-effort background task. Nothing on this page
+sits on a path between an order and a paid bill.
+
+## Offline mode
+
+The owner can switch every optional outbound connection off with the `offline_mode` setting
+(`PUT /api/settings/offline-mode`, permission `offline-mode.manage`, Settings → Privacy). It is off
+by default and is restore-protected across database restore and import.
+`main/services/offline-mode.ts` exposes `isOfflineMode()`, which is also true when
+`FLO_MATRIX_OFFLINE` is `1`, and `getOfflineModeAbortSignal()`, which aborts when Offline mode turns
+on. While it is on:
+
+- FloAdmin cloud sync starts no timers (including auto-registration retries) and `trackedFetch`
+  refuses or aborts every request; turning the mode off reloads sync and refreshes registration.
+- Google Drive scheduled backups do not run, and connecting, listing, backing up and restoring fail
+  with the `offline` error code, and in-flight Drive work is cancelled. Disconnecting retains the
+  local tokens and records the revoke as unconfirmed, which blocks further Drive access.
+- WhatsApp closes its socket without unpairing, cancels in-flight connection and version-lookup
+  work, refuses to connect and does not start; turning the mode off reconnects it.
+- Update checks report the `offline` update state, an in-flight update check or download is
+  cancelled into the `offline` state, and the startup tax pack check and tax pack catalog and
+  artifact downloads (including in-flight requests) are refused or aborted.
+- Telemetry, diagnostics and PostHog send nothing (stopping the daily ping timer, aborting in-flight
+  telemetry, diagnostics and PostHog requests, and shutting down the PostHog client without flushing
+  queued events; turning the mode off resumes the daily telemetry timer without resending
+  `app_launch`), and web image import returns `503` (aborting in-flight fetches).
+
+The Express API, KDS and Server App stay bound to `0.0.0.0`, so devices on the local network keep
+working.
+
+## Google Drive backup
+
+Backs up the local database to a folder in the merchant's own Google Drive, and restores from it.
+
+**Enabled by** an OAuth flow the merchant completes. The redirect is served from an ephemeral
+loopback listener bound to `127.0.0.1` on a kernel-assigned port, and the authorization request uses
+PKCE with `code_challenge_method: 'S256'`.
+
+**Scope rule.** `DRIVE_FILE_SCOPE` is `https://www.googleapis.com/auth/drive.file`, requesting access
+only to files the app creates, alongside `openid` and `email` for identity. The scope must not be
+widened: `drive.file` is what keeps a compromised token from being able to enumerate the merchant's
+whole Drive. Authorization URLs are additionally checked by `isSafeGoogleAuthorizationUrl()` before
+the browser is opened.
+
+**Credential storage.** Tokens are encrypted with Electron's `safeStorage` before being written, and
+decrypted on read. Backup directories, including the staging area, are created with mode `0o700`.
+
+**Warning gate.** Before a backup runs, the merchant must acknowledge a warning, recorded under the
+`google_drive_warning_acknowledged` setting. A backup attempt without that acknowledgement fails
+with `warning_acknowledgement_required`.
+
+**Revoke on disconnect.** Disconnecting revokes the grant at Google rather than only deleting the
+local token.
+
+**Two-step backup and retention pruning.** Each backup separates snapshot upload from retention
+cleanup: the upload step writes the database snapshot to Google Drive and immediately stamps
+`last_backup_status` as `'success'` (`last_backup_at` and `last_success_at`), while the retention
+step (`applyRetention`) moves older automatic backups beyond `retention_count` to Google Drive
+Trash. If a transient error interrupts retention pruning, the completed snapshot upload remains
+valid (`last_backup_status` stays `'success'`) and the service records `retention_pending`
+(`retention_status = 'pending'`) so automatic background retries finish pruning older backups
+without invalidating the backup.
+
+**Offline behaviour.** Every operation fails with a `driveError` code rather than hanging. The last
+error code is persisted so the settings screen can explain the failure after a restart.
+
+## Google Drive QR menu
+
+Settings → QR Menu publishes a customer-facing PDF from the catalog or replaces it with a merchant
+PDF up to 15 MB. It uses the existing `drive.file` grant. The generated menu defaults to the
+phone-oriented Mobile-First Cafe template; Classic Bistro and Standard layouts are also available.
+
+The menu lives in a dedicated `<store>_flocafe_menu` folder marked with
+`flo_destination_kind=flocafe_menu`. The folder remains private. Only the PDF marked
+`flo_file_kind=public_menu_pdf` receives an `anyone`/`reader` permission. Backup discovery excludes
+the menu folder, and every overwrite or permission change revalidates the PDF marker, MIME type,
+installation marker, trash state, and parents before touching the stored file ID.
+
+The first publish creates a six-character menu ID and one Drive file. Later generated or uploaded
+publishes update that same file ID, including after a store-name change, so the public URL and
+printed QR codes remain stable. Pausing sharing removes the public permission without deleting the
+file; resuming restores it on the same file. Disconnect and database-restore cleanup remove the
+Drive-bound menu IDs while preserving the local generator preferences and short ID.
+
+Publishing and sharing require `catalog.manage` or `google-drive.manage`; connecting and
+disconnecting the account still require `google-drive.manage`. Offline mode fails these operations
+with `offline` and serializes them with backup and restore work.
+
+## Anonymous telemetry
+
+Posts anonymous usage and error events to `https://telemetry.flopos.com/collect`.
+
+**Enabled by** the `telemetry_enabled` setting, read as on when the value is `'true'`. It ships
+**on** for a new install, which writes `telemetry_enabled` as `'true'`. An install that already
+carries an explicit value keeps it, because the `telemetry_default_on_for_new_installs` migration
+that flips the default uses `INSERT OR IGNORE`; an install that already ran the earlier
+`seed_telemetry_settings` migration therefore still holds `'false'`.
+
+**Offline behaviour.** Events are dropped, not queued. There is no telemetry outbox.
+
+The same `telemetry_enabled` switch also gates PostHog usage events and the installation email,
+described under PostHog below. The collector at `https://telemetry.flopos.com/collect` sends no name
+and no email.
+
+**Run mode and install source.** Every telemetry event and every FloAdmin registration carries two
+provenance fields, so a merchant install is distinguishable from a developer's local run. `run_mode`
+is `packaged` or `dev`, read from `app.isPackaged`. `install_source` is `github`, `ms_store`,
+`mac_app_store`, `snap`, `appimage`, `flatpak`, `deb`, `rpm`, `linux_package`, or `dev`, resolved in
+this order:
+
+1. An unpackaged build reports `dev` for both fields, which also covers non-Electron hosts.
+2. `process.windowsStore` -> `ms_store`; `process.mas` -> `mac_app_store`.
+3. `SNAP` -> `snap`; `APPIMAGE` -> `appimage`; `FLATPAK_ID` -> `flatpak`. An empty or whitespace
+   variable is not a signal.
+4. `win32` or `darwin` -> `github`, the GitHub-release installers.
+5. Anything else is a native Linux package, and its format is read from `/etc/os-release`:
+   `ID` first, then the `ID_LIKE` family list, giving `deb` for the Debian/Ubuntu families and `rpm`
+   for the RHEL/Fedora/SUSE families. Derivatives resolve through `ID_LIKE`, so Rocky or Linux Mint
+   are classified without being listed themselves.
+
+An unreadable or unrecognised `/etc/os-release` reports `linux_package`. That is a real value, not a
+placeholder for "unknown": the distribution could not be identified, so the format is not guessed and
+neither `deb` nor `rpm` is claimed. Detection is total - outside Electron, in unit tests and scripts,
+it degrades to `dev` rather than throwing.
+
+## PostHog
+
+Optional product analytics and error tracking, next to the anonymous collector. The client sends
+only when a project token and a host resolve. `readPostHogConfig()` in
+`main/services/posthog-config.ts` takes the token from `FLO_POSTHOG_DEV_TOKEN` (development only),
+then the `posthog_project_token` setting, then `posthog_project_token` in
+`dist/main/build-identity.json`; the host comes from the `posthog_host` setting, then
+`posthog_host` in `build-identity.json`, then the EU Cloud public capture host
+`https://eu.i.posthog.com`. No migration seeds either setting. `scripts/copy-runtime-assets.cjs`
+writes the build-time `POSTHOG_PROJECT_TOKEN` and `POSTHOG_HOST` into `build-identity.json`, and
+only the release and Mac App Store workflows set them, so local builds and forks carry no token. No
+environment variable configures the client at runtime other than the development overrides below.
+A host that is not `http` or `https`, or that includes credentials, is ignored, and the client sends
+nothing.
+
+**Only released builds count.** `postHogEnvironment()` in `main/services/posthog-config.ts`
+decides, and only for an Electron main process (`process.type === 'browser'`); test suites run as
+plain Node and never connect, even when they stub `app.isPackaged`.
+
+| Run                                                                               | Environment         |
+| --------------------------------------------------------------------------------- | ------------------- |
+| Packaged build whose `dist/main/build-identity.json` has `official_release: true` | `production`        |
+| Any Electron run with `FLO_POSTHOG_DEV=1`                                         | `development`       |
+| Anything else: `npm run dev`, local `release:*` packages, CI and matrix packages  | none; no connection |
+
+`official_release` is written by `scripts/copy-runtime-assets.cjs` only when the build runs with
+`FLO_OFFICIAL_RELEASE=1`, which only the release and Mac App Store workflows set. Every event and
+the person carry `environment` and `release_channel` (`stable` or `beta`). In development,
+`FLO_POSTHOG_DEV_TOKEN` (and optionally `FLO_POSTHOG_DEV_HOST`) sends to a separate project
+instead of the release one. The client also sends nothing when `CI` is set, when
+`FLO_MATRIX_OFFLINE` is `1`, or when the e2e harness is running (`E2E_TASK_LOCAL_PORTS`).
+
+In the PostHog project, **Settings → Project → Filter out internal and test users** should exclude
+person property `environment` = `development` and the team's email domain, with **Enable this
+filter on all new insights** turned on.
+
+Every event passes through `scrubPostHogEvent` in `shared/posthog-scrub.ts`, in the main process
+(`posthog-node`) and in the renderer (`posthog-js`). It is an allowlist: an event name, property, or
+person property it does not list is dropped. Every event carries `app_version`, `platform`,
+`run_mode`, `install_source`, `environment`, and `release_channel`; `install_ref` is added at the
+`anonymous` and `full` levels, and `store_ref` at `full` only (see **Sharing levels** below).
+`process_type` names the process that failed: `main` for the main-process handlers, `api` for a
+local API 5xx, and `renderer` for the window (`kds` and `server-app` are allowed for later use).
+`$release_id` is kept when the SDK sends one. Release builds use `--release-mode symbol-set`, so
+chunk code carries no release id and PostHog binds an exception to its release through the symbol
+set uploaded for it.
+
+**Sharing levels** (`product_analytics_level`, read by `readProductAnalyticsLevel()` in
+`main/services/posthog-identity.ts`).
+
+| Level       | Distinct id          | Person properties                         | Links                                                                           |
+| ----------- | -------------------- | ----------------------------------------- | ------------------------------------------------------------------------------- |
+| `full`      | Account (`acct_`)    | Store email and store configuration       | `install_ref`, `store_ref`, `staff_ref`; the device is aliased into the account |
+| `anonymous` | Device (`inst_`)     | Store configuration only, never the email | `install_ref`, `staff_ref`                                                      |
+| `off`       | Per launch (`anon_`) | None                                      | None; only exceptions, when diagnostics transmission is on                      |
+
+`telemetry_enabled` set to anything but `true` means `off`. Otherwise a stored `full` is `full`,
+any other stored value is `anonymous`, and a store with no stored level is `anonymous` once
+`onboarding_completed` is `true` and `off` before setup. `PUT /api/settings/product-analytics`
+(`settings.manage`) stores the level and writes `telemetry_enabled` and `anonymous_data_consent`
+(`false` for `off`, `true` otherwise), so the anonymous collector follows the same choice.
+`product_analytics_level` is restore-protected like `telemetry_enabled`. The scrubber's
+`accountLinked` option is on only at `full`; below it the scrubber drops `$create_alias`, any event
+on an `acct_` id, and `email` and `store_ref` wherever they appear.
+
+Setup asks for the level with two equal options, "Link my email" (`full`) and "Keep it anonymous"
+(`anonymous`), plus "Don't share usage data" (`off`); none is preselected and setup cannot
+continue without one. A setup request without a level stores none. An onboarded store with
+telemetry on and no stored level, such as one upgraded from a release without PostHog, shares
+anonymously and shows `ProductAnalyticsDialog` once to users with `settings.manage`. The dialog
+opens outside POS and KDS, only when `readProductAnalyticsChoice()` reports `choice_pending` (a
+configured client that can send), and offers the same two options with the error-report switch.
+Closing it without an answer asks again on the next launch. Settings → Privacy offers all three
+levels.
+
+**Identities** (`main/services/posthog-identity.ts`). The collector keeps `telemetry_anon_id`;
+PostHog does not use it.
+
+| Id               | Value                                                                                                        | Lifetime                                                               |
+| ---------------- | ------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------- |
+| Account (person) | `acct_` + 16 hex of SHA-256 over the lower-cased store email                                                 | Same for every terminal and every reinstall that uses that email       |
+| Device           | `inst_` + 16 hex of SHA-256 over `posthog_install_seed`, a random UUID generated once and stored in settings | Same for the life of the database; a new database gets a new device id |
+| Per launch       | `anon_` + a random UUID                                                                                      | One app launch                                                         |
+
+At `full`, the account is the person once a store email exists. Main sends one `$create_alias`
+that folds the device into the account (`posthog_aliased` records the pair), so events the device
+sent at `anonymous` join the account. The first account key a database derives is kept in
+`posthog_account_ref`, so editing the store email does not split the person; a reinstall derives it
+again from the current email. At `anonymous`, main sets store configuration on the device person
+with a `$set` event and never derives the account key. Moving from `full` to `anonymous` stops new
+links; events already linked stay linked. At `off`, exceptions use the per-launch id with
+`$process_person_profile` set to `false`. Stopping cloud services or requesting cloud deletion
+turns telemetry off and rotates `telemetry_anon_id`, but `posthog_install_seed` does not rotate, so
+a later opt-in on the same database links to the same device again.
+
+Only the main process sets the person, on launch and when the level, email or store settings change.
+The renderer does not call `posthog.init` until main returns the id over `get-posthog-bootstrap`;
+init disables persistence and bootstraps that id, so the SDK cannot mint another one. Main checks
+consent and the id on every send (cached for up to 30 seconds and invalidated immediately when
+`settings` or `users` rows change via `getSettingsRevision()` or `invalidatePostHogConsentCache()`);
+the renderer re-reads both every 30 seconds and on focus and
+stamps the current id on each event, so a level change takes effect without a reload. When usage
+and diagnostics were both off at load, the same check starts PostHog once either is turned on, and
+the current screen is recorded then. At `off`, renderer events move to the per-launch id and the
+scrubber drops `install_ref`, `store_ref`, and `staff_ref`; below `full` it drops `store_ref`. Only the Electron main window loads PostHog; the Server App,
+KDS, and customer display do not.
+
+**Staff are dimensions, not persons.** Many staff share one terminal, and group analytics is a paid
+add-on, so a person is never a staff member. The renderer tags events with `staff_role` (the
+signed-in role) and `staff_ref` (the first 16 hex characters of SHA-256 over the distinct id and the
+user id), and drops both on logout; logout never changes the distinct id. One email shared by
+several branches is one account; terminals are told apart by `install_ref`. A database restored
+onto another terminal brings its seed, so both terminals share a device id.
+
+**Usage follows the sharing level.** At `anonymous` and `full`:
+
+- Person properties are store configuration (`country`, `currency`, `language`, `service_model`,
+  `kds_enabled`), plus the store email at `full`. The email is `settings.email`, the store email
+  cloud registration also sends, or the email of the earliest `users` row when that setting is
+  empty. No name is sent.
+- A usage event keeps only the properties in `POSTHOG_USAGE_PROPERTY_KEYS`; any other property is
+  dropped. `slowest_query` is the one free-text field: it must be a normalized statement (string,
+  number, and double-quoted literals replaced by `?`, comments removed, white space collapsed, 400
+  characters at most), and a value that still holds a literal or a `"` is dropped.
+- `app_launch` and `feature_used` mirror the collector events. `daily_ping` runs on the
+  collector's hourly check but does not depend on the collector: it is sent at most once every 24
+  hours (`posthog_last_daily_ping_at`) with counts for the last 24 hours (orders by type, including
+  `online`, cancelled orders, paid bills, staff who rang up an order) and totals (active staff,
+  products, tables, customers, printers, kitchen stations). `setup_completed` records the setup
+  profile, service model, and business type. `first_order_created` and `first_bill_paid` are sent
+  once per installation with `hours_since_setup`, read hourly from the database. A milestone older
+  than the first check on this installation (`posthog_milestones_since`), such as an upgraded
+  store's first order, carries `backfilled: true`. `api_slow_request` is sent for a local API
+  request that takes 200 ms or more only when the time spent in SQL (`db_ms`) is 200 ms or more, so
+  a request that is slow for another reason, such as a printer or the network, sends nothing. The
+  same route (method and route pattern) sends one event per hour per process; the requests folded
+  into that event are counted in `occurrences`. The properties are `http_method`, the route pattern
+  (`http_route`), `http_status`, `duration_ms`, `db_ms`, the statement count (`db_queries`),
+  `occurrences`, and the slowest statement (`slowest_query_ms`, `slowest_query`). Every such request
+  writes one `console.warn` line, whether or not telemetry is on.
+- The error-report card counts `diagnostics_prompt_shown` each time it appears and
+  `diagnostics_prompt_accepted` only after Send reports saves `diagnostics_consent` and
+  `diagnostics_transmission_enabled`, under the same usage consent as every other usage event. While
+  cloud deletion blocks consent (`cloud_deletion_blocked`), the prompt stays suppressed, `shown`
+  does not record or emit, and `accepted` returns `409` (`cloud_deletion_pending`). The device-side
+  counters, not these events, enforce the ask cap.
+- The renderer sends at most one `$pageview` per screen per staff member every 30 minutes
+  (`shared/posthog-screen-views.ts`); views inside the window are folded into the next pageview's
+  `repeat_views`. A screen is the route path with id-like segments removed, plus `settings_tab` on
+  Settings. No other query value, hash, or title is sent.
+
+At `off`, nothing is identified and no usage event or pageview is sent. Autocapture, heatmaps, dead clicks, performance events, session replay,
+surveys, and feature-flag requests are off. `disable_external_dependency_loading` stops the renderer
+SDK from loading remote scripts.
+
+GeoIP enrichment is on in both SDKs (`posthog-node` needs `disableGeoip: false`), so PostHog adds
+`$geoip_*` location properties from the store's public IP at ingestion. Whether the IP itself is
+stored follows the project's IP data capture setting.
+
+**Exceptions follow diagnostics transmission.** `isDiagnosticsTransmissionEnabled()` is the existing
+"Sending diagnostics automatically" check: `diagnostics_consent` is on unless it is the string
+`false`, and `diagnostics_transmission_enabled` must be the string `true`. A scrubbed exception is
+sent when that check is on, at every sharing level. When the check is off, the
+exception stays on the machine. The client itself is disabled only at `off` with diagnostics
+transmission also off. `sendAnonymousDiagnosticReport` is unchanged and still requires
+both checks.
+
+**Failures follow the same check.** Two diagnostics events leave PostHog's exception stream and
+follow transmission. `printer_failed` carries the failure class, connection type, job kind, release,
+OS, install source, and correlation id, plus the scrubbed error text, and never the queue name.
+`operation_failed` reuses each sealed v2 report queued in `store_diagnostics_outbox` (grouped by
+capture point, outcome, validated facts, release, and hour window, and split across report-count
+bounds or subsequent flushes): one event per sealed report, carrying `reason_code`, `operation`,
+`stage`, `outcome`, `classification`, `count`, `capture_point`, the report's `app_version` and
+`platform`, and the report's validated `facts`. It carries no correlation id and no free text, and
+a printer capture point (`fc.backend.printer.*`) is left out because `printer_failed` already covers
+it. The event uses `report_id` as its PostHog `uuid`, so a resend after a restart deduplicates to
+the same event. The report flush runs only while a diagnostics transport is set up (anonymous
+telemetry or a cloud account), so with neither there is no `operation_failed`.
+
+| Capture point                             | Source                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| ----------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `uncaughtException`, `unhandledRejection` | Main process handlers in `main/index.ts`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| `renderer-autocapture`                    | Unhandled errors and rejections in the main window (bundled `posthog-js` extension, always loaded; the scrubber drops them while diagnostics is off)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `react-error-boundary`                    | `reportRendererError`, called by the dashboard and global error boundaries                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `api-5xx`                                 | A local API response with status 500 or higher: method, route pattern (mount prefix included, also for errors from the global handler, or `<unmatched>` when no route matched), and status. The error a route caught, or the global handler saw, gives its type and its stack frames, and its chained cause gives its type and frames too; the message is always the route pattern, never the error's own text, which can name a customer. A 5xx sent without one keeps the frames of the code that sent it. Requests under `/api/settings/cloud` are never reported, because they fail for every store without a cloud subscription. A 502 or 503 from `/api/products/fetch-url` or `/api/mobile/devices` is not reported either, because those routes answer that way while offline. One exception per method, route, and status is sent per process per hour |
+
+An exception keeps its type, a redacted first line of the message, the mechanism, and stack frames
+with a project-relative file (`_next/static/...` for the packaged renderer), line, column, function
+name, and chunk id. The mechanism keeps `handled`, `synthetic`, `type`, the cause indexes
+`exception_id` and `parent_id`, and a short `source`. Message redaction replaces emails, URLs,
+quoted text, and digit runs. A chained `cause` is kept, scrubbed the same way, and a rejection
+reason that is a plain string becomes the message. Renderer exceptions also carry `$pathname` and
+`$current_url` as a route pattern: no host, no query, and an all-digit segment is `:id`. An error
+captured through `capturePostHogBoundaryError` whose failure came from axios also carries
+`http_method`, `http_route`, and `http_status`, because its frames are all inside
+`node_modules/axios`; `http_route` keeps only the first path segment followed by `/*`, because a
+call can put a customer name, phone number, or search term in the next one. Errors and rejections
+that `posthog-js` autocaptures are sent without those three fields; in the renderer only that
+boundary path adds them. Request
+params, query, body, digest, log tail, and any order or customer field are dropped. Release builds
+upload source maps when PostHog credentials are configured; see
+[PostHog release builds](../maintainers/releases.md#posthog-release-builds).
+
+**Offline behaviour.** Sends are best-effort. A failed send is dropped; there is no PostHog outbox,
+and a send does not sit on the path between an order and a paid bill. Shutdown waits at most
+`POSTHOG_SHUTDOWN_TIMEOUT_MS` (2 s) for pending events, so an unreachable host cannot hold up the
+database close.
+
+## Store-attributed diagnostics
+
+Diagnostics have a local support view and a separate automatic aggregate channel. Capture does not
+depend on either transmission setting. The local `local_diagnostics` log is capped at 200 rows. Its
+access controls, legacy event intake, and clearing behavior are documented in the
+[API reference](../reference/api.md#diagnostics).
+
+Automatic reports come from the closed capture registry in
+[`main/lib/operation-failure.ts`](../../main/lib/operation-failure.ts). A report contains the
+registered reason, operation, stage, classification, outcome, count, bounded time window, optional
+UUID correlation references, and allowlisted facts. It contains no exception text, SQL, request path,
+customer or order identifiers, payment amounts, or transaction references. Frontend, Electron, and
+backend capture call sites use the registry; it owns the exact list and normalized tuples. Legacy
+source-derived signatures remain local support evidence and are never sent through the v2 automatic
+channel.
+
+Menu CSV imports capture malformed input and row rejections with only bounded failed and changed-row
+counts; the outcome is `partial` only when the import actually changed at least one row. Routine
+login failures, authentication middleware rejections, and ordinary empty query results are not
+capture points.
+
+Reports are aggregated by UTC hour, sealed with immutable report IDs, and stored in
+`store_diagnostics_outbox` before sending. The outbox holds at most 200 rows, and each flush sends at
+most 20 reports. If reports are evicted, permanently rejected, or cannot be acknowledged, bounded
+delivery-gap counters remain visible locally and are retried as safe aggregate reports when space is
+available. Retries honor server `Retry-After` hints up to one hour. A report with an invalid or
+mismatched acknowledgment is retained as a visible permanent rejection.
+
+**Transmission gates.** Automatic delivery requires both `diagnostics_consent` and
+`diagnostics_transmission_enabled`. The one-time upgrade migration enables transmission for
+unconfigured legacy installs that already have users while preserving an explicit refusal; a fresh
+install keeps transmission off until the merchant opts in through Settings. A merchant can change the
+choice at any time through Settings. Consent changes synchronize with FloAdmin
+using an idempotent change ID, and remote opt-out takes precedence over startup initialization. Cloud
+deletion blocks all diagnostics delivery. With a configured signed cloud connection reports go to
+FloAdmin. Without one, they use the anonymous collector only when `telemetry_enabled` is also on;
+otherwise they remain local. Consent and transmission are separate from anonymous usage telemetry.
+
+The health endpoint's response contract is documented in the
+[API reference](../reference/api.md#diagnostics). Support tickets remain a separate user-initiated
+channel and their outbox is unaffected by diagnostics preferences.
+
+## WhatsApp receipt delivery
+
+Sends receipts, owner reports, and automated customer follow-ups over WhatsApp ([`main/services/whatsapp.ts`](../../main/services/whatsapp.ts),
+[`shared/whatsapp-automation.ts`](../../shared/whatsapp-automation.ts)).
+
+**Enabled by** the merchant through the WhatsApp settings route, which calls `enable()`. The module
+starts with `state.enabled` false, so nothing is connected until a merchant turns it on.
+
+Receipt outcome is summarised on the order as `whatsapp_receipt_status`, which `GET /api/orders`
+returns per order.
+
+**Templates and automated rules.** `whatsapp_automation_config` in `settings` stores customizable
+templates (`receipt`, `feedback`, `loyalty_milestone`, `visit_milestone`, `winback`), six trigger
+rules, and safety settings. `renderWhatsAppTemplate()` performs single-pass `{...}` placeholder
+substitution across customer, order, loyalty, and store fields (formatting monetary amounts and
+rounding loyalty points to the tenant currency's `currencyFractionDigits`) so substituted values are
+never re-parsed as tokens. All six automated rules ship disabled (`enabled: false`):
+
+- When a bill transitions to `paid` (through `POST /api/bills/:id/payment`,
+  `POST /api/bills/:id/payments`, or committed exact-balance auto-settlement via
+  `completeExactBalanceSettlement()`), `triggerBillPaidAutomation()` runs asynchronously in the
+  background to evaluate `after_payment`, `points_threshold`, and `nth_visit` (`nth_visit` is
+  deduplicated per order and customer across concurrent and sequential split-bill settlements).
+- While WhatsApp is enabled and connected, a 5-minute background timer (`runScheduledAutomationSweep()`,
+  also callable on demand via `POST /api/whatsapp/automation/run-sweep`) evaluates `feedback_delay`
+  (bills settled at least `delayHours` ago and within 7 days of becoming due) and `winback` (active
+  customers whose last paid visit was at least `inactiveDays` ago).
+- When a store-level day close commits (`POST /api/cash-closures` with `scope = 'day'`; never on a
+  per-staff shift close), `claimDayCloseZReportAttempt()` claims the `queued` row inside a SQLite
+  savepoint in the close transaction and `triggerDayCloseZReport()` dispatches it after commit,
+  formatting the stored day-close Z-report snapshot via `formatStoredZReportWhatsAppMessage()` (using
+  the store `language`, regional formatting, and `timezone`, bounded to 4096 characters while preserving
+  financial and drawer-reconciliation totals) rather than rendering a customer template. Configuring
+  `z_report_day_close` requires role `owner` with `reports.view` and an explicit E.164 `recipientPhone`
+  (never inferred from `business_phone`). Each day close claims at most one row in `whatsapp_messages`
+  keyed by `cash_closure_id` (`idx_whatsapp_messages_auto_z_closure`) so repeated close requests or
+  restarts cannot send duplicates, and claim/send errors are isolated so closing never rolls back. When
+  WhatsApp is disabled or explicit Offline mode is on, automatic day-close dispatch is suppressed
+  without queuing a row or triggering a delayed send on reconnection. When WhatsApp is disconnected or
+  delivery fails, the single row is recorded as `failed` without automatic retry or opening a manual
+  share window, leaving manual retry available through `POST /api/whatsapp/messages/:messageId/retry`.
+- `POST /api/whatsapp/automation/broadcast` sends a selected template to up to 50 active customers
+  matching visit, inactivity, and loyalty-point filters.
+- Automated sends record `created_by_user_id` as `rule:<trigger>` (or `rule:broadcast`), which
+  `GET /api/whatsapp/messages` exposes as `trigger_rule`. Report message kinds require
+  `reports.view` for `z_report` and both `reports.view` and `reports.daily-sales.export` for
+  `daily_sales_report` across history visibility, sending, and retry.
+
+**Safety and anti-ban controls.** Inbound non-group DMs matching opt-out keywords (`STOP`,
+`UNSUBSCRIBE`, `OPT OUT`, `OPTOUT`) automatically add the sender to `whatsapp_blocklist` when
+`autoOptOutEnabled` is on. Customer-campaign automated sends check store-timezone quiet hours
+(`quietHoursEnabled`, `quietHoursStart` to `quietHoursEnd`) and a per-customer 7-day automated message
+cap (`maxPerCustomerPerWeek`), returning `quiet_hours` or `weekly_cap` when blocked; owner report sends
+(`z_report` and `daily_sales_report`, manual or `z_report_day_close`) bypass quiet hours and weekly
+customer caps and do not consume customer caps. Outbound sends to the
+same recipient are serialized through `sendLocks` (`sendMessageWithLock()`), keeping the lock tail
+chained onto the active send even when a waiting request cancels or aborts. All outbound sends enforce
+disabled WhatsApp (`whatsapp_enabled`), Offline mode, `MAX_BODY_CHARS` (4096 characters on report
+kinds `z_report` and `daily_sales_report`), transport
+cooldown (`isInCooldown()`), the blocklist, a per-recipient hourly cap (`RATE_LIMIT_MAX_PER_HOUR`,
+plus `RATE_LIMIT_MIN_GAP_MS` spacing on manual and report sends), a 10-minute duplicate-body filter,
+simulated typing delay, and a content filter that rejects non-HTTPS URLs and URL shorteners.
+
+**ACK timeout, late ACKs, and retry.** Outbound messages remain in `typing` (refreshing `typing_at` when
+`socket.sendMessage` completes) until a Baileys `messages.update` server ACK (`status = 2/3/4`) arrives,
+and every submitted attempt's external ID is persisted in `whatsapp_message_attempts`
+(`recordMessageAttemptExternalId()`). `sweepAckTimeouts()` runs every 60 seconds
+(`ACK_SWEEP_INTERVAL_MS`) while connected, on socket open, during scheduled automation sweeps, and on
+startup (`initFromDb()`) to mark non-in-flight outbound rows still in `queued`, `seen`, or `typing` past
+`ACK_TIMEOUT_MS` (5 minutes, or any unfinished pre-restart or unsubmitted rows on startup) as `failed`
+with `error = 'ack_timeout'`. If a late ACK arrives after a row was marked `failed`, `advanceStatus()`
+resolves the row by `external_message_id` or `whatsapp_message_attempts` (across retries and service
+restarts), promotes it to `sent`, `delivered`, or `read`, clears `error` and `failed_at`, backfills
+earlier timestamps via `COALESCE`, and ignores out-of-order lower-rank updates.
+`POST /api/whatsapp/messages/:messageId/retry` (`retryMessage()`) coalesces concurrent retry requests and
+atomically re-queues a `failed` row in place without creating duplicate rows, enforcing Offline mode
+(`offline_mode`), `RATE_LIMIT_MIN_GAP_MS`, and all safety controls while excluding the retried row from
+self-blocking in the 1-hour message count (`RATE_LIMIT_MAX_PER_HOUR`), weekly-cap, and duplicate-body
+checks.
+
+**Offline behaviour.** No work is started when the module is disabled, when Offline mode is on, when
+it is in a terminal shutdown state, or when the request signal is aborted. Work already in flight is
+cancelled when Offline mode turns on or during shutdown rather than left to fail late.
+
+**Credential handling and session lifecycle.** Session files live under
+`path.join(app.getPath('userData'), 'whatsapp-auth')`, created with mode `0o700`. On macOS DMG and ZIP
+builds this resolves to `~/Library/Application Support/Flo Cafe/whatsapp-auth`; on Mac App Store
+sandbox builds (`com.flo.desktop`) it resolves inside the app container at
+`~/Library/Containers/com.flo.desktop/Data/Library/Application Support/Flo Cafe/whatsapp-auth`. The
+session credential is not encrypted at rest, which is a consequence of the protocol library FloCafe
+uses and a reason the containing filesystem matters:
+
+- **Pairing and restart sequence (`515`).** Credential writes queued from an active socket's
+  `creds.update` are serialized through `credentialWriteTail` (surviving a same-tick `515` socket
+  replacement or shutdown unless disabled or invalidated by an auth wipe), and `startSocket()` awaits
+  both `authCleanupPromise` and `credentialWriteTail` before calling `useMultiFileAuthState()`. When
+  WhatsApp completes pairing with status `515` (`restartRequired`), the service reconnects immediately
+  without surfacing a disconnect error banner.
+- **Unpaired timeout (`408`), pairing-code fallback, and non-destructive cancel.** If an unpaired QR
+  or pairing-code attempt closes with `408` (`timedOut`), the service returns to `disconnected` so
+  the merchant can request a fresh code on demand. `connectWithPairingCode()` validates socket
+  identity and cancellation before publishing a pairing code and restores QR mode if code generation
+  fails while the socket remains open. Cancelling an in-progress pairing attempt via
+  `cancelPairing()` (`POST /api/whatsapp/cancel-pairing`) closes the pairing socket without calling
+  `logout()` or wiping `whatsapp-auth/`.
+- **Transient disconnect and sleep/wake recovery.** When a paired session drops for a non-`401`
+  reason, the service enters `connecting` with `lastErrorReason: 'reconnecting'` and retries after
+  `RECONNECT_DELAY_MS`. On system resume (`powerMonitor.on('resume')` -> `handleSystemResume()`), the
+  service reconnects immediately if the socket is absent or stale, and runs a bounded presence probe
+  on an open socket to replace half-open connections left behind by macOS sleep.
+- **Remote device unlink (`401`).** When WhatsApp closes the session with `401` (`loggedOut`), the
+  service clears timers, sets `state: 'disconnected'` and `lastErrorReason: 'logged_out'`, clears
+  `whatsapp_connected_phone`, and wipes `whatsapp-auth/` via `scheduleAuthWipe()` so the next
+  connection attempt starts a clean pairing flow.
+
+## FloAdmin cloud sync
+
+Optional synchronisation with the FloAdmin back office, plus account deletion and recovery.
+
+**Enabled by** `cloud_sync_enabled`, which ships **on**: a fresh install writes it as `'1'`. Other
+flags in the same group are `cloud_orders_enabled`, `cloud_reports_enabled`, and
+`cloud_command_polling_enabled`.
+
+**Upgrade behaviour.** Migration 40, `v2_cloud_defaults_and_tax_toggle`, flips a store that had
+`cloud_sync_enabled` set to `'0'` back on, but only when the setting's `updated_at` still lacks a
+`T`. Seed-written SQLite timestamps have no `T`; an ISO timestamp means a merchant deliberately
+changed it. The discriminator is that timestamp shape, and the migration deletes the obsolete
+`cloud_pending_store_id` setting in the same step.
+
+**Registration is zero-touch.** `start()` calls `maybeAutoRegister()` once at boot. The code states
+the contract directly: the v2 endpoint creates or finds the live store and returns a working API
+key immediately, so **there is no claim step, no pending state, and no human approval**. The
+`cloud_registration_status` values in use are `unregistered`, `registered`, `registration_failed`,
+`deletion_pending`, and `deleted`.
+
+**One stale claim message survives.** `mobilePairingErrorMessage()` in
+[`main/routes/index.ts`](../../main/routes/index.ts) still tells a merchant that the POS "hasn't
+been claimed in FloAdmin yet" and to complete registration there, returned with HTTP 409 when the
+backend reports the store is not registered. That message contradicts the zero-touch behaviour
+above: the merchant has nothing to claim. The message is reachable from the mobile pairing
+endpoint, so this is shipped behaviour, not dead text. Treat it as a product-copy bug to raise
+separately, not as a description of how registration works.
+
+**Payment outcomes stay local-authoritative.** Payment routes capture typed diagnostics only after
+the operation's outcome is known. A rollback is recorded as not applied; a notification failure
+after commit is recorded as applied. Captures are queued asynchronously, and delivery does not
+participate in the bill transaction or change its financial result.
+
+**Offline behaviour.** `reload()` starts the signed sync and support-ticket flushers when cloud sync
+is configured. The diagnostics flusher runs when consent and transmission are enabled and either a
+signed connection or permitted anonymous telemetry is available. It uses its own timer and does not
+require an API key for the anonymous path. A failure in one flusher does not stop the others.
+
+**Deletion and recovery.** A deletion request puts the store into `deletion_pending` or `deleted`.
+`isCloudDeletionBlocking()` reports whether the current status blocks normal cloud work, and while
+it does, `start()` returns without starting and queueing refuses with `queued: false`. Deletion
+clears `cloud_sync_outbox`, `support_ticket_outbox`, and `store_diagnostics_outbox` together, so a
+store that has asked for deletion is not holding queued payload for it.
+
+## RevFlo pairing
+
+RevFlo is the mobile companion app, and pairing happens through a pairing code the store issues and
+the phone redeems.
+
+`getCachedPairingCode()` and `setCachedPairingCode()` in
+[`main/db.ts`](../../main/db.ts) keep the code locally under the `mobile_pairing_code` and
+`mobile_pairing_code_expires_at` settings, with an expiry. The code is stored in plaintext: the
+cloud returns it exactly once, so the local copy is the only one, and the code is short-lived and
+useless without the store's API key. Both settings are cleared as part of the cloud data deletion
+path.
+
+Issuing a pairing code is the endpoint that returns the stale claim message described above, and
+its failure is reported as HTTP 409 for an unregistered store and HTTP 502 for any other cloud
+failure, so a connectivity problem is distinguishable from a registration problem.
+
+**Live relay reports.** `CloudSyncService.runCommand()` in
+[`main/services/cloud-sync.ts`](../../main/services/cloud-sync.ts) serves five live report commands
+for RevFlo (`report.dashboard`, `report.hourly`, `report.sales`, `report.items`, `report.payments`),
+emitting `meta.report_contract_version: 1` payloads on `meta.basis: 'daily-sales-export'`. Store
+`currency`, optional `currency_symbol`, `fraction_digits`, and `timezone` come from
+`resolveRegionalSnapshot()` (see [regional settings](regional-settings.md)), and day bounds use
+`business_day_start_time` (see [business time](business-time.md)). Single-day views (`dashboard`,
+`hourly`) accept `date` or `range` (`today` or `yesterday`); range views (`sales`, `items`,
+`payments`) accept `range` (`today`, `yesterday`, `last7` default, `last30`) or paired `from`/`to`
+dates up to 370 inclusive days (`MAX_COMMAND_RANGE_DAYS`), plus `group_by` (`day`, `week`, `month`)
+on `sales` and `sort_by` (`revenue`, `qty`) and `limit` (`1` to `100`, default `50`) on `items`.
+`dashboard`, `sales`, `items`, and `payments` share `buildDailySalesExportDataset()` (see
+[daily sales export](../reference/daily-sales-export.md)), while `hourly` aggregates paid `bills`
+and `refunds` across the day's `[start, end)` UTC window bucketed by store-local hour.
+
+## Support ticket outbox
+
+A support request is written to the `support_ticket_outbox` table with a `status` of `pending`,
+`sending`, `delivered`, or `failed`, plus `attempt_count`, `next_attempt_at`, and `last_error`. The
+endpoint returns HTTP 202 when the ticket was queued and HTTP 503 when it could not be, so the
+merchant gets a distinct answer for "saved, will send later" and "not accepted".
+
+### The `log_tail` field
+
+A ticket may carry a `log_tail` string holding the tail of the current session's log file.
+
+- **Cap.** `LOG_TAIL_MAX_BYTES` is 200,000. The tail is cut from the end, keeping the most recent
+  bytes, in both the IPC handler and the route. In the POS one-click help flow, the client bounds
+  the attached log tail to 16,384 UTF-16 code units (`SUPPORT_LOG_TAIL_MAX_CHARS`) when opted in.
+- **Window.** `LOG_TAIL_MAX_AGE_MS` is 7 days. The cut is made at the first line whose timestamp
+  falls inside the window, not at a byte offset, so a quiet store's log is not cut mid-record. The
+  byte cap is the backstop when the windowed content is still large.
+- **Absent, not null.** A ticket with no log tail omits the field rather than sending an empty
+  string. `logTail` is `undefined` when the request body has no non-blank `log_tail`.
+- **Where it is persisted.** In the outbox row's `payload`, alongside the ticket's other fields,
+  and sent by `queueSupportTicket()` as the `log_tail` property.
+- **Redaction.** Both the `get-log-tail` IPC handler and `POST /api/support-ticket` pass the tail
+  through `sanitizeLogTail()` in [`main/lib/log-sanitizer.ts`](../../main/lib/log-sanitizer.ts) to
+  redact bearer JWTs, `Authorization` headers, PIN/password/API-key/secret fields, and OAuth tokens
+  while preserving stack traces, timestamps, and error codes.
+
+### Linking a ticket to a known operation failure
+
+When a cashier opens help from a structured failure, `POST /api/support-ticket` may include a
+top-level `operation_failure` object:
+
+```json
+{
+  "correlation_id": "550e8400-e29b-41d4-a716-446655440000",
+  "client_ticket_id": "a stable UUID for this ticket submission",
+  "operation_failure": {
+    "capture_point": "fc.backend.payment.create.validation",
+    "operation_id": "550e8400-e29b-41d4-a716-446655440000",
+    "outcome": "not_applied",
+    "facts": { "display_code": "customer_mismatch" }
+  }
+}
+```
+
+`operation_id` must be a UUID and must exactly match the top-level `correlation_id`. The server
+validates the capture point, outcome, and optional facts against its closed operation-failure
+registry, then stores the normalized tuple under `diagnostics.operation_failure`. The normalized
+tuple contains the server-owned reason, operation, stage, classification, outcome, correlation ID,
+and validated facts; callers cannot supply or override those fields. Invalid or unregistered
+context is rejected without queuing a ticket. `client_ticket_id` remains the independent replay key,
+so retrying the same ticket does not replace its original correlation or operation context.
+
+For hardware printer dispatch failures, `operation_failure` captures
+(`fc.backend.printer.{receipt,kot}.{queue,timeout}`) carry validated `kind`, `connection_type`, and
+`failure_class` facts only when returned with a trusted backend correlation ID and approved capture
+stage. Client-side printer errors without backend dispatch failure context omit `operation_failure`
+while preserving sanitized diagnostics in the ticket body. Expected validation rejections (such as
+insufficient stock, closed cash days, or required cash sessions) surface actionable guidance in the
+POS and are classified as operational guidance rather than defects.
+
+Tickets without `operation_failure` retain the existing manual-help contract. The optional
+structured context does not add raw automatic logs or change the permission required to submit a
+support ticket.
+
+## Error taxonomy and correlation
+
+[`main/errors.ts`](../../main/errors.ts) gives every network operation a `FloErrorCode` and a
+`correlationId`.
+
+- `FloErrorCode` is a template-literal union namespaced by subsystem: `print.`, `tax.`,
+  `migration.`, `backup.`, `cloud.`, and `update.`. A new subsystem adds a namespace rather than a
+  new ad hoc string.
+- `correlationId()` returns a `randomUUID()`.
+- `correlatedError(code, message, cause?)` builds an error named `FloOperationError` carrying the
+  code, the correlation id, and optionally the cause.
+- `errorDetails(error, fallbackCode)` reads a code and correlation id off any thrown value, falling
+  back to a supplied code and a fresh correlation id, and always returns a `message`.
+
+For support-ticket correlation, see
+[Linking a ticket to a known operation failure](#linking-a-ticket-to-a-known-operation-failure).
+
+## Verification
+
+```sh
+npm run test:offline-mode
+npm run test:google-drive
+npm run test:telemetry
+npm run test:support-ticket
+npm run test:cloud-account-status
+npm run test:cloud-live-orders-batching
+npm run test:cloud-live-reports
+npm run test:recovery-cloud   # includes tests/cloud-deletion-recovery.test.ts
+```

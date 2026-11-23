@@ -1,10 +1,6 @@
 /** WebUSB ESC/POS thermal printer driver with browser print fallback. */
 
-export type PrinterStatus =
-  | 'disconnected'
-  | 'connecting'
-  | 'connected'
-  | 'error';
+export type PrinterStatus = 'disconnected' | 'connecting' | 'connected' | 'error';
 
 export type PrintMode = 'escpos' | 'browser';
 
@@ -88,11 +84,7 @@ class PrinterService {
   /** Opens (or re-opens) a device and claims its ESC/POS interface. */
   private async openDevice(device: USBDevice): Promise<void> {
     if (this.device) {
-      // Check if this is the exact same physical device.
-      const sameDevice = this.device.vendorId === device.vendorId
-        && this.device.productId === device.productId
-        && this.device.serialNumber === device.serialNumber;
-      if (sameDevice) {
+      if (this.isSameDevice(this.device, device)) {
         return;
       }
       // Release claim/interface on the previously connected device before switching.
@@ -114,7 +106,7 @@ class PrinterService {
           this.claimedInterface = iface.interfaceNumber;
           // Discover the bulk-OUT endpoint number from the descriptor
           const outEndpoint = alt.endpoints.find(
-            (ep) => ep.type === 'bulk' && ep.direction === 'out'
+            (ep) => ep.type === 'bulk' && ep.direction === 'out',
           );
           if (outEndpoint) this.endpointOut = outEndpoint.endpointNumber;
           break;
@@ -136,6 +128,22 @@ class PrinterService {
     navigator.usb.addEventListener('disconnect', this.handleDisconnect);
   }
 
+  private isSameDevice(left: USBDevice, right: USBDevice): boolean {
+    return (
+      left.vendorId === right.vendorId &&
+      left.productId === right.productId &&
+      left.serialNumber === right.serialNumber &&
+      left.productName === right.productName
+    );
+  }
+
+  private async findUniqueConfiguredDevice(productName: string): Promise<USBDevice | null> {
+    const matches = (await navigator.usb!.getDevices()).filter(
+      (device) => device.productName === productName,
+    );
+    return matches.length === 1 ? matches[0] : null;
+  }
+
   // Serializes openDevice() to prevent concurrent mutations of device/interface state.
   private connectLock: Promise<unknown> = Promise.resolve();
 
@@ -153,9 +161,7 @@ class PrinterService {
     }
 
     if (!navigator.usb) {
-      throw new Error(
-        'WebUSB API is not supported in this browser. Use Chrome or Edge 89+.'
-      );
+      throw new Error('WebUSB API is not supported in this browser. Use Chrome or Edge 89+.');
     }
 
     this.setStatus('connecting');
@@ -206,6 +212,53 @@ class PrinterService {
     return this.reconnectPromise;
   }
 
+  async isConfiguredDeviceReady(productName: string): Promise<boolean> {
+    if (
+      this._printMode === 'browser' ||
+      !this.isConnected ||
+      !this.device ||
+      typeof navigator === 'undefined' ||
+      !navigator.usb
+    ) {
+      return false;
+    }
+
+    return this.runExclusive(async () => {
+      const activeDevice = this.device;
+      if (this._printMode === 'browser' || this._status !== 'connected' || !activeDevice) {
+        return false;
+      }
+      const configuredDevice = await this.findUniqueConfiguredDevice(productName);
+      return (
+        configuredDevice !== null &&
+        this._status === 'connected' &&
+        this.device === activeDevice &&
+        this.isSameDevice(activeDevice, configuredDevice)
+      );
+    });
+  }
+
+  async printToConfiguredDevice(data: Uint8Array, productName: string): Promise<void> {
+    if (this._printMode === 'browser') {
+      throw new Error('Browser print mode is active. Use window.print() instead.');
+    }
+    if (typeof navigator === 'undefined' || !navigator.usb) {
+      throw new Error('WebUSB API is not supported in this browser. Use Chrome or Edge 89+.');
+    }
+
+    await this.runExclusive(async () => {
+      if (this._printMode === 'browser') {
+        throw new Error('Browser print mode is active. Use window.print() instead.');
+      }
+      const configuredDevice = await this.findUniqueConfiguredDevice(productName);
+      if (!configuredDevice) {
+        throw new Error('Configured WebUSB printer does not match one available device.');
+      }
+      await this.openDevice(configuredDevice);
+      await this.print(data);
+    });
+  }
+
   /** Waits for an in-flight silent reconnect to settle before caller checks connection. */
   async awaitPendingReconnect(): Promise<void> {
     if (this.reconnectPromise) await this.reconnectPromise;
@@ -254,8 +307,17 @@ class PrinterService {
   }
 
   /** Print using browser's print dialog with thermal-optimized styles. */
-  async printViaBrowser(htmlContent: string, paperWidth: 58 | 80): Promise<void> {
-    const printWindow = window.open('', '_blank');
+  reserveBrowserPrintWindow(): Window | null {
+    return typeof window === 'undefined' ? null : window.open('', '_blank');
+  }
+
+  async printViaBrowser(
+    htmlContent: string,
+    paperWidth: 58 | 80,
+    reservedWindow?: Window | null,
+  ): Promise<void> {
+    const printWindow =
+      reservedWindow === undefined ? this.reserveBrowserPrintWindow() : reservedWindow;
     if (!printWindow) {
       throw new Error('Please allow popups to print');
     }
@@ -267,17 +329,26 @@ class PrinterService {
       @page { size: ${mmWidth} auto; margin: 0; }
       * { margin: 0; padding: 0; box-sizing: border-box; }
       body {
-        font-family: 'Courier New', monospace;
-        font-size: 12px;
-        line-height: 1.2;
+        font-family: 'Courier New', 'Noto Sans Devanagari', 'Nirmala UI', 'Kohinoor Devanagari', 'Devanagari Sangam MN', 'Noto Sans Gurmukhi', 'Raavi', 'Kohinoor Gurmukhi', 'Gurmukhi Sangam MN', 'Noto Sans Telugu', 'Kohinoor Telugu', 'Telugu Sangam MN', 'Noto Sans Thai', 'Leelawadee UI', Thonburi, monospace;
+        font-size: 13px;
+        font-weight: 600;
+        color: #000;
+        background: #fff;
+        line-height: 1.3;
         width: ${mmWidth};
         max-width: ${mmWidth};
         margin: 0 auto;
         padding: 4px;
         text-align: left;
       }
+      body * {
+        color: #000 !important;
+        background: transparent !important;
+        border-color: #000 !important;
+      }
       @media print {
-        body { width: ${mmWidth} !important; max-width: ${mmWidth} !important; }
+        body { width: ${mmWidth} !important; max-width: ${mmWidth} !important; color: #000 !important; background: #fff !important; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+        body * { color: #000 !important; background: transparent !important; border-color: #000 !important; }
         @page { size: ${mmWidth} auto; margin: 0; }
       }
     `;
@@ -285,7 +356,9 @@ class PrinterService {
 
     // Parse receipt markup and strip executable/script nodes before printing.
     const parsed = new DOMParser().parseFromString(htmlContent, 'text/html');
-    parsed.querySelectorAll('script, link, meta, base, iframe, object, embed, form').forEach((node) => node.remove());
+    parsed
+      .querySelectorAll('script, link, meta, base, iframe, object, embed, form')
+      .forEach((node) => node.remove());
     parsed.querySelectorAll('*').forEach((element) => {
       for (const attribute of Array.from(element.attributes)) {
         const name = attribute.name.toLowerCase();
@@ -300,7 +373,9 @@ class PrinterService {
       }
     });
     printWindow.document.body.replaceChildren(
-      ...Array.from(parsed.body.childNodes).map((node) => printWindow.document.importNode(node, true)),
+      ...Array.from(parsed.body.childNodes).map((node) =>
+        printWindow.document.importNode(node, true),
+      ),
     );
     printWindow.document.close();
     printWindow.print();

@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import Link from 'next/link';
 import { Loader2 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
@@ -15,13 +15,48 @@ import { getCountryByCode, getCurrencyMinorUnitFactor } from '@/lib/countries';
 import { useAuthStore } from '@/store/auth';
 import { createPaymentIdempotencyKey } from '@/lib/payment-idempotency';
 import { parseDbTimestamp } from '@/lib/utils';
+import { formatItemHeading } from '@/lib/printer/item-heading';
+import {
+  businessDateForInstant,
+  dayBoundsInTimezone,
+  normalizeBusinessDayStartTime,
+} from '@shared/business-date';
 import { ROLE_ACCESS, hasRole } from '@shared/role-permissions';
 
 // Kept in sync with REFUND_ITEM_ELIGIBLE_STATUSES in main/services/refund.ts.
 const REFUND_ELIGIBLE_ITEM_STATUSES = ['preparing', 'ready', 'served', 'completed'];
-// Approximation of REFUND_WINDOW_MS in main/services/refund.ts, for the PIN hint only —
-// the backend's business-day check is authoritative.
-const REFUND_IN_PROGRESS_WINDOW_MS = 60 * 60 * 1000;
+
+type RefundManagerWindow = '30m' | '1h' | '2h' | '4h' | 'same_business_day';
+
+interface RefundPolicySettings {
+  refund_manager_enabled: boolean;
+  refund_manager_window: RefundManagerWindow;
+}
+
+const DEFAULT_REFUND_POLICY: RefundPolicySettings = {
+  refund_manager_enabled: true,
+  refund_manager_window: '1h',
+};
+
+const REFUND_MANAGER_WINDOW_MS: Record<
+  Exclude<RefundManagerWindow, 'same_business_day'>,
+  number
+> = {
+  '30m': 30 * 60 * 1000,
+  '1h': 60 * 60 * 1000,
+  '2h': 2 * 60 * 60 * 1000,
+  '4h': 4 * 60 * 60 * 1000,
+};
+
+function isRefundManagerWindow(value: unknown): value is RefundManagerWindow {
+  return (
+    value === '30m' ||
+    value === '1h' ||
+    value === '2h' ||
+    value === '4h' ||
+    value === 'same_business_day'
+  );
+}
 
 // Mirrors BUILT_IN_PAYMENT_KEYS in PaymentModal.tsx.
 const BUILT_IN_PAYMENT_KEYS = {
@@ -40,12 +75,48 @@ function getCurrentTime(): number {
   return Date.now();
 }
 
+function isOrderLikelyLateForRefund(
+  order: Order,
+  nowMs: number,
+  policy: RefundPolicySettings,
+  timezone: string | null | undefined,
+  businessDayStartTime: string | null | undefined,
+): boolean {
+  if (!policy.refund_manager_enabled) return true;
+  if (order.release_status && order.release_status !== 'released') return false;
+  const anchor = order.released_at || order.created_at;
+  const anchorMs = parseDbTimestamp(anchor).getTime();
+  if (!Number.isFinite(anchorMs)) return false;
+
+  if (
+    policy.refund_manager_window !== 'same_business_day' &&
+    nowMs - anchorMs > REFUND_MANAGER_WINDOW_MS[policy.refund_manager_window]
+  ) {
+    return true;
+  }
+
+  const effectiveTz = timezone || 'UTC';
+  const effectiveStartTime = normalizeBusinessDayStartTime(businessDayStartTime);
+  const orderBusinessDate = businessDateForInstant({
+    instant: new Date(anchorMs),
+    timezone: effectiveTz,
+    startTime: effectiveStartTime,
+  });
+  const [, businessDayEnd] = dayBoundsInTimezone(
+    orderBusinessDate,
+    effectiveTz,
+    effectiveStartTime,
+  );
+  return nowMs >= parseDbTimestamp(businessDayEnd).getTime();
+}
+
 function getConfiguredApprovers(staff: Staff[]): Staff[] {
-  return staff.filter((member) => (
-    member.is_active !== 0
-    && Boolean(member.has_pin)
-    && hasRole(member.role, ROLE_ACCESS.ownerManager)
-  ));
+  return staff.filter(
+    (member) =>
+      member.is_active !== 0 &&
+      Boolean(member.has_pin) &&
+      hasRole(member.role, ROLE_ACCESS.ownerManager),
+  );
 }
 
 interface Props {
@@ -53,9 +124,16 @@ interface Props {
   bills: Bill[];
   onClose: () => void;
   onRefunded: () => void;
+  onRegisterDismissHandler?: (handler?: () => boolean) => void;
 }
 
-export default function RefundModal({ order, bills, onClose, onRefunded }: Props) {
+export default function RefundModal({
+  order,
+  bills,
+  onClose,
+  onRefunded,
+  onRegisterDismissHandler,
+}: Props) {
   const t = useTranslations('orders');
   const tCommon = useTranslations('common');
   const tPos = useTranslations('pos');
@@ -69,17 +147,22 @@ export default function RefundModal({ order, bills, onClose, onRefunded }: Props
   const { toDisplay: toDisplayUnit, toStored: toStoredUnit, formatInput } = unitAdapter;
   const formatCurrency = useFormatCurrency();
   // Ticks while the modal is open so the hint doesn't go stale if it's left open across
-  // the 1-hour mark; the backend re-checks the real time at submission regardless.
+  // the approval window; the backend re-checks the real time at submission regardless.
   const [now, setNow] = useState(() => Date.now());
-  useEffect(() => {
-    const interval = setInterval(() => setNow(Date.now()), 30000);
-    return () => clearInterval(interval);
-  }, []);
-  const isLikelyLate = now - parseDbTimestamp(order.created_at).getTime() > REFUND_IN_PROGRESS_WINDOW_MS;
+  const [refundPolicy, setRefundPolicy] = useState<RefundPolicySettings>(DEFAULT_REFUND_POLICY);
+  const isLikelyLate = isOrderLikelyLateForRefund(
+    order,
+    now,
+    refundPolicy,
+    currentTenant?.timezone,
+    currentTenant?.business_day_start_time,
+  );
 
   // Split checks mean an order can have several paid bills, each with its own allocated
   // items; a fully refunded bill has nothing left, so exclude it from selection.
-  const paidBills = bills.filter((b) => Number(b.paid_amount) > 0 && b.payment_status !== 'refunded');
+  const paidBills = bills.filter(
+    (b) => Number(b.paid_amount) > 0 && b.payment_status !== 'refunded',
+  );
   const [selectedBillId, setSelectedBillId] = useState<number | ''>(paidBills[0]?.id ?? '');
   const selectedBill = paidBills.find((b) => b.id === selectedBillId) || paidBills[0] || null;
 
@@ -96,46 +179,137 @@ export default function RefundModal({ order, bills, onClose, onRefunded }: Props
   const [approverId, setApproverId] = useState('');
   const [approversLoading, setApproversLoading] = useState(true);
   const [approversLoadFailed, setApproversLoadFailed] = useState(false);
+  const [approversUserId, setApproversUserId] = useState<string | null>(null);
   const [refundedSoFarCents, setRefundedSoFarCents] = useState(0);
   const [submitting, setSubmitting] = useState(false);
+  const submittingRef = useRef(false);
+
+  const dismissHandlerRef = useRef<() => boolean>(() => true);
+  useEffect(() => {
+    dismissHandlerRef.current = () => {
+      if (submitting || submittingRef.current) return true;
+      onClose();
+      return true;
+    };
+  });
+
+  useEffect(() => {
+    if (!onRegisterDismissHandler) return;
+    onRegisterDismissHandler(() => dismissHandlerRef.current());
+    return () => onRegisterDismissHandler(undefined);
+  }, [onRegisterDismissHandler]);
 
   useEffect(() => {
     let cancelled = false;
-    api.get('/staff', { params: { active: true } })
-      .then((res) => {
+    const requestUserId = user?.id == null ? null : String(user.id);
+    Promise.all([api.get('/staff/approvers'), api.get('/settings/refunds')])
+      .then(([res, policyRes]) => {
         if (cancelled) return;
-        const staff: Staff[] = res.data?.staff || [];
-        const eligibleStaff = getConfiguredApprovers(staff);
-        const eligibleStaffAtCurrentTime = eligibleStaff.filter((member) => hasRole(
-          member.role,
-          isLikelyLate ? ROLE_ACCESS.owner : ROLE_ACCESS.ownerManager,
-        ));
-        const currentUserApprover = eligibleStaffAtCurrentTime.find((member) => String(member.id) === String(user?.id));
-        const preferredId = currentUserApprover?.id || (eligibleStaffAtCurrentTime.length === 1 ? eligibleStaffAtCurrentTime[0].id : '');
-        setApprovers(eligibleStaff);
+        const loadedPolicy: RefundPolicySettings = {
+          refund_manager_enabled: policyRes.data?.refund_manager_enabled !== false,
+          refund_manager_window: isRefundManagerWindow(policyRes.data?.refund_manager_window)
+            ? policyRes.data.refund_manager_window
+            : '1h',
+        };
+        setRefundPolicy(loadedPolicy);
+        const staff: Staff[] = res.data?.approvers ?? res.data?.staff ?? [];
+        const configured = getConfiguredApprovers(staff);
+        const late = isOrderLikelyLateForRefund(
+          order,
+          getCurrentTime(),
+          loadedPolicy,
+          currentTenant?.timezone,
+          currentTenant?.business_day_start_time,
+        );
+        const eligible = configured.filter((member) =>
+          hasRole(member.role, late ? ROLE_ACCESS.owner : ROLE_ACCESS.ownerManager),
+        );
+        const currentUserApprover = eligible.find((member) => String(member.id) === requestUserId);
+        const preferredId =
+          currentUserApprover?.id || (eligible.length === 1 ? eligible[0].id : '');
+        setApprovers(configured);
         setApproverId(preferredId ? String(preferredId) : '');
         setOverridePin('');
         setApproversLoadFailed(false);
+        setApproversUserId(requestUserId);
       })
       .catch(() => {
         if (cancelled) return;
         setApprovers([]);
+        setApproverId('');
+        setOverridePin('');
         setApproversLoadFailed(true);
+        setApproversUserId(requestUserId);
       })
       .finally(() => {
         if (!cancelled) setApproversLoading(false);
       });
-    return () => { cancelled = true; };
-  }, [isLikelyLate, user?.id]);
+    return () => {
+      cancelled = true;
+    };
+  }, [currentTenant?.business_day_start_time, currentTenant?.timezone, order, user?.id]);
 
-  const eligibleApprovers = approvers.filter((member) => hasRole(
-    member.role,
-    isLikelyLate ? ROLE_ACCESS.owner : ROLE_ACCESS.ownerManager,
-  ));
+  useEffect(() => {
+    const interval = setInterval(() => {
+      const currentTime = Date.now();
+      setNow(currentTime);
+      const eligible = approvers.filter((member) =>
+        hasRole(
+          member.role,
+          isOrderLikelyLateForRefund(
+            order,
+            currentTime,
+            refundPolicy,
+            currentTenant?.timezone,
+            currentTenant?.business_day_start_time,
+          )
+            ? ROLE_ACCESS.owner
+            : ROLE_ACCESS.ownerManager,
+        ),
+      );
+      setApproverId((currentApproverId) => {
+        if (!currentApproverId) {
+          if (eligible.length === 1) {
+            setOverridePin('');
+            return String(eligible[0].id);
+          }
+          return currentApproverId;
+        }
+        if (!eligible.some((member) => String(member.id) === currentApproverId)) {
+          const currentUserApprover = eligible.find(
+            (member) => String(member.id) === String(user?.id),
+          );
+          const preferredId =
+            currentUserApprover?.id || (eligible.length === 1 ? eligible[0].id : '');
+          setOverridePin('');
+          return preferredId ? String(preferredId) : '';
+        }
+        return currentApproverId;
+      });
+    }, 30000);
+    return () => clearInterval(interval);
+  }, [
+    approvers,
+    currentTenant?.business_day_start_time,
+    currentTenant?.timezone,
+    order,
+    refundPolicy,
+    user?.id,
+  ]);
+
+  const approversReady =
+    !approversLoading && approversUserId === (user?.id == null ? null : String(user.id));
+  const eligibleApprovers = approvers.filter((member) =>
+    hasRole(member.role, isLikelyLate ? ROLE_ACCESS.owner : ROLE_ACCESS.ownerManager),
+  );
   const approverIdForRefund = eligibleApprovers.some((member) => String(member.id) === approverId)
     ? approverId
-    : eligibleApprovers.length === 1 ? String(eligibleApprovers[0].id) : '';
-  const selectedApprover = eligibleApprovers.find((member) => String(member.id) === approverIdForRefund);
+    : eligibleApprovers.length === 1
+      ? String(eligibleApprovers[0].id)
+      : '';
+  const selectedApprover = eligibleApprovers.find(
+    (member) => String(member.id) === approverIdForRefund,
+  );
 
   // Bill-scoped view: order.items is order-wide and includes other split bills' items,
   // which the backend would reject for this bill.
@@ -144,19 +318,25 @@ export default function RefundModal({ order, bills, onClose, onRefunded }: Props
   useEffect(() => {
     if (!selectedBill) return;
     let cancelled = false;
-    api.get(`/bills/${selectedBill.id}`).then((res) => {
-      if (cancelled) return;
-      setScopedBill(res.data.bill);
-      setScopedItems(res.data.bill.order?.items || []);
-    }).catch(() => {
-      if (cancelled) return;
-      setScopedBill(selectedBill);
-      setScopedItems([]);
-    });
-    return () => { cancelled = true; };
+    api
+      .get(`/bills/${selectedBill.id}`)
+      .then((res) => {
+        if (cancelled) return;
+        setScopedBill(res.data.bill);
+        setScopedItems(res.data.bill.order?.items || []);
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setScopedBill(selectedBill);
+        setScopedItems([]);
+      });
+    return () => {
+      cancelled = true;
+    };
   }, [selectedBill]);
 
-  const effectiveBill = scopedBill && scopedBill.id === selectedBill?.id ? scopedBill : selectedBill;
+  const effectiveBill =
+    scopedBill && scopedBill.id === selectedBill?.id ? scopedBill : selectedBill;
   // A split item only allocated in part to this bill has a smaller quantity here than in
   // the order-wide list; the backend refuses to refund those as a whole item.
   const originalItemById = new Map((order.items || []).map((item) => [item.id, item]));
@@ -179,9 +359,16 @@ export default function RefundModal({ order, bills, onClose, onRefunded }: Props
   useEffect(() => {
     if (!effectiveBill) return;
     let cancelled = false;
-    api.get('/payment-methods').then((res) => setCustomMethods(res.data.payment_methods || [])).catch(() => setCustomMethods([]));
-    api.get('/settings/loyalty').then((res) => setLoyaltyEnabled(!!res.data?.loyalty_enabled)).catch(() => {});
-    api.get('/refunds', { params: { bill_id: effectiveBill.id, limit: 500 } })
+    api
+      .get('/payment-methods')
+      .then((res) => setCustomMethods(res.data.payment_methods || []))
+      .catch(() => setCustomMethods([]));
+    api
+      .get('/settings/loyalty')
+      .then((res) => setLoyaltyEnabled(!!res.data?.loyalty_enabled))
+      .catch(() => {});
+    api
+      .get('/refunds', { params: { bill_id: effectiveBill.id, limit: 500 } })
       .then((res) => {
         if (cancelled) return;
         const refunds: { amount_cents?: number }[] = res.data?.refunds || [];
@@ -189,7 +376,9 @@ export default function RefundModal({ order, bills, onClose, onRefunded }: Props
         setRefundedSoFarCents(total);
       })
       .catch(() => {});
-    return () => { cancelled = true; };
+    return () => {
+      cancelled = true;
+    };
   }, [effectiveBill]);
 
   const paidCents = Math.round(Number(effectiveBill?.paid_amount || 0) * minorFactor);
@@ -205,10 +394,15 @@ export default function RefundModal({ order, bills, onClose, onRefunded }: Props
   }
 
   const selectedItem = eligibleItems.find((i) => i.id === itemId) || null;
-  const amountValue = scope === 'item' && selectedItem ? toDisplayUnit(Number(selectedItem.total)) : parseFloat(amount) || 0;
+  const amountValue =
+    scope === 'item' && selectedItem
+      ? toDisplayUnit(Number(selectedItem.total))
+      : parseFloat(amount) || 0;
 
   const canSubmit =
     !submitting &&
+    approversReady &&
+    !approversLoadFailed &&
     !!effectiveBill &&
     approverIdForRefund.trim().length > 0 &&
     approverIdForRefund === approverId &&
@@ -219,20 +413,42 @@ export default function RefundModal({ order, bills, onClose, onRefunded }: Props
     (scope === 'whole' || !!selectedItem);
 
   const submit = async () => {
-    if (!canSubmit || !effectiveBill) return;
+    if (submittingRef.current || !canSubmit || !effectiveBill) return;
+    submittingRef.current = true;
     setSubmitting(true);
     try {
-      const staffResponse = await api.get('/staff', { params: { active: true } });
+      const [staffResponse, policyResponse] = await Promise.all([
+        api.get('/staff/approvers'),
+        api.get('/settings/refunds'),
+      ]);
+      const latestPolicy: RefundPolicySettings = {
+        refund_manager_enabled: policyResponse.data?.refund_manager_enabled !== false,
+        refund_manager_window: isRefundManagerWindow(policyResponse.data?.refund_manager_window)
+          ? policyResponse.data.refund_manager_window
+          : '1h',
+      };
       const submissionNow = getCurrentTime();
-      const submissionIsLate = submissionNow - parseDbTimestamp(order.created_at).getTime() > REFUND_IN_PROGRESS_WINDOW_MS;
-      const configuredApprovers = getConfiguredApprovers(staffResponse.data?.staff || []);
-      const eligibleApproversAtSubmission = configuredApprovers.filter((member) => hasRole(
-        member.role,
-        submissionIsLate ? ROLE_ACCESS.owner : ROLE_ACCESS.ownerManager,
-      ));
-      const approverIdAtSubmission = eligibleApproversAtSubmission.some((member) => String(member.id) === approverId)
+      const submissionIsLate = isOrderLikelyLateForRefund(
+        order,
+        submissionNow,
+        latestPolicy,
+        currentTenant?.timezone,
+        currentTenant?.business_day_start_time,
+      );
+      const configuredApprovers = getConfiguredApprovers(
+        staffResponse.data?.approvers ?? staffResponse.data?.staff ?? [],
+      );
+      const eligibleApproversAtSubmission = configuredApprovers.filter((member) =>
+        hasRole(member.role, submissionIsLate ? ROLE_ACCESS.owner : ROLE_ACCESS.ownerManager),
+      );
+      const approverIdAtSubmission = eligibleApproversAtSubmission.some(
+        (member) => String(member.id) === approverId,
+      )
         ? approverId
-        : eligibleApproversAtSubmission.length === 1 ? String(eligibleApproversAtSubmission[0].id) : '';
+        : eligibleApproversAtSubmission.length === 1
+          ? String(eligibleApproversAtSubmission[0].id)
+          : '';
+      setRefundPolicy(latestPolicy);
       setNow(submissionNow);
       setApprovers(configuredApprovers);
       setApproverId(approverIdAtSubmission);
@@ -252,13 +468,16 @@ export default function RefundModal({ order, bills, onClose, onRefunded }: Props
       } else {
         body.amount = toStoredUnit(amountValue);
       }
-      await api.post('/refunds', body, { headers: { 'Idempotency-Key': createPaymentIdempotencyKey() } });
+      await api.post('/refunds', body, {
+        headers: { 'Idempotency-Key': createPaymentIdempotencyKey() },
+      });
       toast.success(t('refundIssued'));
       onRefunded();
       onClose();
     } catch (error) {
       toast.error(extractRefundErrorMessage(error) || t('refundFailed'));
     } finally {
+      submittingRef.current = false;
       setSubmitting(false);
     }
   };
@@ -273,7 +492,10 @@ export default function RefundModal({ order, bills, onClose, onRefunded }: Props
         <div className="space-y-4">
           {paidBills.length > 1 && (
             <div>
-              <label htmlFor="refundBill" className="block text-sm font-medium text-foreground mb-1">
+              <label
+                htmlFor="refundBill"
+                className="block text-sm font-medium text-foreground mb-1"
+              >
                 {t('refundBillLabel')}
               </label>
               <select
@@ -309,8 +531,8 @@ export default function RefundModal({ order, bills, onClose, onRefunded }: Props
             </button>
           </div>
 
-          {scope === 'item' && (
-            eligibleItems.length === 0 ? (
+          {scope === 'item' &&
+            (eligibleItems.length === 0 ? (
               <p className="text-sm text-muted-foreground">{t('refundNoEligibleItems')}</p>
             ) : (
               <select
@@ -321,16 +543,19 @@ export default function RefundModal({ order, bills, onClose, onRefunded }: Props
                 <option value="">{t('refundSelectItemPlaceholder')}</option>
                 {eligibleItems.map((item) => (
                   <option key={item.id} value={item.id}>
-                    {item.product_name} — {formatCurrency(Number(item.total))}
+                    {formatItemHeading(item.product_name, item.variant_selection)} —{' '}
+                    {formatCurrency(Number(item.total))}
                   </option>
                 ))}
               </select>
-            )
-          )}
+            ))}
 
           {scope === 'whole' && (
             <div>
-              <label htmlFor="refundAmount" className="block text-sm font-medium text-foreground mb-1">
+              <label
+                htmlFor="refundAmount"
+                className="block text-sm font-medium text-foreground mb-1"
+              >
                 {t('refundAmountLabel')}
               </label>
               <input
@@ -339,7 +564,10 @@ export default function RefundModal({ order, bills, onClose, onRefunded }: Props
                 min={0}
                 step="any"
                 value={amount}
-                onChange={(e) => { setAmountTouched(true); setAmount(e.target.value); }}
+                onChange={(e) => {
+                  setAmountTouched(true);
+                  setAmount(e.target.value);
+                }}
                 className="w-full rounded-lg border border-border bg-background px-3 py-2 text-sm"
               />
             </div>
@@ -350,7 +578,10 @@ export default function RefundModal({ order, bills, onClose, onRefunded }: Props
           </p>
 
           <div>
-            <label htmlFor="refundMethod" className="block text-sm font-medium text-foreground mb-1">
+            <label
+              htmlFor="refundMethod"
+              className="block text-sm font-medium text-foreground mb-1"
+            >
               {t('refundMethodLabel')}
             </label>
             <select
@@ -360,11 +591,17 @@ export default function RefundModal({ order, bills, onClose, onRefunded }: Props
               className="w-full rounded-lg border border-border bg-background px-3 py-2 text-sm"
             >
               {PAYMENT_METHODS.map((m) => (
-                <option key={m.key} value={m.key}>{tPos(BUILT_IN_PAYMENT_KEYS[m.key])}</option>
+                <option key={m.key} value={m.key}>
+                  {tPos(BUILT_IN_PAYMENT_KEYS[m.key])}
+                </option>
               ))}
-              {customMethods.filter((m) => m.is_active).map((m) => (
-                <option key={m.id} value={m.name}>{m.name}</option>
-              ))}
+              {customMethods
+                .filter((m) => m.is_active)
+                .map((m) => (
+                  <option key={m.id} value={m.name}>
+                    {m.name}
+                  </option>
+                ))}
               {loyaltyEnabled && effectiveBill?.customer_id && (
                 <option value="wallet">{t('refundMethodStoreCredit')}</option>
               )}
@@ -372,7 +609,10 @@ export default function RefundModal({ order, bills, onClose, onRefunded }: Props
           </div>
 
           <div>
-            <label htmlFor="refundReason" className="block text-sm font-medium text-foreground mb-1">
+            <label
+              htmlFor="refundReason"
+              className="block text-sm font-medium text-foreground mb-1"
+            >
               {tCommon('reasonOptional')}
             </label>
             <input
@@ -384,20 +624,20 @@ export default function RefundModal({ order, bills, onClose, onRefunded }: Props
             />
           </div>
 
-          {approversLoading && (
+          {!approversReady && (
             <div className="flex items-center gap-2 text-sm text-muted-foreground">
               <Loader2 size={14} className="animate-spin" />
               {t('refundApproverLabel')}
             </div>
           )}
 
-          {approversLoadFailed && (
+          {approversReady && approversLoadFailed && (
             <p className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
               {t('refundApproverLoadFailed')}
             </p>
           )}
 
-          {!approversLoading && !approversLoadFailed && eligibleApprovers.length === 0 && (
+          {approversReady && !approversLoadFailed && eligibleApprovers.length === 0 && (
             <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800">
               <p>
                 {hasRole(currentTenant?.role, ROLE_ACCESS.owner)
@@ -412,9 +652,12 @@ export default function RefundModal({ order, bills, onClose, onRefunded }: Props
             </div>
           )}
 
-          {!approversLoading && eligibleApprovers.length > 1 && (
+          {approversReady && eligibleApprovers.length > 1 && (
             <div>
-              <label htmlFor="refundApprover" className="block text-sm font-medium text-foreground mb-1">
+              <label
+                htmlFor="refundApprover"
+                className="block text-sm font-medium text-foreground mb-1"
+              >
                 {t('refundApproverLabel')}
               </label>
               <select
@@ -437,9 +680,10 @@ export default function RefundModal({ order, bills, onClose, onRefunded }: Props
             </div>
           )}
 
-          {!approversLoading && eligibleApprovers.length === 1 && selectedApprover && (
+          {approversReady && eligibleApprovers.length === 1 && selectedApprover && (
             <p className="text-sm text-muted-foreground">
-              {t('refundApproverLabel')}: <span className="font-medium text-foreground">{selectedApprover.name}</span>
+              {t('refundApproverLabel')}:{' '}
+              <span className="font-medium text-foreground">{selectedApprover.name}</span>
             </p>
           )}
 
@@ -454,11 +698,25 @@ export default function RefundModal({ order, bills, onClose, onRefunded }: Props
               value={overridePin}
               maxLength={6}
               onChange={(e) => setOverridePin(e.target.value.replace(/\D/g, '').slice(0, 6))}
-              disabled={submitting}
+              disabled={
+                submitting ||
+                !approversReady ||
+                approversLoadFailed ||
+                !selectedApprover ||
+                approverId !== approverIdForRefund
+              }
               className="w-full rounded-lg border border-border bg-background px-3 py-2 text-sm"
             />
             <p className="text-xs text-muted-foreground mt-1">{t('refundApprovalPinHint')}</p>
-            {isLikelyLate && <p className="text-xs text-muted-foreground mt-1">{t('refundOwnerPinNotice')}</p>}
+            {isLikelyLate && (
+              <p className="text-xs text-muted-foreground mt-1">
+                {!refundPolicy.refund_manager_enabled
+                  ? t('refundOwnerOnlyNotice')
+                  : refundPolicy.refund_manager_window === '1h'
+                    ? t('refundOwnerPinNotice')
+                    : t('refundOutsideWindowNotice')}
+              </p>
+            )}
           </div>
         </div>
 

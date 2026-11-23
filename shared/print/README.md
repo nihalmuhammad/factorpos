@@ -17,8 +17,8 @@ issue #441 (epic #438).
   kernel treats codes as structural strings (`PrintLanguageCode = string`).
 - Enforced in CI by the public consumer-boundary checks in
   `tests/kernel-purity.test.ts`, the static forbidden-import audit in
-  `tests/print-document.test.ts`, and ESLint (`npm run lint` covers `shared/`
-  with import restrictions).
+  `tests/print-document.test.ts`, and the shared-scope lint rules described in
+  [the frontend architecture guide](../../docs/architecture/frontend.md#lint-engine).
 
 ## Registry-injection pattern
 
@@ -48,7 +48,7 @@ never kernel → registry.
 | `policy.ts`   | Resolution (`resolveReceiptLanguages`, `resolveKotLanguage`) and validation (`parsePrintLanguagePolicy`, `parseKotLanguagePolicy`); max-2 documents enforced at type level for v1 |
 | `direction.ts`| Per-scope direction (`document` / `block` / `value`), LTR-island classification |
 | `bilingual.ts`| `BilingualLabel` + width-fit strategies (`inline` vs `stacked`) parameterized by column count |
-| `document.ts` | Renderer-independent `PrintDocument` v1 / `KotDocument` v1 (#442/#443): receipt and kitchen-ticket block types, `PrintData`/`PrintContext` snapshots (including tenant currency), and pure `buildBillDocument` / `buildKotDocument`. Schema and extension policy documented in [docs/printing-architecture.md](../../docs/printing-architecture.md) (#449) |
+| `document.ts` | Renderer-independent `PrintDocument` v1 / `KotDocument` v1 (#442/#443): receipt and kitchen-ticket block types, `PrintData`/`PrintContext` snapshots (including tenant currency), and pure `buildBillDocument` / `buildKotDocument`. Schema and extension policy documented in [docs/architecture/printing.md](../../docs/architecture/printing.md) (#449) |
 
 Consumers: `main/*` imports the relative path `../../shared/print` and gets
 one compiled runtime copy under `dist/shared/print`; `frontend/*` imports

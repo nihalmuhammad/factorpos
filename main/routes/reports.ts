@@ -1,27 +1,139 @@
 import { Router, Request, Response } from 'express';
+import { cloudSync } from '../services/cloud-sync';
+import { serializeOperationFailure } from '../lib/operation-failure';
 import Decimal from 'decimal.js';
 import {
-  dayBoundsInTimezone, getDatabase, getSettingValue, localDateInTimezone, parseDbTimestamp,
+  dayBoundsInTimezone,
+  getDatabase,
+  getSettingValue,
+  localDateInTimezone,
+  now,
+  parseDbTimestamp,
   tenantBusinessDayStartTime,
 } from '../db';
-import { requireRole } from '../middleware/security';
-import { ROLE_ACCESS } from '../../shared/role-permissions';
+import { hasPermission, requirePermission } from '../services/authorization';
+import { getHttpRequestSignal, trackHttpRequestWork } from '../shutdown';
+import * as whatsapp from '../services/whatsapp';
+import { parsePhoneE164 } from '../lib/phone';
 import { getOrdersWithItemsForBills } from './bills';
+import {
+  getShiftWindow,
+  listPriceExceptions,
+  listShiftsOverlapping,
+} from '../services/item-price-override';
 import { aggregateTaxComponents } from '../services/tax-components';
 import { getTenantCurrency } from '../services/refund';
-import { getCurrencyMinorUnitFactor } from '../countries';
-import { computeDayAggregates, paymentMethodBreakdown } from './cash-closures';
+import { getCurrencyMinorUnitFactor, resolveRegionalSnapshot } from '../countries';
+import {
+  openSessionsBlockingDayClose,
+  sessionBusinessDate,
+} from '../services/cash-day-close-guards';
+import type { CashSessionRow } from '../services/shift-session-gate';
+import type { AuthedRequest } from './cash-sessions';
+import {
+  computeDayAggregates,
+  computeSessionAggregates,
+  expectedCashFromAggregates,
+  paymentMethodBreakdown,
+  sessionExpectedCash,
+} from './cash-closures';
+import { getCurrencyFractionDigits } from '../countries';
+import { roundCurrencyCost } from '../services/supplies';
+import {
+  buildDailySalesExportDataset,
+  DailySalesExportValidationError,
+  formatDailySalesWhatsAppMessage,
+  parseValidBusinessDate,
+  resolveDailySalesExportRange,
+  type DailySalesCostStatus,
+} from '../services/daily-sales-export';
+import {
+  dailySalesExportFilename,
+  serializeDailySalesExportCsv,
+  serializeDailySalesExportHtml,
+  serializeDailySalesExportXlsx,
+  type DailySalesExportCsvPart,
+} from '../services/daily-sales-export-files';
+import {
+  buildDailyInvoicesExportDataset,
+  DAILY_INVOICES_EXPORT_MAX_RANGE_DAYS,
+  dailyInvoicesExportFilename,
+  serializeDailyInvoicesExportHtml,
+} from '../services/daily-invoices-export';
+import {
+  buildCustomerSalesDataset,
+  customerSalesExportFilename,
+  CustomerSalesRangeError,
+  serializeCustomerSalesCsv,
+  serializeCustomerSalesXlsx,
+} from '../services/customer-sales-export';
+import {
+  serializeXReportCsv,
+  serializeXReportHtml,
+  serializeXReportXlsx,
+  serializeZReportCsv,
+  serializeZReportHtml,
+  serializeZReportXlsx,
+  type CashCloseHtmlOptions,
+  type XReportExport,
+  type ZReportExport,
+} from '../services/cash-close-export';
 
 const router = Router();
 
-const WEEKDAY_NAMES = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+function captureFinancialSummaryDateRangeRejection(): void {
+  const failure = serializeOperationFailure({
+    capture_point: 'fc.backend.reports.financial_summary.date_range',
+    outcome: 'not_applied',
+  });
+  try {
+    if (failure) cloudSync.captureOperationFailure(failure);
+  } catch {
+    // Diagnostics cannot change report validation responses.
+  }
+}
+
+function captureReportsDateRangeRejection(
+  validationCode: 'invalid_format' | 'reversed_range' | 'date_and_range_conflict',
+): void {
+  const failure = serializeOperationFailure({
+    capture_point: 'fc.backend.reports.date_range.invalid',
+    outcome: 'not_applied',
+    facts: { validation_code: validationCode },
+  });
+  try {
+    if (failure) cloudSync.captureOperationFailure(failure);
+  } catch {
+    // Diagnostics cannot change report validation responses.
+  }
+}
+
+const WEEKDAY_NAMES = [
+  'Sunday',
+  'Monday',
+  'Tuesday',
+  'Wednesday',
+  'Thursday',
+  'Friday',
+  'Saturday',
+];
 
 // Mirrors main/routes/tables.ts's ACTIVE_ORDER_STATUS_SQL — an order still
 // "occupying" its table until it's completed or cancelled.
 const ACTIVE_ORDER_STATUS_SQL = "o.status NOT IN ('completed', 'cancelled')";
 
+// Resolves through the country profile when the stored timezone is missing
+// or invalid, matching resolveRegionalSnapshot's own contract, instead of
+// letting bucketByLocalHourAndWeekday()/dayBoundsInTimezone() silently fall
+// back to UTC — reporting a tenant-local day or hour bucket in the wrong
+// zone produces incorrect report data. Only throws RegionalNotConfiguredError
+// when the country itself is unresolvable.
 function tenantTimezone(): string {
-  return getSettingValue('timezone') || 'Asia/Kolkata';
+  return resolveRegionalSnapshot({
+    country: getSettingValue('country') ?? undefined,
+    currency: getSettingValue('currency') ?? undefined,
+    timezone: getSettingValue('timezone') ?? undefined,
+  }).timezone;
 }
 
 function tenantStartTime(): string {
@@ -37,7 +149,11 @@ function reportDayBounds(date: string): [string, string] {
 }
 
 function reportDate(value: unknown, fallback: string): string {
-  return typeof value === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(value) ? value : fallback;
+  return typeof value === 'string' &&
+    /^\d{4}-\d{2}-\d{2}$/.test(value) &&
+    parseValidBusinessDate(value) !== null
+    ? value
+    : fallback;
 }
 
 /**
@@ -48,7 +164,11 @@ function reportDate(value: unknown, fallback: string): string {
  * IANA timezone support (only fixed offsets), so this bucketing happens
  * in JS via Intl instead of in SQL.
  */
-function bucketByLocalHourAndWeekday(timestamps: string[], timeZone: string, startTime?: string): { hourCounts: number[]; dayCounts: number[] } {
+function bucketByLocalHourAndWeekday(
+  timestamps: string[],
+  timeZone: string,
+  startTime?: string,
+): { hourCounts: number[]; dayCounts: number[] } {
   const hourFmt = new Intl.DateTimeFormat('en-US', { timeZone, hour: 'numeric', hourCycle: 'h23' });
 
   const hourCounts = new Array(24).fill(0);
@@ -68,7 +188,11 @@ function bucketByLocalHourAndWeekday(timestamps: string[], timeZone: string, sta
 }
 
 /** argmax/argmin over counts, restricted to indices where include(count) is true. Returns null if nothing qualifies. */
-function pickExtreme(counts: number[], mode: 'max' | 'min', include: (count: number) => boolean): { index: number; count: number } | null {
+function pickExtreme(
+  counts: number[],
+  mode: 'max' | 'min',
+  include: (count: number) => boolean,
+): { index: number; count: number } | null {
   let best: { index: number; count: number } | null = null;
   counts.forEach((count, index) => {
     if (!include(count)) return;
@@ -79,66 +203,91 @@ function pickExtreme(counts: number[], mode: 'max' | 'min', include: (count: num
   return best;
 }
 
-router.get('/daily-stats', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res: Response) => {
+router.get('/daily-stats', requirePermission('reports.view'), (req: Request, res: Response) => {
   try {
     const db = getDatabase();
     const minorFactor = getCurrencyMinorUnitFactor(getTenantCurrency(db));
     const today = reportToday();
     const [start, end] = reportDayBounds(today);
-    const salesToday = db.prepare(`
+    const salesToday = db
+      .prepare(`
       SELECT
         COALESCE((SELECT SUM(paid_amount) FROM bills WHERE paid_at >= ? AND paid_at < ?), 0)
         - COALESCE((SELECT SUM(CAST(amount_cents AS REAL)) / ? FROM refunds WHERE created_at >= ? AND created_at < ?), 0) AS sales
-    `).get(start, end, minorFactor, start, end) as { sales: number };
-    const paymentMethodsToday = paymentMethodBreakdown(db, today) as { total: number }[];
+    `)
+      .get(start, end, minorFactor, start, end) as { sales: number };
+    const paymentMethodsToday = paymentMethodBreakdown(db, { startDate: today }) as {
+      total: number;
+    }[];
 
-    const runningOrders = db.prepare(`
-      SELECT COUNT(*) as count FROM orders WHERE status IN ('pending', 'preparing')
-    `).get() as { count: number };
+    const runningOrders = db
+      .prepare(`
+      SELECT COUNT(*) as count FROM orders
+      WHERE release_status = 'released' AND status IN ('pending', 'preparing')
+    `)
+      .get() as { count: number };
 
-    const pendingOrders = db.prepare(`
-      SELECT COUNT(*) as count FROM orders WHERE status = 'pending'
-    `).get() as { count: number };
+    const pendingOrders = db
+      .prepare(`
+      SELECT COUNT(*) as count FROM orders
+      WHERE release_status = 'released' AND status = 'pending'
+    `)
+      .get() as { count: number };
 
-    const tablesOccupied = db.prepare(`
+    const tablesOccupied = db
+      .prepare(`
       SELECT COUNT(*) as count FROM tables WHERE status = 'occupied'
-    `).get() as { count: number };
+    `)
+      .get() as { count: number };
 
     // Avg Table Turn: how long dine-in tables took to turn over today, for
     // orders that finished today (mirrors /insights' avgPrepTimeMinutes idiom).
-    const tableTurn = db.prepare(`
+    const tableTurn = db
+      .prepare(`
       SELECT AVG((julianday(completed_at) - julianday(created_at)) * 24 * 60) as avgMinutes,
         COUNT(*) as sampleSize
       FROM orders
       WHERE type = 'dine_in' AND status = 'completed' AND completed_at IS NOT NULL
         AND completed_at >= ? AND completed_at < ?
-    `).get(start, end) as { avgMinutes: number | null; sampleSize: number };
+    `)
+      .get(start, end) as { avgMinutes: number | null; sampleSize: number };
 
     // Avg Current Occupancy: how long tables occupied right now have been seated.
-    const currentOccupancy = db.prepare(`
+    const currentOccupancy = db
+      .prepare(`
       SELECT AVG((julianday('now') - julianday(o.created_at)) * 24 * 60) as avgMinutes,
         COUNT(*) as sampleSize
       FROM tables t
       JOIN orders o ON o.table_id = t.id AND ${ACTIVE_ORDER_STATUS_SQL}
       WHERE t.status = 'occupied'
-    `).get() as { avgMinutes: number | null; sampleSize: number };
+    `)
+      .get() as { avgMinutes: number | null; sampleSize: number };
 
     res.json({
       sales: salesToday.sales,
       runningOrders: runningOrders.count,
       pendingOrders: pendingOrders.count,
       tablesOccupied: tablesOccupied.count,
-      avgTableTurnMinutes: tableTurn.sampleSize > 0 && tableTurn.avgMinutes !== null ? Math.round(tableTurn.avgMinutes) : null,
-      avgCurrentOccupancyMinutes: currentOccupancy.sampleSize > 0 && currentOccupancy.avgMinutes !== null ? Math.round(currentOccupancy.avgMinutes) : null,
+      avgTableTurnMinutes:
+        tableTurn.sampleSize > 0 && tableTurn.avgMinutes !== null
+          ? Math.round(tableTurn.avgMinutes)
+          : null,
+      avgCurrentOccupancyMinutes:
+        currentOccupancy.sampleSize > 0 && currentOccupancy.avgMinutes !== null
+          ? Math.round(currentOccupancy.avgMinutes)
+          : null,
       paymentMethods: paymentMethodsToday,
     });
   } catch (error: any) {
-    console.error("[API] Internal error:", error);
-    res.status(500).json({ error: "Internal server error" });
+    res.locals.postHogError = error;
+    console.error('[API] Internal error:', error);
+    res
+      .status(error.statusCode || 500)
+      .json({ error: error.statusCode ? error.message : 'Internal server error' });
   }
 });
 
-router.get('/summary', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res: Response) => {
+router.get('/summary', requirePermission('reports.view'), (req: Request, res: Response) => {
   try {
     const db = getDatabase();
     const minorFactor = getCurrencyMinorUnitFactor(getTenantCurrency(db));
@@ -147,69 +296,118 @@ router.get('/summary', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, 
     const date = reportDate(req.query.date, reportToday());
     const [start, end] = reportDayBounds(date);
 
-    const ordersToday = db.prepare(`
+    const ordersToday = db
+      .prepare(`
       SELECT COUNT(*) as count, COALESCE(SUM(total), 0) as total
-      FROM orders WHERE created_at >= ? AND created_at < ?
-    `).get(start, end) as { count: number; total: number };
+      FROM orders WHERE created_at >= ? AND created_at < ? AND status != 'cancelled'
+    `)
+      .get(start, end) as { count: number; total: number };
 
-    const billsToday = db.prepare(`
-      SELECT COUNT(*) as count, COALESCE(SUM(total), 0) as total,
-        COALESCE((SELECT SUM(paid_amount) FROM bills WHERE paid_at >= ? AND paid_at < ?), 0)
-        - COALESCE((SELECT SUM(CAST(amount_cents AS REAL)) / ? FROM refunds WHERE created_at >= ? AND created_at < ?), 0) as collected
-      FROM bills WHERE created_at >= ? AND created_at < ?
-    `).get(start, end, minorFactor, start, end, start, end) as { count: number; total: number; collected: number };
-    const paymentMethodsToday = paymentMethodBreakdown(db, date);
+    const billsToday = db
+      .prepare(`
+      SELECT COUNT(*) as count, COALESCE(SUM(b.total), 0) as total,
+        COALESCE((
+          SELECT SUM(b2.paid_amount)
+          FROM bills b2
+          JOIN orders o2 ON o2.id = b2.order_id
+          WHERE b2.paid_at >= ? AND b2.paid_at < ? AND o2.status != 'cancelled'
+        ), 0)
+        - COALESCE((
+          SELECT SUM(CAST(r.amount_cents AS REAL)) / ?
+          FROM refunds r
+          JOIN bills b3 ON b3.id = r.bill_id
+          JOIN orders o3 ON o3.id = b3.order_id
+          WHERE r.created_at >= ? AND r.created_at < ? AND o3.status != 'cancelled'
+        ), 0) as collected
+      FROM bills b
+      JOIN orders o ON o.id = b.order_id
+      WHERE b.created_at >= ? AND b.created_at < ? AND o.status != 'cancelled'
+    `)
+      .get(start, end, minorFactor, start, end, start, end) as {
+      count: number;
+      total: number;
+      collected: number;
+    };
+    const paymentMethodsToday = paymentMethodBreakdown(db, {
+      startDate: date,
+      excludeCancelledOrders: true,
+    });
 
-    const customersToday = db.prepare(`
+    const customersToday = db
+      .prepare(`
       SELECT COUNT(*) as count FROM customers WHERE created_at >= ? AND created_at < ?
-    `).get(start, end) as { count: number };
+    `)
+      .get(start, end) as { count: number };
 
-    const ordersByStatus = db.prepare(`
+    const ordersByStatus = db
+      .prepare(`
       SELECT status, COUNT(*) as count FROM orders WHERE created_at >= ? AND created_at < ? GROUP BY status
-    `).all(start, end);
+    `)
+      .all(start, end);
 
     res.json({
       summary: {
         date,
         orders: { count: ordersToday.count, total: ordersToday.total },
-        bills: { count: billsToday.count, total: billsToday.total, collected: billsToday.collected },
+        bills: {
+          count: billsToday.count,
+          total: billsToday.total,
+          collected: billsToday.collected,
+        },
         customers: { new: customersToday.count },
         ordersByStatus,
         paymentMethods: paymentMethodsToday,
-      }
+      },
     });
   } catch (error: any) {
-    console.error("[API] Internal error:", error);
-    res.status(500).json({ error: "Internal server error" });
+    res.locals.postHogError = error;
+    console.error('[API] Internal error:', error);
+    res
+      .status(error.statusCode || 500)
+      .json({ error: error.statusCode ? error.message : 'Internal server error' });
   }
 });
 
-router.get('/financial-summary', requireRole(...ROLE_ACCESS.owner), (req: Request, res: Response) => {
-  try {
-    const today = reportToday();
-    const startDate = reportDate(req.query.start_date, today);
-    const endDate = reportDate(req.query.end_date, startDate);
-    if ((req.query.start_date !== undefined && reportDate(req.query.start_date, '') === '')
-      || (req.query.end_date !== undefined && reportDate(req.query.end_date, '') === '')) {
-      return res.status(400).json({ error: 'start_date and end_date must use YYYY-MM-DD format' });
-    }
-    if (startDate > endDate) {
-      return res.status(400).json({ error: 'start_date must be on or before end_date' });
-    }
-    const [start] = reportDayBounds(startDate);
-    const [, end] = reportDayBounds(endDate);
-    const db = getDatabase();
-    const minorFactor = getCurrencyMinorUnitFactor(getTenantCurrency(db));
-    const collections = db.prepare(`
+router.get(
+  '/financial-summary',
+  requirePermission('reports.financial.view'),
+  (req: Request, res: Response) => {
+    try {
+      const today = reportToday();
+      const startDate = reportDate(req.query.start_date, today);
+      const endDate = reportDate(req.query.end_date, startDate);
+      if (
+        (req.query.start_date !== undefined && reportDate(req.query.start_date, '') === '') ||
+        (req.query.end_date !== undefined && reportDate(req.query.end_date, '') === '')
+      ) {
+        captureFinancialSummaryDateRangeRejection();
+        return res
+          .status(400)
+          .json({ error: 'start_date and end_date must use YYYY-MM-DD format' });
+      }
+      if (startDate > endDate) {
+        captureFinancialSummaryDateRangeRejection();
+        return res.status(400).json({ error: 'start_date must be on or before end_date' });
+      }
+      const [start] = reportDayBounds(startDate);
+      const [, end] = reportDayBounds(endDate);
+      const db = getDatabase();
+      const minorFactor = getCurrencyMinorUnitFactor(getTenantCurrency(db));
+      const collections = db
+        .prepare(`
       SELECT COUNT(*) AS bill_count, COALESCE(SUM(paid_amount), 0) AS gross_collected
       FROM bills WHERE paid_at >= ? AND paid_at < ?
-    `).get(start, end) as { bill_count: number; gross_collected: number };
-    const refundTotals = db.prepare(`
+    `)
+        .get(start, end) as { bill_count: number; gross_collected: number };
+      const refundTotals = db
+        .prepare(`
       SELECT COUNT(*) AS refund_count, COALESCE(SUM(CAST(r.amount_cents AS REAL)) / ?, 0) AS refunded
       FROM refunds r JOIN bills b ON b.id = r.bill_id
       WHERE b.paid_at >= ? AND b.paid_at < ?
-    `).get(minorFactor, start, end) as { refund_count: number; refunded: number };
-    const refunds = db.prepare(`
+    `)
+        .get(minorFactor, start, end) as { refund_count: number; refunded: number };
+      const refunds = db
+        .prepare(`
       SELECT r.id, CAST(r.amount_cents AS REAL) / ? AS amount, r.method, r.reason,
         r.created_at, b.bill_number, b.paid_at, o.order_number,
         COALESCE(approver.name, creator.name, 'Unknown') AS approved_by_name
@@ -221,53 +419,71 @@ router.get('/financial-summary', requireRole(...ROLE_ACCESS.owner), (req: Reques
       WHERE b.paid_at >= ? AND b.paid_at < ?
       ORDER BY r.created_at DESC, r.id DESC
       LIMIT 50
-    `).all(minorFactor, start, end);
-    const grossCollected = Number(collections.gross_collected || 0);
-    const refunded = Number(refundTotals.refunded || 0);
+    `)
+        .all(minorFactor, start, end);
+      const grossCollected = Number(collections.gross_collected || 0);
+      const refunded = Number(refundTotals.refunded || 0);
+      const fractionDigits = getCurrencyFractionDigits(getTenantCurrency(db));
+      const profitability = computeSettledProfitabilitySummary(db, start, end, fractionDigits);
 
-    res.json({
-      financialSummary: {
-        startDate,
-        endDate,
-        grossCollected,
-        refunded,
-        netCollected: grossCollected - refunded,
-        billCount: Number(collections.bill_count || 0),
-        refundCount: Number(refundTotals.refund_count || 0),
-        averageOrderValue: collections.bill_count ? (grossCollected - refunded) / collections.bill_count : 0,
-        paymentMethods: paymentMethodBreakdown(db, startDate, endDate, true, true),
-        refunds,
-      },
-    });
-  } catch (error: any) {
-    console.error('[API] Internal error:', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
+      res.json({
+        financialSummary: {
+          startDate,
+          endDate,
+          grossCollected,
+          refunded,
+          netCollected: grossCollected - refunded,
+          billCount: Number(collections.bill_count || 0),
+          refundCount: Number(refundTotals.refund_count || 0),
+          averageOrderValue: collections.bill_count
+            ? (grossCollected - refunded) / collections.bill_count
+            : 0,
+          paymentMethods: paymentMethodBreakdown(db, {
+            startDate,
+            endDate,
+            paidOnly: true,
+            attributeRefundsToBillDate: true,
+          }),
+          refunds,
+          profitability,
+        },
+      });
+    } catch (error: any) {
+      res.locals.postHogError = error;
+      console.error('[API] Internal error:', error);
+      res
+        .status(error.statusCode || 500)
+        .json({ error: error.statusCode ? error.message : 'Internal server error' });
+    }
+  },
+);
 
 // Dynamic tax-component report for receipt/report consumers. Components are
 // derived item by item so mixed legacy + categorized bills cannot double-count
 // the categorized portion already present in the bill-level tax_breakdown.
-router.get('/tax-components', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res: Response) => {
+router.get('/tax-components', requirePermission('reports.view'), (req: Request, res: Response) => {
   try {
     const db = getDatabase();
     const today = reportToday();
     const startDate = reportDate(req.query.start_date, today);
     const endDate = reportDate(req.query.end_date, today);
     if (startDate > endDate) {
+      captureReportsDateRangeRejection('reversed_range');
       return res.status(400).json({ error: 'start_date must be on or before end_date' });
     }
     const windowStart = reportDayBounds(startDate)[0];
     const windowEnd = reportDayBounds(endDate)[1];
 
-    const bills = db.prepare(`
+    const bills = db
+      .prepare(`
       SELECT b.*
       FROM bills b
       JOIN orders o ON o.id = b.order_id
       WHERE b.created_at >= ? AND b.created_at < ?
         AND o.status != 'cancelled'
       ORDER BY b.created_at, b.id
-    `).all(windowStart, windowEnd) as any[];
+    `)
+      .all(windowStart, windowEnd) as any[];
 
     const orders = getOrdersWithItemsForBills(db, bills);
     const documents = bills.map((bill) => ({
@@ -276,10 +492,7 @@ router.get('/tax-components', requireRole(...ROLE_ACCESS.ownerManager), (req: Re
       tax_breakdown: bill.tax_breakdown,
       items: orders.get(Number(bill.id))?.items || [],
     }));
-    const taxAmount = bills.reduce(
-      (sum, bill) => sum.plus(bill.tax_amount || 0),
-      new Decimal(0),
-    );
+    const taxAmount = bills.reduce((sum, bill) => sum.plus(bill.tax_amount || 0), new Decimal(0));
 
     res.json({
       taxComponents: {
@@ -291,18 +504,78 @@ router.get('/tax-components', requireRole(...ROLE_ACCESS.ownerManager), (req: Re
       },
     });
   } catch (error: any) {
+    res.locals.postHogError = error;
     console.error('[API] Tax component report failed:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    res
+      .status(error.statusCode || 500)
+      .json({ error: error.statusCode ? error.message : 'Internal server error' });
   }
 });
 
-router.get('/sales', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res: Response) => {
+router.get(
+  '/price-exceptions',
+  requirePermission('reports.view'),
+  (req: Request, res: Response) => {
+    try {
+      const db = getDatabase();
+      const today = reportToday();
+      const startDate = reportDate(req.query.start_date, today);
+      const endDate = reportDate(req.query.end_date, today);
+      if (startDate > endDate) {
+        captureReportsDateRangeRejection('reversed_range');
+        return res.status(400).json({ error: 'start_date must be on or before end_date' });
+      }
+      const rangeStart = reportDayBounds(startDate)[0];
+      const rangeEnd = reportDayBounds(endDate)[1];
+      const shifts = listShiftsOverlapping(db, rangeStart, rangeEnd);
+      let fromIso = rangeStart;
+      let toIso = rangeEnd;
+      let shiftId: number | null = null;
+      if (req.query.shift_id !== undefined && req.query.shift_id !== '') {
+        const requested = Number(req.query.shift_id);
+        const shift = Number.isInteger(requested) ? getShiftWindow(db, requested) : undefined;
+        if (!shift) return res.status(404).json({ error: 'Shift not found' });
+        shiftId = shift.id;
+        fromIso = shift.opened_at;
+        toIso = shift.closed_at ?? '9999-12-31 23:59:59';
+      }
+      const rows = listPriceExceptions(db, fromIso, toIso);
+      const complimentary = rows.filter((row) => row.billed_unit_price === 0).length;
+      const totalDifference = rows.reduce(
+        (sum, row) => sum.plus(row.difference * row.quantity),
+        new Decimal(0),
+      );
+      res.json({
+        priceExceptions: {
+          startDate,
+          endDate,
+          shiftId,
+          shifts,
+          count: rows.length,
+          complimentaryCount: complimentary,
+          totalDifference: totalDifference.toDecimalPlaces(6).toNumber(),
+          rows,
+        },
+      });
+    } catch (error: unknown) {
+      res.locals.postHogError = error;
+      console.error('[API] Price exceptions report failed:', error);
+      const failure = error as { statusCode?: number; message?: string };
+      res
+        .status(failure.statusCode || 500)
+        .json({ error: failure.statusCode ? failure.message : 'Internal server error' });
+    }
+  },
+);
+
+router.get('/sales', requirePermission('reports.view'), (req: Request, res: Response) => {
   try {
     const db = getDatabase();
     const today = reportToday();
     const startDate = reportDate(req.query.start_date, today);
     const endDate = reportDate(req.query.end_date, today);
     if (startDate > endDate) {
+      captureReportsDateRangeRejection('reversed_range');
       return res.status(400).json({ error: 'start_date must be on or before end_date' });
     }
     // #208: half-open UTC ranges so the orders/bills indexes apply instead
@@ -312,11 +585,13 @@ router.get('/sales', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, re
 
     // Daily series is grouped by the tenant business date rather than
     // the UTC date stored in SQLite.
-    const dailyRows = db.prepare(`
+    const dailyRows = db
+      .prepare(`
       SELECT created_at, total
       FROM orders
-      WHERE created_at >= ? AND created_at < ?
-    `).all(windowStart, windowEnd) as { created_at: string; total: number }[];
+      WHERE created_at >= ? AND created_at < ? AND status != 'cancelled'
+    `)
+      .all(windowStart, windowEnd) as { created_at: string; total: number }[];
     const dailyByDate = new Map<string, { orders: number; sales: number }>();
     const timeZone = tenantTimezone();
     const startTime = tenantStartTime();
@@ -331,14 +606,25 @@ router.get('/sales', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, re
       .sort(([left], [right]) => left.localeCompare(right))
       .map(([date, totals]) => ({ date, ...totals }));
 
-    const byPaymentMethod = paymentMethodBreakdown(db, startDate, endDate, true) as { method: string; count: number; total: number }[];
+    const byPaymentMethod = paymentMethodBreakdown(db, {
+      startDate,
+      endDate,
+      paidOnly: true,
+      excludeCancelledOrders: true,
+    }) as {
+      method: string;
+      count: number;
+      total: number;
+    }[];
 
-    const byOrderType = db.prepare(`
+    const byOrderType = db
+      .prepare(`
       SELECT type, COUNT(*) as count, SUM(total) as total
       FROM orders
-      WHERE created_at >= ? AND created_at < ?
+      WHERE created_at >= ? AND created_at < ? AND status != 'cancelled'
       GROUP BY type
-    `).all(windowStart, windowEnd);
+    `)
+      .all(windowStart, windowEnd);
 
     res.json({
       sales: {
@@ -347,66 +633,289 @@ router.get('/sales', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, re
         dailySales,
         byPaymentMethod,
         byOrderType,
-      }
+      },
     });
   } catch (error: any) {
-    console.error("[API] Internal error:", error);
-    res.status(500).json({ error: "Internal server error" });
+    res.locals.postHogError = error;
+    console.error('[API] Internal error:', error);
+    res
+      .status(error.statusCode || 500)
+      .json({ error: error.statusCode ? error.message : 'Internal server error' });
   }
 });
 
-router.get('/topProducts', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res: Response) => {
+type RawProfitabilityAggregate = {
+  total_quantity: number;
+  ex_tax_revenue: number;
+  known_cost_quantity: number;
+  unknown_cost_quantity: number;
+  known_cost_revenue: number;
+  known_ingredient_cost: number;
+};
+
+function deriveProfitabilityMetrics(
+  row: RawProfitabilityAggregate,
+  fractionDigits: number,
+): {
+  net_revenue: number;
+  known_cost_revenue: number;
+  known_cost_quantity: number;
+  unknown_cost_quantity: number;
+  cost_status: DailySalesCostStatus;
+  ingredient_cost: number | null;
+  profit: number | null;
+  margin_percent: number | null;
+} {
+  const knownQty = Number(row.known_cost_quantity || 0);
+  const unknownQty = Number(row.unknown_cost_quantity || 0);
+  const costStatus: DailySalesCostStatus =
+    knownQty > 0 ? (unknownQty === 0 ? 'known' : 'partial') : 'unknown';
+  const netRevenue = roundCurrencyCost(Number(row.ex_tax_revenue || 0), fractionDigits);
+  const knownCostRevenue = roundCurrencyCost(Number(row.known_cost_revenue || 0), fractionDigits);
+  if (knownQty <= 0) {
+    return {
+      net_revenue: netRevenue,
+      known_cost_revenue: 0,
+      known_cost_quantity: 0,
+      unknown_cost_quantity: unknownQty,
+      cost_status: costStatus,
+      ingredient_cost: null,
+      profit: null,
+      margin_percent: null,
+    };
+  }
+  const ingredientCost = roundCurrencyCost(Number(row.known_ingredient_cost || 0), fractionDigits);
+  const profit = roundCurrencyCost(
+    new Decimal(knownCostRevenue).minus(ingredientCost),
+    fractionDigits,
+  );
+  const marginPercent =
+    knownCostRevenue > 0
+      ? new Decimal(profit)
+          .div(knownCostRevenue)
+          .mul(100)
+          .toDecimalPlaces(2, Decimal.ROUND_HALF_UP)
+          .toNumber()
+      : null;
+  return {
+    net_revenue: netRevenue,
+    known_cost_revenue: knownCostRevenue,
+    known_cost_quantity: knownQty,
+    unknown_cost_quantity: unknownQty,
+    cost_status: costStatus,
+    ingredient_cost: ingredientCost,
+    profit,
+    margin_percent: marginPercent,
+  };
+}
+
+function computePeriodProfitabilitySummary(
+  db: ReturnType<typeof getDatabase>,
+  windowStart: string,
+  windowEnd: string,
+  fractionDigits: number,
+) {
+  const row = db
+    .prepare(
+      `
+      SELECT
+        COALESCE(SUM(oi.quantity), 0) as total_quantity,
+        COALESCE(SUM(oi.subtotal - CASE WHEN oi.tax_type = 'inclusive' THEN COALESCE(oi.tax_amount, 0) ELSE 0 END), 0) as ex_tax_revenue,
+        COALESCE(SUM(CASE WHEN oi.ingredient_cost_known = 1 AND oi.ingredient_cost IS NOT NULL THEN oi.quantity ELSE 0 END), 0) as known_cost_quantity,
+        COALESCE(SUM(CASE WHEN oi.ingredient_cost_known = 1 AND oi.ingredient_cost IS NOT NULL THEN 0 ELSE oi.quantity END), 0) as unknown_cost_quantity,
+        COALESCE(SUM(CASE WHEN oi.ingredient_cost_known = 1 AND oi.ingredient_cost IS NOT NULL
+                          THEN (oi.subtotal - CASE WHEN oi.tax_type = 'inclusive' THEN COALESCE(oi.tax_amount, 0) ELSE 0 END)
+                          ELSE 0 END), 0) as known_cost_revenue,
+        COALESCE(SUM(CASE WHEN oi.ingredient_cost_known = 1 AND oi.ingredient_cost IS NOT NULL THEN oi.ingredient_cost ELSE 0 END), 0) as known_ingredient_cost
+      FROM order_items oi
+      JOIN orders o ON oi.order_id = o.id
+      WHERE o.created_at >= ? AND o.created_at < ?
+        AND o.status != 'cancelled'
+        AND COALESCE(oi.status, 'active') NOT IN ('cancelled', 'voided', 'void_adjustment', 'refunded')
+    `,
+    )
+    .get(windowStart, windowEnd) as RawProfitabilityAggregate;
+
+  return {
+    total_quantity: Number(row.total_quantity || 0),
+    ...deriveProfitabilityMetrics(row, fractionDigits),
+  };
+}
+
+function computeSettledProfitabilitySummary(
+  db: ReturnType<typeof getDatabase>,
+  windowStart: string,
+  windowEnd: string,
+  fractionDigits: number,
+) {
+  const row = db
+    .prepare(
+      `
+      SELECT
+        COALESCE(SUM(CASE WHEN b.split_group_id IS NULL OR b.split_group_id = ''
+                          THEN oi.quantity ELSE bi.quantity END), 0) as total_quantity,
+        COALESCE(SUM(CASE WHEN b.split_group_id IS NULL OR b.split_group_id = ''
+                          THEN (oi.subtotal - CASE WHEN oi.tax_type = 'inclusive' THEN COALESCE(oi.tax_amount, 0) ELSE 0 END)
+                          ELSE (oi.subtotal - CASE WHEN oi.tax_type = 'inclusive' THEN COALESCE(oi.tax_amount, 0) ELSE 0 END) * bi.quantity / NULLIF(oi.quantity, 0)
+                     END), 0) as ex_tax_revenue,
+        COALESCE(SUM(CASE WHEN oi.ingredient_cost_known = 1 AND oi.ingredient_cost IS NOT NULL
+                          THEN (CASE WHEN b.split_group_id IS NULL OR b.split_group_id = '' THEN oi.quantity ELSE bi.quantity END)
+                          ELSE 0
+                     END), 0) as known_cost_quantity,
+        COALESCE(SUM(CASE WHEN oi.ingredient_cost_known = 1 AND oi.ingredient_cost IS NOT NULL
+                          THEN 0
+                          ELSE (CASE WHEN b.split_group_id IS NULL OR b.split_group_id = '' THEN oi.quantity ELSE bi.quantity END)
+                     END), 0) as unknown_cost_quantity,
+        COALESCE(SUM(CASE WHEN oi.ingredient_cost_known = 1 AND oi.ingredient_cost IS NOT NULL
+                          THEN (CASE WHEN b.split_group_id IS NULL OR b.split_group_id = ''
+                                     THEN (oi.subtotal - CASE WHEN oi.tax_type = 'inclusive' THEN COALESCE(oi.tax_amount, 0) ELSE 0 END)
+                                     ELSE (oi.subtotal - CASE WHEN oi.tax_type = 'inclusive' THEN COALESCE(oi.tax_amount, 0) ELSE 0 END) * bi.quantity / NULLIF(oi.quantity, 0)
+                                END)
+                          ELSE 0
+                     END), 0) as known_cost_revenue,
+        COALESCE(SUM(CASE WHEN oi.ingredient_cost_known = 1 AND oi.ingredient_cost IS NOT NULL
+                          THEN (CASE WHEN b.split_group_id IS NULL OR b.split_group_id = ''
+                                     THEN oi.ingredient_cost
+                                     ELSE oi.ingredient_cost * bi.quantity / NULLIF(oi.quantity, 0)
+                                END)
+                          ELSE 0
+                     END), 0) as known_ingredient_cost
+      FROM bills b
+      JOIN orders o ON o.id = b.order_id
+      JOIN order_items oi ON oi.order_id = o.id
+      LEFT JOIN bill_items bi ON bi.bill_id = b.id AND bi.order_item_id = oi.id
+      WHERE b.paid_at >= ? AND b.paid_at < ?
+        AND (oi.status IS NULL OR oi.status NOT IN ('cancelled', 'voided', 'void_adjustment'))
+        AND (b.split_group_id IS NULL OR b.split_group_id = '' OR bi.bill_id IS NOT NULL)
+    `,
+    )
+    .get(windowStart, windowEnd) as RawProfitabilityAggregate;
+
+  return {
+    total_quantity: Number(row.total_quantity || 0),
+    ...deriveProfitabilityMetrics(row, fractionDigits),
+  };
+}
+
+router.get('/topProducts', requirePermission('reports.view'), (req: Request, res: Response) => {
   try {
     const db = getDatabase();
     const today = reportToday();
     const startDate = reportDate(req.query.start_date, today);
     const endDate = reportDate(req.query.end_date, today);
     if (startDate > endDate) {
+      captureReportsDateRangeRejection('reversed_range');
       return res.status(400).json({ error: 'start_date must be on or before end_date' });
     }
     const requestedLimit = Number(req.query.limit);
-    const limit = Number.isInteger(requestedLimit) ? Math.min(Math.max(requestedLimit, 1), 100) : 10;
+    const limit = Number.isInteger(requestedLimit)
+      ? Math.min(Math.max(requestedLimit, 1), 100)
+      : 10;
     const windowStart = reportDayBounds(startDate)[0];
     const windowEnd = reportDayBounds(endDate)[1];
+    const userId = String((req as Request & { user?: { userId?: string } }).user?.userId || '');
+    const canViewFinancials = userId ? hasPermission(userId, 'reports.financial.view') : false;
+    const fractionDigits = getCurrencyFractionDigits(getTenantCurrency(db));
 
-    const topProducts = db.prepare(`
+    type RawTopProductRow = RawProfitabilityAggregate & {
+      product_id: string;
+      product_name: string;
+      total_revenue: number;
+      order_count: number;
+    };
+
+    const rawTopProducts = db
+      .prepare(
+        `
+      WITH win AS MATERIALIZED (
+        SELECT o.id FROM orders o
+        WHERE o.created_at >= ? AND o.created_at < ? AND o.status != 'cancelled'
+      )
       SELECT oi.product_id, oi.product_name,
         SUM(oi.quantity) as total_quantity,
         SUM(oi.subtotal) as total_revenue,
-        COUNT(DISTINCT oi.order_id) as order_count
-      FROM order_items oi
-      JOIN orders o ON oi.order_id = o.id
-      WHERE o.created_at >= ? AND o.created_at < ?
+        COUNT(DISTINCT oi.order_id) as order_count,
+        SUM(oi.subtotal - CASE WHEN oi.tax_type = 'inclusive' THEN COALESCE(oi.tax_amount, 0) ELSE 0 END) as ex_tax_revenue,
+        SUM(CASE WHEN oi.ingredient_cost_known = 1 AND oi.ingredient_cost IS NOT NULL THEN oi.quantity ELSE 0 END) as known_cost_quantity,
+        SUM(CASE WHEN oi.ingredient_cost_known = 1 AND oi.ingredient_cost IS NOT NULL THEN 0 ELSE oi.quantity END) as unknown_cost_quantity,
+        SUM(CASE WHEN oi.ingredient_cost_known = 1 AND oi.ingredient_cost IS NOT NULL
+                 THEN (oi.subtotal - CASE WHEN oi.tax_type = 'inclusive' THEN COALESCE(oi.tax_amount, 0) ELSE 0 END)
+                 ELSE 0 END) as known_cost_revenue,
+        SUM(CASE WHEN oi.ingredient_cost_known = 1 AND oi.ingredient_cost IS NOT NULL THEN oi.ingredient_cost ELSE 0 END) as known_ingredient_cost
+      FROM win
+      JOIN order_items oi ON oi.order_id = win.id
+      WHERE COALESCE(oi.status, 'active') NOT IN ('cancelled', 'voided', 'void_adjustment', 'refunded')
       GROUP BY oi.product_id
       ORDER BY total_quantity DESC
       LIMIT ?
-    `).all(windowStart, windowEnd, limit);
+    `,
+      )
+      .all(windowStart, windowEnd, limit) as RawTopProductRow[];
+
+    const topProducts = rawTopProducts.map((row) => {
+      const base = {
+        product_id: row.product_id,
+        product_name: row.product_name,
+        total_quantity: Number(row.total_quantity || 0),
+        total_revenue: Number(row.total_revenue || 0),
+        order_count: Number(row.order_count || 0),
+      };
+      if (!canViewFinancials) return base;
+      return {
+        ...base,
+        ...deriveProfitabilityMetrics(row, fractionDigits),
+      };
+    });
+
+    if (canViewFinancials) {
+      const profitability = computePeriodProfitabilitySummary(
+        db,
+        windowStart,
+        windowEnd,
+        fractionDigits,
+      );
+      return res.json({ topProducts, profitability });
+    }
 
     res.json({ topProducts });
   } catch (error: any) {
-    console.error("[API] Internal error:", error);
-    res.status(500).json({ error: "Internal server error" });
+    res.locals.postHogError = error;
+    console.error('[API] Internal error:', error);
+    res
+      .status(error.statusCode || 500)
+      .json({ error: error.statusCode ? error.message : 'Internal server error' });
   }
 });
 
-router.get('/recentOrders', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res: Response) => {
+router.get('/recentOrders', requirePermission('reports.view'), (req: Request, res: Response) => {
   try {
     const db = getDatabase();
     const requestedLimit = Number(req.query.limit);
-    const limit = Number.isInteger(requestedLimit) ? Math.min(Math.max(requestedLimit, 1), 100) : 20;
+    const limit = Number.isInteger(requestedLimit)
+      ? Math.min(Math.max(requestedLimit, 1), 100)
+      : 20;
     const date = req.query.date === undefined ? undefined : reportDate(req.query.date, '');
-    const startDate = req.query.start_date === undefined ? undefined : reportDate(req.query.start_date, '');
-    const endDate = req.query.end_date === undefined ? undefined : reportDate(req.query.end_date, '');
+    const startDate =
+      req.query.start_date === undefined ? undefined : reportDate(req.query.start_date, '');
+    const endDate =
+      req.query.end_date === undefined ? undefined : reportDate(req.query.end_date, '');
     if (req.query.date !== undefined && !date) {
+      captureReportsDateRangeRejection('invalid_format');
       return res.status(400).json({ error: 'date must use YYYY-MM-DD format' });
     }
-    if ((req.query.start_date !== undefined && !startDate) || (req.query.end_date !== undefined && !endDate)) {
+    if (
+      (req.query.start_date !== undefined && !startDate) ||
+      (req.query.end_date !== undefined && !endDate)
+    ) {
+      captureReportsDateRangeRejection('invalid_format');
       return res.status(400).json({ error: 'start_date and end_date must use YYYY-MM-DD format' });
     }
     if (date && (startDate || endDate)) {
+      captureReportsDateRangeRejection('date_and_range_conflict');
       return res.status(400).json({ error: 'date cannot be combined with start_date or end_date' });
     }
     if (startDate && endDate && startDate > endDate) {
+      captureReportsDateRangeRejection('reversed_range');
       return res.status(400).json({ error: 'start_date must be on or before end_date' });
     }
 
@@ -429,7 +938,8 @@ router.get('/recentOrders', requireRole(...ROLE_ACCESS.ownerManager), (req: Requ
       params.push(s, e);
     }
 
-    const recentOrders = db.prepare(`
+    const recentOrders = db
+      .prepare(`
       SELECT o.*, t.number as table_name, c.name as customer_name
       FROM orders o
       LEFT JOIN tables t ON o.table_id = t.id
@@ -437,14 +947,19 @@ router.get('/recentOrders', requireRole(...ROLE_ACCESS.ownerManager), (req: Requ
       ${where}
       ORDER BY o.created_at DESC
       LIMIT ?
-    `).all(...params, limit);
+    `)
+      .all(...params, limit);
 
     // #208: batch all items in one IN() query instead of per-order N+1.
     const orderIds = recentOrders.map((o: any) => o.id);
     const itemsByOrder = new Map<number, any[]>();
     if (orderIds.length > 0) {
       const placeholders = orderIds.map(() => '?').join(',');
-      const items = db.prepare(`SELECT * FROM order_items WHERE order_id IN (${placeholders}) ORDER BY order_id, id`).all(...orderIds);
+      const items = db
+        .prepare(
+          `SELECT * FROM order_items WHERE order_id IN (${placeholders}) ORDER BY order_id, id`,
+        )
+        .all(...orderIds);
       for (const item of items as any[]) {
         const list = itemsByOrder.get(item.order_id) || [];
         list.push(item);
@@ -458,17 +973,21 @@ router.get('/recentOrders', requireRole(...ROLE_ACCESS.ownerManager), (req: Requ
 
     res.json({ recentOrders: ordersWithItems });
   } catch (error: any) {
-    console.error("[API] Internal error:", error);
-    res.status(500).json({ error: "Internal server error" });
+    res.locals.postHogError = error;
+    console.error('[API] Internal error:', error);
+    res
+      .status(error.statusCode || 500)
+      .json({ error: error.statusCode ? error.message : 'Internal server error' });
   }
 });
 
-router.get('/tables', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res: Response) => {
+router.get('/tables', requirePermission('reports.view'), (req: Request, res: Response) => {
   try {
     const db = getDatabase();
     const [start, end] = reportDayBounds(reportToday());
 
-    const tableStats = db.prepare(`
+    const tableStats = db
+      .prepare(`
       SELECT t.*,
         COUNT(DISTINCT o.id) as total_orders,
         COALESCE(SUM(o.total), 0) as total_revenue,
@@ -476,10 +995,13 @@ router.get('/tables', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, r
       FROM tables t
       LEFT JOIN orders o ON t.id = o.table_id
         AND o.created_at >= ? AND o.created_at < ?
+        AND o.status != 'cancelled'
       GROUP BY t.id
-    `).all(start, end);
+    `)
+      .all(start, end);
 
-    const tableUtilization = db.prepare(`
+    const tableUtilization = db
+      .prepare(`
       SELECT
         SUM(CASE WHEN status = 'occupied' THEN 1 ELSE 0 END) as occupied,
         SUM(CASE WHEN status = 'available' THEN 1 ELSE 0 END) as available,
@@ -487,94 +1009,213 @@ router.get('/tables', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, r
         SUM(CASE WHEN status = 'cleaning' THEN 1 ELSE 0 END) as cleaning,
         COUNT(*) as total
       FROM tables
-    `).get();
+    `)
+      .get();
 
     res.json({
       tableStats,
-      tableUtilization
+      tableUtilization,
     });
   } catch (error: any) {
-    console.error("[API] Internal error:", error);
-    res.status(500).json({ error: "Internal server error" });
+    res.locals.postHogError = error;
+    console.error('[API] Internal error:', error);
+    res
+      .status(error.statusCode || 500)
+      .json({ error: error.statusCode ? error.message : 'Internal server error' });
   }
 });
 
-// ── GET /insights — dashboard metrics beyond today's snapshot ──────────────
+// ── GET /insights - dashboard metrics beyond today's snapshot ──────────────
 // AOV, top staff, top categories, busiest/idlest hour & day-of-week, and
-// average kitchen prep time, aggregated over a trailing window (default 30
-// days) so hour/day patterns reflect a consistent trend rather than one day.
-router.get('/insights', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res: Response) => {
+// average kitchen prep time, aggregated over an explicit `[start_date, end_date]`
+// business-date range (up to 365 days) or a trailing `days` window (default 30).
+router.get('/insights', requirePermission('reports.view'), (req: Request, res: Response) => {
   try {
     const db = getDatabase();
     const minorFactor = getCurrencyMinorUnitFactor(getTenantCurrency(db));
-    const days = Math.min(Math.max(parseInt(req.query.days as string) || 30, 1), 365);
-    // #208: "N days back" in the tenant's local calendar, with a UTC range
-    // so the window filters on the index. The same timezone drives the
-    // hour/day-of-week bucketing below.
+    const startDateParam =
+      req.query.start_date === undefined ? undefined : reportDate(req.query.start_date, '');
+    const endDateParam =
+      req.query.end_date === undefined ? undefined : reportDate(req.query.end_date, '');
+    if (
+      (req.query.start_date !== undefined && !startDateParam) ||
+      (req.query.end_date !== undefined && !endDateParam)
+    ) {
+      captureReportsDateRangeRejection('invalid_format');
+      return res.status(400).json({ error: 'start_date and end_date must use YYYY-MM-DD format' });
+    }
     const timeZone = tenantTimezone();
-    const today = reportToday();
-    const startDateValue = new Date(`${today}T00:00:00Z`);
-    startDateValue.setUTCDate(startDateValue.getUTCDate() - days);
-    const startDate = startDateValue.toISOString().slice(0, 10);
-    const [windowStart] = reportDayBounds(startDate);
+    let windowStart: string;
+    let windowEnd: string | null = null;
+    let days: number;
+    if (startDateParam || endDateParam) {
+      const effectiveStart = startDateParam || endDateParam!;
+      const effectiveEnd = endDateParam || startDateParam!;
+      if (effectiveStart > effectiveEnd) {
+        captureReportsDateRangeRejection('reversed_range');
+        return res.status(400).json({ error: 'start_date must be on or before end_date' });
+      }
+      windowStart = reportDayBounds(effectiveStart)[0];
+      windowEnd = reportDayBounds(effectiveEnd)[1];
+      days = Math.max(
+        1,
+        Math.round(
+          (new Date(`${effectiveEnd}T00:00:00Z`).getTime() -
+            new Date(`${effectiveStart}T00:00:00Z`).getTime()) /
+            86_400_000,
+        ) + 1,
+      );
+      if (days > 365) {
+        captureReportsDateRangeRejection('invalid_format');
+        return res
+          .status(400)
+          .json({ error: 'start_date and end_date range must not exceed 365 days' });
+      }
+    } else {
+      days = Math.min(Math.max(parseInt(req.query.days as string) || 30, 1), 365);
+      // #208: "N days back" in the tenant's local calendar, with a UTC range
+      // so the window filters on the index. The same timezone drives the
+      // hour/day-of-week bucketing below.
+      const today = reportToday();
+      const startDateValue = new Date(`${today}T00:00:00Z`);
+      startDateValue.setUTCDate(startDateValue.getUTCDate() - days);
+      const startDate = startDateValue.toISOString().slice(0, 10);
+      [windowStart] = reportDayBounds(startDate);
+    }
 
     // AOV — same revenue basis ("paid bills") as the existing daily-stats tile.
-    const revenue = db.prepare(`
-      SELECT COUNT(*) as billCount,
-        COALESCE(SUM(paid_amount), 0)
-        - COALESCE((SELECT SUM(CAST(amount_cents AS REAL)) / ? FROM refunds WHERE created_at >= ?), 0) as total
-      FROM bills
-      WHERE paid_at >= ?
-    `).get(minorFactor, windowStart, windowStart) as { billCount: number; total: number };
+    const revenue = (
+      windowEnd
+        ? db
+            .prepare(`
+          SELECT COUNT(*) as billCount,
+            COALESCE(SUM(paid_amount), 0)
+            - COALESCE((SELECT SUM(CAST(amount_cents AS REAL)) / ? FROM refunds WHERE created_at >= ? AND created_at < ?), 0) as total
+          FROM bills
+          WHERE paid_at >= ? AND paid_at < ?
+        `)
+            .get(minorFactor, windowStart, windowEnd, windowStart, windowEnd)
+        : db
+            .prepare(`
+          SELECT COUNT(*) as billCount,
+            COALESCE(SUM(paid_amount), 0)
+            - COALESCE((SELECT SUM(CAST(amount_cents AS REAL)) / ? FROM refunds WHERE created_at >= ?), 0) as total
+          FROM bills
+          WHERE paid_at >= ?
+        `)
+            .get(minorFactor, windowStart, windowStart)
+    ) as { billCount: number; total: number };
     const aov = revenue.billCount > 0 ? revenue.total / revenue.billCount : 0;
 
     // Kitchen velocity — substitutes for "best cook", which isn't derivable:
     // order_items has no per-chef attribution (marking an item ready doesn't
     // record who did it), so there's no data to rank individual cooks by.
     // Average prep time is the closest real signal for kitchen performance.
-    const prepTime = db.prepare(`
-      SELECT AVG((julianday(ready_at) - julianday(cooking_started_at)) * 24 * 60) as avgMinutes,
-        COUNT(*) as sampleSize
-      FROM orders
-      WHERE cooking_started_at IS NOT NULL AND ready_at IS NOT NULL
-        AND created_at >= ? AND status != 'cancelled'
-    `).get(windowStart) as { avgMinutes: number | null; sampleSize: number };
+    const prepTime = (
+      windowEnd
+        ? db
+            .prepare(`
+          SELECT AVG((julianday(ready_at) - julianday(cooking_started_at)) * 24 * 60) as avgMinutes,
+            COUNT(*) as sampleSize
+          FROM orders
+          WHERE cooking_started_at IS NOT NULL AND ready_at IS NOT NULL
+            AND created_at >= ? AND created_at < ? AND status != 'cancelled'
+        `)
+            .get(windowStart, windowEnd)
+        : db
+            .prepare(`
+          SELECT AVG((julianday(ready_at) - julianday(cooking_started_at)) * 24 * 60) as avgMinutes,
+            COUNT(*) as sampleSize
+          FROM orders
+          WHERE cooking_started_at IS NOT NULL AND ready_at IS NOT NULL
+            AND created_at >= ? AND status != 'cancelled'
+        `)
+            .get(windowStart)
+    ) as { avgMinutes: number | null; sampleSize: number };
 
     // Top staff by revenue — covers whoever creates orders (owner/manager/
     // cashier/server, per POST /orders' own role gate), i.e. "best cashier".
-    const topStaff = db.prepare(`
-      SELECT u.id as user_id, u.name, u.role,
-        COALESCE(SUM(o.total), 0) as revenue,
-        COUNT(o.id) as orderCount
-      FROM orders o
-      JOIN users u ON u.id = o.user_id
-      WHERE o.created_at >= ? AND o.status != 'cancelled'
-      GROUP BY u.id
-      ORDER BY revenue DESC
-      LIMIT 5
-    `).all(windowStart);
+    const topStaff = windowEnd
+      ? db
+          .prepare(`
+        SELECT u.id as user_id, u.name, u.role,
+          COALESCE(SUM(o.total), 0) as revenue,
+          COUNT(o.id) as orderCount
+        FROM orders o
+        JOIN users u ON u.id = o.user_id
+        WHERE o.created_at >= ? AND o.created_at < ? AND o.status != 'cancelled'
+        GROUP BY u.id
+        ORDER BY revenue DESC
+        LIMIT 5
+      `)
+          .all(windowStart, windowEnd)
+      : db
+          .prepare(`
+        SELECT u.id as user_id, u.name, u.role,
+          COALESCE(SUM(o.total), 0) as revenue,
+          COUNT(o.id) as orderCount
+        FROM orders o
+        JOIN users u ON u.id = o.user_id
+        WHERE o.created_at >= ? AND o.status != 'cancelled'
+        GROUP BY u.id
+        ORDER BY revenue DESC
+        LIMIT 5
+      `)
+          .all(windowStart);
 
     // Top categories by revenue.
-    const topCategories = db.prepare(`
-      SELECT c.id as category_id, COALESCE(c.name, 'Uncategorized') as name,
-        COALESCE(SUM(oi.quantity), 0) as quantity,
-        COALESCE(SUM(oi.subtotal), 0) as revenue
-      FROM order_items oi
-      JOIN orders o ON o.id = oi.order_id
-      JOIN products p ON p.id = oi.product_id
-      LEFT JOIN categories c ON c.id = p.category_id
-      WHERE o.created_at >= ? AND oi.status != 'cancelled'
-      GROUP BY c.id
-      ORDER BY revenue DESC
-      LIMIT 5
-    `).all(windowStart);
+    const topCategories = windowEnd
+      ? db
+          .prepare(`
+        SELECT c.id as category_id, COALESCE(c.name, 'Uncategorized') as name,
+          COALESCE(SUM(oi.quantity), 0) as quantity,
+          COALESCE(SUM(oi.subtotal), 0) as revenue
+        FROM order_items oi
+        JOIN orders o ON o.id = oi.order_id
+        JOIN products p ON p.id = oi.product_id
+        LEFT JOIN categories c ON c.id = p.category_id
+        WHERE o.created_at >= ? AND o.created_at < ? AND oi.status != 'cancelled'
+        GROUP BY c.id
+        ORDER BY revenue DESC
+        LIMIT 5
+      `)
+          .all(windowStart, windowEnd)
+      : db
+          .prepare(`
+        SELECT c.id as category_id, COALESCE(c.name, 'Uncategorized') as name,
+          COALESCE(SUM(oi.quantity), 0) as quantity,
+          COALESCE(SUM(oi.subtotal), 0) as revenue
+        FROM order_items oi
+        JOIN orders o ON o.id = oi.order_id
+        JOIN products p ON p.id = oi.product_id
+        LEFT JOIN categories c ON c.id = p.category_id
+        WHERE o.created_at >= ? AND oi.status != 'cancelled'
+        GROUP BY c.id
+        ORDER BY revenue DESC
+        LIMIT 5
+      `)
+          .all(windowStart);
 
     // Busiest/idlest hour & day-of-week, bucketed in the tenant's local timezone.
-    const orderTimestamps = (db.prepare(
-      `SELECT created_at FROM orders WHERE created_at >= ? AND status != 'cancelled'`
-    ).all(windowStart) as { created_at: string }[]).map((r) => r.created_at);
+    const orderTimestamps = (
+      (windowEnd
+        ? db
+            .prepare(
+              `SELECT created_at FROM orders WHERE created_at >= ? AND created_at < ? AND status != 'cancelled'`,
+            )
+            .all(windowStart, windowEnd)
+        : db
+            .prepare(
+              `SELECT created_at FROM orders WHERE created_at >= ? AND status != 'cancelled'`,
+            )
+            .all(windowStart)) as { created_at: string }[]
+    ).map((r) => r.created_at);
 
-    const { hourCounts, dayCounts } = bucketByLocalHourAndWeekday(orderTimestamps, timeZone, tenantStartTime());
+    const { hourCounts, dayCounts } = bucketByLocalHourAndWeekday(
+      orderTimestamps,
+      timeZone,
+      tenantStartTime(),
+    );
 
     // Hours with zero orders are excluded from busiest/idlest — almost
     // certainly "closed overnight" rather than a meaningful idle signal,
@@ -591,17 +1232,27 @@ router.get('/insights', requireRole(...ROLE_ACCESS.ownerManager), (req: Request,
       windowDays: days,
       aov,
       ordersAnalyzed: orderTimestamps.length,
-      avgPrepTimeMinutes: prepTime.sampleSize > 0 && prepTime.avgMinutes !== null ? Math.round(prepTime.avgMinutes) : null,
+      avgPrepTimeMinutes:
+        prepTime.sampleSize > 0 && prepTime.avgMinutes !== null
+          ? Math.round(prepTime.avgMinutes)
+          : null,
       topStaff,
       topCategories,
       busiestHour: busiestHour ? { hour: busiestHour.index, orderCount: busiestHour.count } : null,
       idlestHour: idlestHour ? { hour: idlestHour.index, orderCount: idlestHour.count } : null,
-      busiestDayOfWeek: busiestDay ? { dayIndex: busiestDay.index, orderCount: busiestDay.count } : null,
-      idlestDayOfWeek: idlestDay ? { dayIndex: idlestDay.index, orderCount: idlestDay.count } : null,
+      busiestDayOfWeek: busiestDay
+        ? { dayIndex: busiestDay.index, orderCount: busiestDay.count }
+        : null,
+      idlestDayOfWeek: idlestDay
+        ? { dayIndex: idlestDay.index, orderCount: idlestDay.count }
+        : null,
     });
   } catch (error: any) {
-    console.error("[API] Internal error:", error);
-    res.status(500).json({ error: "Internal server error" });
+    res.locals.postHogError = error;
+    console.error('[API] Internal error:', error);
+    res
+      .status(error.statusCode || 500)
+      .json({ error: error.statusCode ? error.message : 'Internal server error' });
   }
 });
 
@@ -627,28 +1278,174 @@ router.get('/insights', requireRole(...ROLE_ACCESS.ownerManager), (req: Request,
 //   opening_float_cents. Consumers must not compare them directly; X is the
 //   live drawer expectation, Z is the point-in-time snapshot that bakes in the
 //   float.
-router.get('/x-report', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res: Response) => {
+function resolveRequestedCashSession(
+  db: ReturnType<typeof getDatabase>,
+  req: Request,
+  res: Response,
+): CashSessionRow | null | 'responded' {
+  if (req.query.session_id === undefined || String(req.query.session_id).trim() === '') {
+    return null;
+  }
+  const sessionId = Number(req.query.session_id);
+  if (!Number.isInteger(sessionId) || sessionId <= 0) {
+    res.status(400).json({ error: 'Invalid session_id', code: 'session_id_invalid' });
+    return 'responded';
+  }
+  const session = db
+    .prepare(
+      `SELECT id, opened_by, opened_by_name, opened_at, opening_float_cents, status, closed_at, closed_by, closure_id
+       FROM cash_sessions WHERE id = ?`,
+    )
+    .get(sessionId) as CashSessionRow | undefined;
+  if (!session) {
+    res.status(404).json({ error: 'Shift not found', code: 'session_unavailable' });
+    return 'responded';
+  }
+  const actor = (req as AuthedRequest).user;
+  const actorRole = String(actor?.role || '');
+  const actorUserId = String(actor?.userId || '');
+  if (
+    actorRole !== 'owner' &&
+    actorRole !== 'manager' &&
+    String(session.opened_by) !== actorUserId
+  ) {
+    res.status(403).json({
+      error: "Only owners and managers can view another staff member's shift report",
+      code: 'shift_access_forbidden',
+    });
+    return 'responded';
+  }
+  return session;
+}
+
+router.get('/x-report', requirePermission('reports.view'), (req: Request, res: Response) => {
   try {
-    const today = reportToday();
-    const date = reportDate(req.query.date, today);
     const db = getDatabase();
     const minorFactor = getCurrencyMinorUnitFactor(getTenantCurrency(db));
+
+    const session = resolveRequestedCashSession(db, req, res);
+    if (session === 'responded') return;
+    if (session) {
+      const shiftDate = sessionBusinessDate(db, session);
+      const sessionClosedRow =
+        session.closure_id != null
+          ? (db
+              .prepare(
+                `SELECT z_number FROM cash_closures WHERE id = ? AND scope = 'session' LIMIT 1`,
+              )
+              .get(session.closure_id) as { z_number: number } | undefined)
+          : undefined;
+      const sessionPriorRow = db
+        .prepare(
+          `SELECT business_date, counted_cash_cents FROM cash_closures
+           WHERE business_date < ? AND scope = 'day'
+           ORDER BY business_date DESC LIMIT 1`,
+        )
+        .get(shiftDate) as { business_date: string; counted_cash_cents: number } | undefined;
+      const sessionBlockingSessions = openSessionsBlockingDayClose(db, shiftDate);
+      const sessionBlocking = sessionBlockingSessions[0];
+      const sessionOpenShifts = sessionBlockingSessions.map((s) => ({
+        id: s.id,
+        opened_by: s.opened_by,
+        opened_by_name: s.opened_by_name,
+        opened_at: s.opened_at,
+      }));
+      const sessionEnd = session.closed_at || now();
+      const openingFloatCents = Number(session.opening_float_cents || 0);
+      const sessionAggregates = computeSessionAggregates(db, session, sessionEnd);
+      const totalExpectedCashCents = sessionExpectedCash(
+        db,
+        session,
+        sessionEnd,
+        sessionAggregates.cashMovements,
+      );
+      return res.json({
+        xReport: {
+          businessDate: shiftDate,
+          periodStart: session.opened_at,
+          periodEnd: sessionEnd,
+          grossCollected: sessionAggregates.grossCollectedCents / minorFactor,
+          refunded: sessionAggregates.refundedCents / minorFactor,
+          netCollected: sessionAggregates.netCollectedCents / minorFactor,
+          billCount: sessionAggregates.billCount,
+          refundCount: sessionAggregates.refundCount,
+          paymentMethods: sessionAggregates.paymentMethods.map((row) => ({
+            method: row.method,
+            count: row.count,
+            total: row.total_cents / minorFactor,
+          })),
+          staffSales: sessionAggregates.staffSales.map((row) => ({
+            user_id: row.user_id,
+            name: row.name,
+            role: row.role,
+            revenue: row.revenue_cents / minorFactor,
+            orderCount: row.orderCount,
+          })),
+          taxComponents: sessionAggregates.taxComponents,
+          openingFloatCents,
+          payInCents: sessionAggregates.payInCents,
+          payOutCents: sessionAggregates.payOutCents,
+          safeDropCents: sessionAggregates.safeDropCents,
+          cashMovements: sessionAggregates.cashMovements,
+          expectedCashCents: totalExpectedCashCents - openingFloatCents,
+          priorClosedCashCents: sessionPriorRow?.counted_cash_cents ?? null,
+          priorBusinessDate: sessionPriorRow?.business_date ?? null,
+          alreadyClosed: session.status === 'closed' || !!sessionClosedRow,
+          zNumber: sessionClosedRow?.z_number,
+          session: {
+            id: session.id,
+            opened_by: session.opened_by,
+            opened_by_name: session.opened_by_name,
+            opened_at: session.opened_at,
+            closed_at: session.closed_at,
+            status: session.status,
+            closure_id: session.closure_id,
+            opening_float_cents: openingFloatCents,
+            expected_cash_cents: totalExpectedCashCents,
+          },
+          openShifts: sessionOpenShifts,
+          blockingOpenShift: sessionBlocking
+            ? {
+                id: sessionBlocking.id,
+                opened_by_name: sessionBlocking.opened_by_name,
+                opened_at: sessionBlocking.opened_at,
+              }
+            : null,
+        },
+      });
+    }
+
+    const today = reportToday();
+    const date = reportDate(req.query.date, today);
     const [periodStart, periodEnd] = reportDayBounds(date);
 
     const aggregates = computeDayAggregates(db, date);
 
-    const closedRow = db.prepare(
-      `SELECT z_number FROM cash_closures WHERE business_date = ? AND scope = 'day' LIMIT 1`
-    ).get(date) as { z_number: number } | undefined;
+    const closedRow = db
+      .prepare(
+        `SELECT z_number FROM cash_closures WHERE business_date = ? AND scope = 'day' LIMIT 1`,
+      )
+      .get(date) as { z_number: number } | undefined;
 
     // F3: most recent prior closed day for this business date, used by the
     // modal to prefill the opening float (server-side one-shot query; the
     // frontend no longer walks back day-by-day).
-    const priorRow = db.prepare(
-      `SELECT business_date, counted_cash_cents FROM cash_closures
+    const priorRow = db
+      .prepare(
+        `SELECT business_date, counted_cash_cents FROM cash_closures
          WHERE business_date < ? AND scope = 'day'
-         ORDER BY business_date DESC LIMIT 1`
-    ).get(date) as { business_date: string; counted_cash_cents: number } | undefined;
+         ORDER BY business_date DESC LIMIT 1`,
+      )
+      .get(date) as { business_date: string; counted_cash_cents: number } | undefined;
+
+    const blockingSessions = openSessionsBlockingDayClose(db, date);
+    const blockingSession = blockingSessions[0];
+    const openShifts = blockingSessions.map((s) => ({
+      id: s.id,
+      opened_by: s.opened_by,
+      opened_by_name: s.opened_by_name,
+      opened_at: s.opened_at,
+    }));
 
     res.json({
       xReport: {
@@ -673,16 +1470,19 @@ router.get('/x-report', requireRole(...ROLE_ACCESS.ownerManager), (req: Request,
           orderCount: row.orderCount,
         })),
         taxComponents: aggregates.taxComponents,
-        openingFloatCents: aggregates.cashMovements.find((movement) => movement.movement_type === 'opening_float')?.amount_cents ?? null,
+        openingFloatCents:
+          aggregates.cashMovements.find((movement) => movement.movement_type === 'opening_float')
+            ?.amount_cents ?? null,
         payInCents: aggregates.payInCents,
         payOutCents: aggregates.payOutCents,
         safeDropCents: aggregates.safeDropCents,
         cashMovements: aggregates.cashMovements,
-        expectedCashCents: aggregates.cashSalesCents
-          + aggregates.payInCents
-          - aggregates.payOutCents
-          - aggregates.safeDropCents
-          - aggregates.cashRefundsByCreatedAtCents,
+        expectedCashCents:
+          aggregates.cashSalesCents +
+          aggregates.payInCents -
+          aggregates.payOutCents -
+          aggregates.safeDropCents -
+          aggregates.cashRefundsByCreatedAtCents,
         // F3: server-resolved prior close; null fields when no prior close
         // exists. The frontend only shows the "no prior close" hint when
         // this is genuinely null (never on transport error).
@@ -690,11 +1490,23 @@ router.get('/x-report', requireRole(...ROLE_ACCESS.ownerManager), (req: Request,
         priorBusinessDate: priorRow?.business_date ?? null,
         alreadyClosed: !!closedRow,
         zNumber: closedRow?.z_number,
+        session: null,
+        openShifts,
+        blockingOpenShift: blockingSession
+          ? {
+              id: blockingSession.id,
+              opened_by_name: blockingSession.opened_by_name,
+              opened_at: blockingSession.opened_at,
+            }
+          : null,
       },
     });
   } catch (error: any) {
+    res.locals.postHogError = error;
     console.error('[API] Internal error:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    res
+      .status(error.statusCode || 500)
+      .json({ error: error.statusCode ? error.message : 'Internal server error' });
   }
 });
 
@@ -702,20 +1514,24 @@ router.get('/x-report', requireRole(...ROLE_ACCESS.ownerManager), (req: Request,
 // Reads the immutable `cash_closures` row for the requested business date.
 // 404 with `{ alreadyClosed: false }` when no day-close row exists yet.
 // Same role gate as /x-report.
-router.get('/z-report', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res: Response) => {
+router.get('/z-report', requirePermission('reports.view'), (req: Request, res: Response) => {
   try {
     const today = reportToday();
     const date = reportDate(req.query.date, today);
     const db = getDatabase();
-    const row = db.prepare(
-      `SELECT * FROM cash_closures WHERE business_date = ? AND scope = 'day' LIMIT 1`
-    ).get(date) as any;
+    const row = db
+      .prepare(`SELECT * FROM cash_closures WHERE business_date = ? AND scope = 'day' LIMIT 1`)
+      .get(date) as any;
     if (!row) {
-      return res.status(404).json({ error: 'Day not closed', alreadyClosed: false, businessDate: date });
+      return res
+        .status(404)
+        .json({ error: 'Day not closed', alreadyClosed: false, businessDate: date });
     }
     // F6: resolve the operator's display name (id -> name) for the response.
     // Falls back to the raw id when the user row is missing.
-    const userRow = db.prepare(`SELECT name FROM users WHERE id = ?`).get(row.closed_by) as { name: string } | undefined;
+    const userRow = db.prepare(`SELECT name FROM users WHERE id = ?`).get(row.closed_by) as
+      | { name: string }
+      | undefined;
     res.json({
       zReport: {
         id: row.id,
@@ -747,9 +1563,601 @@ router.get('/z-report', requireRole(...ROLE_ACCESS.ownerManager), (req: Request,
       },
     });
   } catch (error: any) {
+    res.locals.postHogError = error;
     console.error('[API] Internal error:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    res
+      .status(error.statusCode || 500)
+      .json({ error: error.statusCode ? error.message : 'Internal server error' });
   }
 });
+
+function resolveCashCloseHtmlOptions(db: ReturnType<typeof getDatabase>): CashCloseHtmlOptions {
+  const currency = getTenantCurrency(db);
+  const businessName = getSettingValue('business_name') ?? undefined;
+  try {
+    const snapshot = resolveRegionalSnapshot({
+      country: getSettingValue('country') ?? undefined,
+      currency,
+      timezone: getSettingValue('timezone') ?? undefined,
+      currency_display: getSettingValue('currency_display') ?? undefined,
+      number_digits: getSettingValue('number_digits') ?? undefined,
+      calendar: getSettingValue('calendar') ?? undefined,
+    });
+    return {
+      businessName,
+      currency: snapshot.currency,
+      locale: snapshot.locale,
+      timezone: snapshot.timezone,
+      preferences: snapshot.preferences,
+    };
+  } catch {
+    return {
+      businessName,
+      currency,
+    };
+  }
+}
+
+router.get(
+  '/x-report/export',
+  requirePermission('reports.view'),
+  async (req: Request, res: Response) => {
+    try {
+      const format =
+        req.query.format === 'csv'
+          ? 'csv'
+          : req.query.format === 'xlsx'
+            ? 'xlsx'
+            : req.query.format === 'html'
+              ? 'html'
+              : null;
+      if (!format) return res.status(400).json({ error: 'format must be xlsx, csv, or html' });
+
+      const db = getDatabase();
+      const session = resolveRequestedCashSession(db, req, res);
+      if (session === 'responded') return;
+
+      const minorFactor = getCurrencyMinorUnitFactor(getTenantCurrency(db));
+      let report: XReportExport;
+      let filename: string;
+      if (session) {
+        const shiftDate = sessionBusinessDate(db, session);
+        const sessionEnd = session.closed_at || now();
+        const openingFloatCents = Number(session.opening_float_cents || 0);
+        const sessionAggregates = computeSessionAggregates(db, session, sessionEnd);
+        const totalExpectedCashCents = sessionExpectedCash(
+          db,
+          session,
+          sessionEnd,
+          sessionAggregates.cashMovements,
+        );
+        report = {
+          businessDate: shiftDate,
+          periodStart: session.opened_at,
+          periodEnd: sessionEnd,
+          grossSales: sessionAggregates.grossCollectedCents / minorFactor,
+          refunds: sessionAggregates.refundedCents / minorFactor,
+          netCollections: sessionAggregates.netCollectedCents / minorFactor,
+          billCount: sessionAggregates.billCount,
+          expectedCash: totalExpectedCashCents / minorFactor,
+          openingFloat: openingFloatCents / minorFactor,
+          payIn: sessionAggregates.payInCents / minorFactor,
+          payOut: sessionAggregates.payOutCents / minorFactor,
+          safeDrops: sessionAggregates.safeDropCents / minorFactor,
+          paymentMethods: sessionAggregates.paymentMethods.map((row) => ({
+            method: row.method,
+            count: row.count,
+            total: row.total_cents / minorFactor,
+          })),
+          staffSales: sessionAggregates.staffSales.map((row) => ({
+            name: row.name,
+            role: row.role,
+            orderCount: row.orderCount,
+            revenue: row.revenue_cents / minorFactor,
+          })),
+          taxComponents: sessionAggregates.taxComponents.map((comp) => ({
+            title: comp.title,
+            rate: comp.rate,
+            amount: comp.amount,
+          })),
+          session: {
+            id: session.id,
+            openedByName: session.opened_by_name || session.opened_by,
+          },
+        };
+        filename = `x-report-${shiftDate}-shift-${session.id}.${format}`;
+      } else {
+        const date = reportDate(req.query.date, reportToday());
+        const [periodStart, periodEnd] = reportDayBounds(date);
+        const aggregates = computeDayAggregates(db, date);
+        report = {
+          businessDate: date,
+          periodStart,
+          periodEnd,
+          grossSales: aggregates.grossCollectedCents / minorFactor,
+          refunds: aggregates.refundedCents / minorFactor,
+          netCollections: aggregates.netCollectedCents / minorFactor,
+          billCount: aggregates.billCount,
+          expectedCash: expectedCashFromAggregates(aggregates) / minorFactor,
+          openingFloat: aggregates.openingFloatCents / minorFactor,
+          payIn: aggregates.payInCents / minorFactor,
+          payOut: aggregates.payOutCents / minorFactor,
+          safeDrops: aggregates.safeDropCents / minorFactor,
+          paymentMethods: aggregates.paymentMethods.map((row) => ({
+            method: row.method,
+            count: row.count,
+            total: row.total_cents / minorFactor,
+          })),
+          staffSales: aggregates.staffSales.map((row) => ({
+            name: row.name,
+            role: row.role,
+            orderCount: row.orderCount,
+            revenue: row.revenue_cents / minorFactor,
+          })),
+          taxComponents: aggregates.taxComponents.map((comp) => ({
+            title: comp.title,
+            rate: comp.rate,
+            amount: comp.amount,
+          })),
+        };
+        filename = `x-report-${date}.${format}`;
+      }
+      if (format === 'xlsx') {
+        res.setHeader(
+          'Content-Type',
+          'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        );
+        res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+        return res.send(await serializeXReportXlsx(report));
+      }
+      if (format === 'html') {
+        res.setHeader('Content-Type', 'text/html; charset=utf-8');
+        res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+        return res.send(serializeXReportHtml(report, resolveCashCloseHtmlOptions(db)));
+      }
+      res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+      res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+      return res.send(serializeXReportCsv(report));
+    } catch (error: unknown) {
+      res.locals.postHogError = error;
+      console.error('[API] X report export error:', error);
+      return res.status(500).json({ error: 'Internal server error' });
+    }
+  },
+);
+
+router.get(
+  '/z-report/export',
+  requirePermission('reports.view'),
+  async (req: Request, res: Response) => {
+    try {
+      const date = reportDate(req.query.date, reportToday());
+      const format =
+        req.query.format === 'csv'
+          ? 'csv'
+          : req.query.format === 'xlsx'
+            ? 'xlsx'
+            : req.query.format === 'html'
+              ? 'html'
+              : null;
+      if (!format) return res.status(400).json({ error: 'format must be xlsx, csv, or html' });
+
+      const db = getDatabase();
+      const row = db
+        .prepare(`SELECT * FROM cash_closures WHERE business_date = ? AND scope = 'day' LIMIT 1`)
+        .get(date) as any;
+      if (!row) return res.status(404).json({ error: 'Day not closed' });
+
+      const minorFactor = getCurrencyMinorUnitFactor(getTenantCurrency(db));
+      const userRow = db.prepare('SELECT name FROM users WHERE id = ?').get(row.closed_by) as
+        | { name: string }
+        | undefined;
+      const report: ZReportExport = {
+        businessDate: row.business_date,
+        periodStart: row.period_start,
+        periodEnd: row.period_end,
+        grossSales: row.gross_collected_cents / minorFactor,
+        refunds: row.refunded_cents / minorFactor,
+        netCollections: row.net_collected_cents / minorFactor,
+        billCount: row.bill_count,
+        expectedCash: row.expected_cash_cents / minorFactor,
+        openingFloat: row.opening_float_cents / minorFactor,
+        payIn: row.pay_in_cents / minorFactor,
+        payOut: row.pay_out_cents / minorFactor,
+        safeDrops: row.safe_drop_cents / minorFactor,
+        paymentMethods: JSON.parse(row.payment_methods_json || '[]').map((payment: any) => ({
+          method: payment.method,
+          count: payment.count,
+          total: payment.total_cents / minorFactor,
+        })),
+        staffSales: JSON.parse(row.staff_sales_json || '[]').map((staff: any) => ({
+          name: staff.name,
+          role: staff.role,
+          orderCount: staff.orderCount,
+          revenue: staff.revenue_cents / minorFactor,
+        })),
+        taxComponents: JSON.parse(row.tax_components_json || '[]').map(
+          (comp: { title?: unknown; rate?: unknown; amount?: unknown }) => ({
+            title: String(comp.title ?? 'Tax'),
+            rate: typeof comp.rate === 'number' ? comp.rate : null,
+            amount: Number(comp.amount ?? 0),
+          }),
+        ),
+        zNumber: row.z_number,
+        closedAt: row.created_at,
+        closedBy: userRow?.name ?? row.closed_by,
+        notes: row.notes,
+        countedCash: row.counted_cash_cents / minorFactor,
+        cashVariance: row.variance_cents / minorFactor,
+      };
+      const filename = `z-report-Z${row.z_number}-${date}.${format}`;
+      if (format === 'xlsx') {
+        res.setHeader(
+          'Content-Type',
+          'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        );
+        res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+        return res.send(await serializeZReportXlsx(report));
+      }
+      if (format === 'html') {
+        res.setHeader('Content-Type', 'text/html; charset=utf-8');
+        res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+        return res.send(serializeZReportHtml(report, resolveCashCloseHtmlOptions(db)));
+      }
+      res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+      res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+      return res.send(serializeZReportCsv(report));
+    } catch (error: unknown) {
+      res.locals.postHogError = error;
+      console.error('[API] Z report export error:', error);
+      return res.status(500).json({ error: 'Internal server error' });
+    }
+  },
+);
+
+router.post(
+  '/cash-closes/:id/whatsapp',
+  requirePermission('reports.view'),
+  requirePermission('whatsapp.use'),
+  async (req: Request, res: Response) => {
+    const id = Number(req.params.id);
+    if (!Number.isSafeInteger(id) || id < 1) {
+      return res.status(400).json({ error: 'Invalid cash close id' });
+    }
+
+    const { phone_e164: phoneE164, body } = req.body ?? {};
+    if (typeof phoneE164 !== 'string' || !phoneE164) {
+      return res.status(400).json({ error: 'phone_e164 required', reason: 'phone_required' });
+    }
+    const parsedPhone = parsePhoneE164(phoneE164, getSettingValue('country') || '');
+    if (!parsedPhone) {
+      return res.status(400).json({ error: 'Valid phone_e164 required', reason: 'invalid_phone' });
+    }
+    if (typeof body !== 'string' || !body.trim() || body.length > 4096) {
+      return res.status(400).json({
+        error: 'body must be a non-empty string of at most 4096 characters',
+        reason: 'invalid_body',
+      });
+    }
+
+    const db = getDatabase();
+    const close = db.prepare("SELECT id FROM cash_closures WHERE id = ? AND scope = 'day'").get(id);
+    if (!close) return res.status(404).json({ error: 'Cash close not found' });
+
+    const userId = (req as Request & { user?: { userId?: string } }).user?.userId ?? null;
+    const result = await trackHttpRequestWork(
+      req,
+      whatsapp.sendMessage({
+        phoneE164: parsedPhone.e164,
+        body,
+        billId: null,
+        customerId: null,
+        kind: 'z_report',
+        userId,
+        signal: getHttpRequestSignal(req),
+      }),
+    );
+    if (!result.ok) {
+      if (result.reason === 'not_connected') {
+        return res.json({ fallback: true, reason: 'not_connected' });
+      }
+      const status = result.reason === 'cooldown' || result.reason === 'rate_limited' ? 429 : 400;
+      return res.status(status).json({ error: result.error, reason: result.reason });
+    }
+    return res.json({ success: true, messageId: result.messageId });
+  },
+);
+
+router.post(
+  '/daily-sales/whatsapp',
+  requirePermission('reports.view'),
+  requirePermission('reports.daily-sales.export'),
+  requirePermission('whatsapp.use'),
+  async (req: Request, res: Response) => {
+    try {
+      const payload =
+        req.body && typeof req.body === 'object' && !Array.isArray(req.body) ? req.body : {};
+      const phoneE164 = payload.phone_e164;
+      if (typeof phoneE164 !== 'string' || !phoneE164.trim()) {
+        return res.status(400).json({ error: 'phone_e164 required', reason: 'phone_required' });
+      }
+      const parsedPhone = parsePhoneE164(phoneE164.trim(), getSettingValue('country') || '');
+      if (!parsedPhone) {
+        return res
+          .status(400)
+          .json({ error: 'Valid phone_e164 required', reason: 'invalid_phone' });
+      }
+
+      const range = resolveDailySalesExportRange(
+        {
+          date: payload.date,
+          from: payload.from,
+          to: payload.to,
+          defaultDate: reportToday(),
+        },
+        reportToday(),
+      );
+
+      const dataset = buildDailySalesExportDataset({
+        from: range.fromDate,
+        to: range.toDate,
+      });
+      const body = formatDailySalesWhatsAppMessage(dataset, {
+        maxChars: whatsapp.MAX_BODY_CHARS,
+      });
+
+      const userId = (req as Request & { user?: { userId?: string } }).user?.userId ?? null;
+      const result = await trackHttpRequestWork(
+        req,
+        whatsapp.sendMessage({
+          phoneE164: parsedPhone.e164,
+          body,
+          billId: null,
+          customerId: null,
+          kind: 'daily_sales_report',
+          userId,
+          signal: getHttpRequestSignal(req),
+        }),
+      );
+
+      if (!result.ok) {
+        if (result.reason === 'not_connected') {
+          return res.json({ fallback: true, reason: 'not_connected', body });
+        }
+        const status = result.reason === 'cooldown' || result.reason === 'rate_limited' ? 429 : 400;
+        return res.status(status).json({ error: result.error, reason: result.reason });
+      }
+
+      const deliveryStatus: 'sent' | 'submitted' =
+        typeof whatsapp.waitForMessageAck === 'function' && result.messageId != null
+          ? await trackHttpRequestWork(
+              req,
+              whatsapp.waitForMessageAck(result.messageId, 1500, getHttpRequestSignal(req)),
+            )
+          : (result as { deliveryStatus?: string; acknowledged?: boolean }).deliveryStatus ===
+                'sent' || (result as { acknowledged?: boolean }).acknowledged === true
+            ? 'sent'
+            : 'submitted';
+
+      return res.json({ success: true, deliveryStatus, messageId: result.messageId, body });
+    } catch (error: unknown) {
+      res.locals.postHogError = error;
+      if (error instanceof DailySalesExportValidationError) {
+        return res.status(400).json({ error: error.message, reason: 'invalid_range' });
+      }
+      const statusCode =
+        typeof error === 'object' && error !== null
+          ? (error as { statusCode?: number }).statusCode
+          : undefined;
+      const message = error instanceof Error ? error.message : 'Internal server error';
+      if (statusCode === 400) {
+        return res.status(400).json({
+          error: error instanceof Error ? error.message : 'Invalid export request',
+          reason: 'invalid_range',
+        });
+      }
+      if (statusCode === 409) {
+        return res.status(409).json({ error: message });
+      }
+      console.error('[API] Daily sales WhatsApp send error:', error);
+      return res
+        .status(statusCode || 500)
+        .json({ error: statusCode ? message : 'Internal server error' });
+    }
+  },
+);
+
+// Owner-only daily sales export (xlsx workbook, CSV parts, or print-styled HTML across 1..93 business days).
+// Accounting lives in buildDailySalesExportDataset; serializers only encode.
+router.get(
+  '/daily-sales/export',
+  requirePermission('reports.daily-sales.export'),
+  async (req: Request, res: Response) => {
+    try {
+      const range = resolveDailySalesExportRange(
+        {
+          date: req.query.date,
+          from: req.query.from,
+          to: req.query.to,
+          defaultDate: reportToday(),
+        },
+        reportToday(),
+      );
+      const format =
+        req.query.format === 'csv'
+          ? 'csv'
+          : req.query.format === 'xlsx'
+            ? 'xlsx'
+            : req.query.format === 'html'
+              ? 'html'
+              : null;
+      if (!format) {
+        return res.status(400).json({ error: 'format must be xlsx, csv, or html' });
+      }
+      const part: DailySalesExportCsvPart | undefined =
+        req.query.part === 'summary' ||
+        req.query.part === 'daily' ||
+        req.query.part === 'taxes' ||
+        req.query.part === 'items' ||
+        req.query.part === 'payments'
+          ? req.query.part
+          : undefined;
+      if (format === 'csv' && !part) {
+        return res.status(400).json({
+          error:
+            'CSV export requires part=summary, part=daily, part=taxes, part=items or part=payments',
+        });
+      }
+
+      const dataset = buildDailySalesExportDataset({
+        from: range.fromDate,
+        to: range.toDate,
+      });
+      const filename = dailySalesExportFilename(
+        { fromDate: range.fromDate, toDate: range.toDate },
+        format,
+        part,
+      );
+
+      if (format === 'xlsx') {
+        const buffer = await serializeDailySalesExportXlsx(dataset, {
+          fractionDigits: getCurrencyFractionDigits(dataset.summary.currency),
+        });
+        res.setHeader(
+          'Content-Type',
+          'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        );
+        res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+        return res.send(buffer);
+      }
+
+      if (format === 'html') {
+        const html = serializeDailySalesExportHtml(dataset, {
+          businessName: getSettingValue('business_name') ?? undefined,
+        });
+        res.setHeader('Content-Type', 'text/html; charset=utf-8');
+        res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+        return res.send(html);
+      }
+
+      const csv = serializeDailySalesExportCsv(dataset, part!);
+      res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+      res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+      return res.send(csv);
+    } catch (error: unknown) {
+      res.locals.postHogError = error;
+      if (error instanceof DailySalesExportValidationError) {
+        return res.status(400).json({ error: error.message });
+      }
+      const statusCode =
+        typeof error === 'object' && error !== null
+          ? (error as { statusCode?: number }).statusCode
+          : undefined;
+      const message = error instanceof Error ? error.message : 'Internal server error';
+      if (statusCode === 400) {
+        return res.status(400).json({ error: message });
+      }
+      if (statusCode === 409) {
+        return res.status(409).json({ error: message });
+      }
+      console.error('[API] Daily sales export error:', error);
+      res.status(statusCode || 500).json({ error: statusCode ? message : 'Internal server error' });
+    }
+  },
+);
+
+// Owner-only compiled daily invoices export (print-styled A4 HTML for PDF/browser print across 1..366 business days).
+router.get(
+  '/daily-invoices/export',
+  requirePermission('reports.daily-sales.export'),
+  async (req: Request, res: Response) => {
+    try {
+      const rawFormat =
+        req.query.format === undefined || req.query.format === '' ? 'html' : req.query.format;
+      if (rawFormat !== 'html') {
+        return res.status(400).json({ error: 'format must be html' });
+      }
+      const range = resolveDailySalesExportRange(
+        {
+          date: req.query.date,
+          from: req.query.from,
+          to: req.query.to,
+          defaultDate: reportToday(),
+        },
+        reportToday(),
+        DAILY_INVOICES_EXPORT_MAX_RANGE_DAYS,
+      );
+      const dataset = buildDailyInvoicesExportDataset({
+        from: range.fromDate,
+        to: range.toDate,
+      });
+      const html = serializeDailyInvoicesExportHtml(dataset);
+      const filename = dailyInvoicesExportFilename(
+        { fromDate: range.fromDate, toDate: range.toDate },
+        'html',
+      );
+      res.setHeader('Content-Type', 'text/html; charset=utf-8');
+      res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+      return res.send(html);
+    } catch (error: unknown) {
+      res.locals.postHogError = error;
+      if (error instanceof DailySalesExportValidationError) {
+        return res.status(400).json({ error: error.message });
+      }
+      const statusCode =
+        typeof error === 'object' && error !== null
+          ? (error as { statusCode?: number }).statusCode
+          : undefined;
+      const message = error instanceof Error ? error.message : 'Internal server error';
+      if (statusCode === 400) {
+        return res.status(400).json({ error: message });
+      }
+      if (statusCode === 409) {
+        return res.status(409).json({ error: message });
+      }
+      console.error('[API] Daily invoices export error:', error);
+      res.status(statusCode || 500).json({ error: statusCode ? message : 'Internal server error' });
+    }
+  },
+);
+
+// Owner-only: one row per item sold with the bill's customer details (PII).
+router.get(
+  '/customer-sales/export',
+  requirePermission('reports.customer-sales.export'),
+  async (req: Request, res: Response) => {
+    try {
+      const format =
+        req.query.format === 'csv' ? 'csv' : req.query.format === 'xlsx' ? 'xlsx' : null;
+      if (!format) {
+        return res.status(400).json({ error: 'format must be xlsx or csv' });
+      }
+      const today = reportToday();
+      const startDate = reportDate(req.query.start_date, today);
+      const endDate = reportDate(req.query.end_date, startDate);
+
+      const dataset = buildCustomerSalesDataset(startDate, endDate);
+      const filename = customerSalesExportFilename(startDate, endDate, format);
+      res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+
+      if (format === 'xlsx') {
+        res.setHeader(
+          'Content-Type',
+          'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        );
+        return res.send(await serializeCustomerSalesXlsx(dataset));
+      }
+      res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+      return res.send(serializeCustomerSalesCsv(dataset));
+    } catch (error: unknown) {
+      res.locals.postHogError = error;
+      if (error instanceof CustomerSalesRangeError) {
+        return res.status(400).json({ error: error.message });
+      }
+      console.error('[API] Customer sales export error:', error);
+      res.status(500).json({ error: 'Internal server error' });
+    }
+  },
+);
 
 export const reportRoutes = router;

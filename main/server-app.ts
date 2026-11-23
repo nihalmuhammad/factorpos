@@ -6,55 +6,81 @@ import * as http from 'http';
 import * as path from 'path';
 import * as fs from 'fs';
 import { randomUUID } from 'node:crypto';
-import { closeServerResources, createShutdownCancellationError, getHttpRequestSignal, installHttpShutdownTracking, trackHttpRequestWork } from './shutdown';
-import { databaseMaintenanceMiddleware, getDatabase, isServerAppEnabled } from './db';
-import { getJWTSecret } from './routes/auth';
-import { authRateLimit, staticRouteRateLimit, corsOptions, isTokenRevoked, isTokenStale, rateLimit, revokeToken } from './middleware/security';
+import {
+  closeServerResources,
+  createShutdownCancellationError,
+  getHttpRequestSignal,
+  installHttpShutdownTracking,
+  trackHttpRequestWork,
+} from './shutdown';
+import {
+  DatabaseAdmissionReservation,
+  createDatabaseMaintenanceHandoff,
+  databaseMaintenanceMiddleware,
+  getDatabase,
+  isServerAppEnabled,
+  isServerBillPrintingEnabled,
+  recordAuthAudit,
+  revokeDatabaseMaintenanceHandoff,
+} from './db';
+import { getJWTSecret } from './security/jwt-secret';
+import { asyncHandler } from './middleware/async-handler';
+import {
+  authenticatePinLogin,
+  handlePasswordChange,
+  handlePinChange,
+  tokenExpSeconds,
+} from './routes/auth';
+import {
+  authRateLimit,
+  loginAuthRateLimit,
+  checkLoginRateLimit,
+  incrementFailedLogin,
+  resetSuccessfulLogin,
+  FAILED_LOGIN_LOCKOUT_MINUTES,
+  staticRouteRateLimit,
+  corsOptions,
+  isTokenRevoked,
+  isTokenStale,
+  nextTokenIatSeconds,
+  rateLimit,
+  revokeToken,
+} from './middleware/security';
 import { getServerPort } from './server';
-import { getDefaultServerAppPort, getServerAppPort as getActiveServerAppPort, setServerAppPort } from './server-app-state';
+import {
+  getDefaultServerAppPort,
+  getServerAppPort as getActiveServerAppPort,
+  setServerAppPort,
+} from './server-app-state';
 import { API_JSON_BODY_LIMIT } from './http-limits';
 import { buildCspHeader } from './csp';
+import { readPosSortSettings } from './lib/pos-sort';
 import { resolveContainedPath } from './lib/path-containment';
-import { ROLE_ACCESS } from '../shared/role-permissions';
+import { RegionalNotConfiguredError, resolveRegionalSnapshot } from './countries';
 import {
-  getCountryByCode,
-  getCurrencyFractionDigits,
-  getCurrencySymbol,
-  resolveTenantCurrency,
-} from './countries';
+  effectivePermissionRevision,
+  hasPermission,
+  resolveEffectivePermissions,
+} from './services/authorization';
 
 let serverApp: http.Server | null = null;
 let stopPromise: Promise<void> | null = null;
 let startReject: ((error: Error) => void) | null = null;
 let stopping = false;
 const SERVER_APP_PORT = getDefaultServerAppPort();
-const SERVER_APP_ALLOWED_ROLES = new Set(ROLE_ACCESS.serverApp);
 
 type ServerAppUser = {
   userId: string;
   email?: string;
   role: string;
   iat?: number;
+  exp?: number;
 };
 
-function currencyPosition(locale: string, currency: string): 'prefix' | 'suffix' {
-  try {
-    const parts = new Intl.NumberFormat(locale, {
-      style: 'currency',
-      currency,
-      currencyDisplay: 'narrowSymbol',
-    }).formatToParts(1);
-    return parts.findIndex((part) => part.type === 'currency')
-      < parts.findIndex((part) => part.type === 'integer')
-      ? 'prefix'
-      : 'suffix';
-  } catch {
-    return 'prefix';
-  }
-}
-
 function normalizeEmail(email: unknown): string {
-  return String(email || '').trim().toLowerCase();
+  return String(email || '')
+    .trim()
+    .toLowerCase();
 }
 
 export function isServerAppRunning(): boolean {
@@ -82,7 +108,9 @@ function rewriteNextExportPath(reqPath: string): string {
   const lastDotIndex = rest.lastIndexOf('.');
   if (lastDotIndex === -1) return reqPath;
 
-  return prefix + rest.substring(0, lastDotIndex).replace(/\./g, '/') + rest.substring(lastDotIndex);
+  return (
+    prefix + rest.substring(0, lastDotIndex).replace(/\./g, '/') + rest.substring(lastDotIndex)
+  );
 }
 
 function requireServerAppAuth(req: Request, res: Response, next: NextFunction) {
@@ -99,12 +127,19 @@ function requireServerAppAuth(req: Request, res: Response, next: NextFunction) {
   try {
     const decoded = jwt.verify(token, getJWTSecret()) as any;
     const db = getDatabase();
-    const user = db.prepare('SELECT id, email, role, tokens_valid_after FROM users WHERE id = ? AND is_active = 1').get(decoded.userId) as any;
+    const user = db
+      .prepare(
+        'SELECT id, email, role, tokens_valid_after FROM users WHERE id = ? AND is_active = 1',
+      )
+      .get(decoded.userId) as any;
     if (!user || isTokenStale(decoded.iat, user.tokens_valid_after)) {
       return res.status(401).json({ error: 'Invalid token' });
     }
-    if (!SERVER_APP_ALLOWED_ROLES.has(user.role)) {
-      return res.status(403).json({ error: 'Access denied. Only server, manager, or owner accounts allowed.' });
+    if (!hasPermission(user.id, 'server-app.use')) {
+      return res.status(403).json({
+        error: 'Access denied. Only server, manager, or owner accounts allowed.',
+        code: 'permission_denied',
+      });
     }
 
     (req as any).user = {
@@ -112,6 +147,7 @@ function requireServerAppAuth(req: Request, res: Response, next: NextFunction) {
       email: user.email,
       role: user.role,
       iat: decoded.iat,
+      exp: decoded.exp,
     } satisfies ServerAppUser;
     next();
   } catch {
@@ -133,6 +169,11 @@ async function forwardToMainApiImpl(req: Request, res: Response, targetPath: str
     }
   }
 
+  const reservation = (req as any).databaseAdmissionReservation as
+    | DatabaseAdmissionReservation
+    | undefined;
+  const handoffToken = reservation ? createDatabaseMaintenanceHandoff(reservation) : undefined;
+
   try {
     const upstream = await fetch(target, {
       method: req.method,
@@ -140,14 +181,15 @@ async function forwardToMainApiImpl(req: Request, res: Response, targetPath: str
         'Content-Type': 'application/json',
         ...(req.headers.authorization ? { Authorization: req.headers.authorization } : {}),
         ...(req.get('Idempotency-Key') ? { 'Idempotency-Key': req.get('Idempotency-Key')! } : {}),
+        ...(handoffToken ? { 'x-flo-maintenance-handoff': handoffToken } : {}),
       },
       body: ['GET', 'HEAD'].includes(req.method) ? undefined : JSON.stringify(req.body || {}),
       signal: getHttpRequestSignal(req),
     });
-    const text = await upstream.text();
+    const buffer = Buffer.from(await upstream.arrayBuffer());
     res.status(upstream.status);
     res.type(upstream.headers.get('content-type') || 'application/json');
-    res.send(text);
+    res.send(buffer);
   } catch (error: any) {
     if (getHttpRequestSignal(req)?.aborted) {
       if (!res.headersSent) res.status(503).end();
@@ -156,6 +198,10 @@ async function forwardToMainApiImpl(req: Request, res: Response, targetPath: str
     }
     console.error('[Server App] Main API forward failed:', error);
     res.status(502).json({ error: 'Could not reach the local POS API' });
+  } finally {
+    if (handoffToken) {
+      revokeDatabaseMaintenanceHandoff(handoffToken);
+    }
   }
 }
 
@@ -198,37 +244,62 @@ export function startServerApp(): Promise<void> {
       });
     });
 
-    app.get('/api/server-app/info', (_req: Request, res: Response) => {
+    const serverAppApiRateLimit = expressRateLimit({
+      windowMs: 60 * 1000,
+      limit: 600,
+      standardHeaders: true,
+      legacyHeaders: false,
+    });
+
+    app.get('/api/server-app/info', serverAppApiRateLimit, (_req: Request, res: Response) => {
       if (!isServerAppEnabled()) return res.status(404).json({ error: 'Not found' });
-      const rows = getDatabase().prepare('SELECT key, value FROM settings').all() as { key: string; value: string }[];
+      const rows = getDatabase().prepare('SELECT key, value FROM settings').all() as {
+        key: string;
+        value: string;
+      }[];
       const settings: Record<string, string> = {};
       for (const row of rows) settings[row.key] = row.value;
-      const country = getCountryByCode(settings.country) || getCountryByCode('IN')!;
-      const currency = resolveTenantCurrency(settings.currency, country.code);
-      const currencySymbol = settings.currency_symbol?.trim()
-        || getCurrencySymbol(currency, country.locale)
-        || currency;
+      let snapshot;
+      try {
+        snapshot = resolveRegionalSnapshot(settings);
+      } catch (error) {
+        if (error instanceof RegionalNotConfiguredError)
+          return res.status(409).json({ error: 'regional_not_configured' });
+        throw error;
+      }
       res.json({
         language: settings.language || null,
-        country: country.code,
-        currency,
-        currency_symbol: currencySymbol,
-        currency_position: currencyPosition(country.locale, currency),
-        currency_fraction_digits: getCurrencyFractionDigits(currency),
+        country: snapshot.country,
+        currency: snapshot.currency,
+        currency_symbol: snapshot.currencySymbol,
+        currency_position: snapshot.currencyPosition,
+        currency_fraction_digits: snapshot.currencyFractionDigits,
         kds_enabled: settings.kds_enabled !== 'false',
+        ...readPosSortSettings(settings),
       });
     });
 
-    app.post('/api/auth/login', authRateLimit(), (req: Request, res: Response) => {
+    app.post('/api/auth/login', loginAuthRateLimit(), (req: Request, res: Response) => {
       if (!isServerAppEnabled()) return res.status(404).json({ error: 'Not found' });
       try {
+        const ip = req.ip || req.socket.remoteAddress || 'unknown';
+        const loginLimiter = checkLoginRateLimit(ip);
+        if (!loginLimiter.allowed) {
+          return res.status(429).json({
+            error: `Too many failed attempts. Try again in ${loginLimiter.waitMinutes} minutes.`,
+          });
+        }
+
         const email = normalizeEmail(req.body?.email);
         const { password, remember_me } = req.body;
-        if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
+        if (!email || !password)
+          return res.status(400).json({ error: 'Email and password required' });
 
         const db = getDatabase();
         const bcrypt = require('bcryptjs');
-        const user = db.prepare('SELECT * FROM users WHERE email = ? AND is_active = 1').get(email) as any;
+        const user = db
+          .prepare('SELECT * FROM users WHERE email = ? AND is_active = 1')
+          .get(email) as any;
         let passwordMatches = false;
         if (user) {
           try {
@@ -238,21 +309,49 @@ export function startServerApp(): Promise<void> {
           }
         }
         if (!user || !passwordMatches) {
-          return res.status(401).json({ error: 'Invalid credentials' });
-        }
-        if (!SERVER_APP_ALLOWED_ROLES.has(user.role)) {
-          return res.status(403).json({ error: 'Access denied. Only server, manager, or owner accounts allowed.' });
+          const attemptsRemaining = incrementFailedLogin(ip);
+          return res.status(401).json({
+            error: 'Invalid credentials',
+            attempts_remaining: attemptsRemaining,
+            lockout_minutes: attemptsRemaining === 0 ? FAILED_LOGIN_LOCKOUT_MINUTES : undefined,
+          });
         }
 
+        if (!hasPermission(user.id, 'server-app.use')) {
+          return res.status(403).json({
+            error: 'Access denied. Only server, manager, or owner accounts allowed.',
+            code: 'permission_denied',
+          });
+        }
+
+        resetSuccessfulLogin(ip);
+
+        const remember = !!remember_me;
+        const iat = nextTokenIatSeconds();
         const token = jwt.sign(
-          { userId: user.id, email: user.email, role: user.role, jti: randomUUID() },
+          {
+            userId: user.id,
+            email: user.email,
+            role: user.role,
+            remember,
+            jti: randomUUID(),
+            iat,
+            exp: tokenExpSeconds(remember, iat),
+          },
           getJWTSecret(),
-          { expiresIn: remember_me ? '10d' : '24h' },
         );
 
         res.json({
           access_token: token,
-          user: { id: user.id, name: user.name, email: user.email, role: user.role },
+          user: {
+            id: user.id,
+            name: user.name,
+            email: user.email,
+            role: user.role,
+            has_pin: Boolean(user.pin_hash),
+            permission_ids: [...(resolveEffectivePermissions(user.id)?.permissionIds ?? [])],
+            authorization_revision: effectivePermissionRevision(user.id),
+          },
         });
       } catch (error: any) {
         console.error('[Server App] Login error:', error);
@@ -260,42 +359,277 @@ export function startServerApp(): Promise<void> {
       }
     });
 
-    app.get('/api/auth/me', requireServerAppAuth, (req: Request, res: Response) => {
-      const user = (req as any).user as ServerAppUser;
-      const row = getDatabase().prepare('SELECT id, name, email, role FROM users WHERE id = ? AND is_active = 1').get(user.userId) as any;
-      if (!row) return res.status(401).json({ error: 'Invalid token' });
-      res.json({ user: row });
+    app.get('/api/auth/pin-users', authRateLimit({ max: 600 }), (_req: Request, res: Response) => {
+      if (!isServerAppEnabled()) return res.status(404).json({ error: 'Not found' });
+      try {
+        const db = getDatabase();
+        const rows = db
+          .prepare(
+            `SELECT id, name, role
+             FROM users
+             WHERE is_active = 1 AND pin_hash IS NOT NULL
+             ORDER BY CASE role
+               WHEN 'owner' THEN 1
+               WHEN 'manager' THEN 2
+               WHEN 'cashier' THEN 3
+               WHEN 'server' THEN 4
+               WHEN 'chef' THEN 5
+               ELSE 6
+             END, name COLLATE NOCASE ASC`,
+          )
+          .all() as Array<{ id: string; name: string; role: string }>;
+
+        const eligible = rows.filter((row) => hasPermission(row.id, 'server-app.use'));
+
+        res.json({
+          users: eligible.map((row) => ({
+            id: String(row.id),
+            name: String(row.name),
+            role: String(row.role),
+          })),
+        });
+      } catch (error: unknown) {
+        console.error('[Server App] PIN users error:', error);
+        res.status(500).json({ error: 'Internal server error' });
+      }
     });
 
-    app.post('/api/auth/logout', requireServerAppAuth, (req: Request, res: Response) => {
-      const token = req.headers.authorization?.split(' ')[1];
-      if (token) revokeToken(token);
-      res.json({ success: true });
-    });
+    app.post(
+      '/api/auth/pin-login',
+      authRateLimit({
+        max: 600,
+        skipSuccessfulRequests: true,
+        onRateLimited: (req: Request) => {
+          const ip = req.ip || req.socket.remoteAddress || 'unknown';
+          const rawUserId = req.body?.user_id;
+          const userId =
+            typeof rawUserId === 'string' && rawUserId.trim() ? rawUserId.trim() : null;
+          recordAuthAudit(getDatabase(), {
+            userId,
+            eventType: 'pin_login',
+            outcome: 'rate_limited',
+            ipAddress: ip,
+            details: { reason: 'endpoint_rate_limited', service: 'server-app' },
+          });
+        },
+      }),
+      async (req: Request, res: Response) => {
+        if (!isServerAppEnabled()) return res.status(404).json({ error: 'Not found' });
+        try {
+          const ip = req.ip || req.socket.remoteAddress || 'unknown';
+          const { user_id, pin, remember_me, rememberMe } = req.body || {};
+          const userId = typeof user_id === 'string' ? user_id.trim() : '';
+          const rawPin = typeof pin === 'string' || typeof pin === 'number' ? String(pin) : '';
 
-    app.get('/api/categories', requireServerAppAuth, (req, res) => forwardToMainApi(req, res, '/categories'));
-    app.get('/api/products', requireServerAppAuth, (req, res) => forwardToMainApi(req, res, '/products'));
-    app.get('/api/tables', requireServerAppAuth, (req, res) => forwardToMainApi(req, res, '/tables'));
-    app.get('/api/orders', requireServerAppAuth, (req, res) => forwardToMainApi(req, res, '/orders'));
-    app.post('/api/orders', requireServerAppAuth, (req, res) => forwardToMainApi(req, res, '/orders'));
-    app.post('/api/orders/:id/items', requireServerAppAuth, (req, res) => forwardToMainApi(req, res, `/orders/${encodeURIComponent(String(req.params.id))}/items`));
-    app.get('/api/customers-search', requireServerAppAuth, (req, res) => forwardToMainApi(req, res, '/customers-search'));
-    app.get('/api/crm/lookup', requireServerAppAuth, (req, res) => forwardToMainApi(req, res, '/crm/lookup'));
+          const db = getDatabase();
+          if (!userId || !rawPin) {
+            recordAuthAudit(db, {
+              userId: userId || null,
+              eventType: 'pin_login',
+              outcome: 'failure',
+              ipAddress: ip,
+              details: {
+                service: 'server-app',
+                reason:
+                  !userId && !rawPin
+                    ? 'missing_credentials'
+                    : !userId
+                      ? 'missing_user_id'
+                      : 'missing_pin',
+              },
+            });
+            return res.status(400).json({ error: 'user_id and pin are required' });
+          }
+
+          const remember = !!(remember_me ?? rememberMe);
+          const result = await authenticatePinLogin({
+            db,
+            userId,
+            rawPin,
+            ip,
+            remember,
+            service: 'server-app',
+            authorizeUser: (currentDb, currentUser) => {
+              if (!hasPermission(currentUser.id, 'server-app.use')) {
+                recordAuthAudit(currentDb, {
+                  userId: currentUser.id,
+                  eventType: 'pin_login',
+                  outcome: 'failure',
+                  ipAddress: ip,
+                  details: { service: 'server-app', reason: 'permission_denied' },
+                });
+                return {
+                  ok: false,
+                  status: 403,
+                  body: {
+                    error: 'Access denied. Only server, manager, or owner accounts allowed.',
+                    code: 'permission_denied',
+                  },
+                };
+              }
+              return { ok: true, extra: undefined };
+            },
+          });
+
+          if (result.status !== 200) {
+            return res.status(result.status).json(result.body);
+          }
+
+          const { token, user } = result;
+
+          res.json({
+            access_token: token,
+            user: {
+              id: user.id,
+              name: user.name,
+              email: user.email,
+              role: user.role,
+              has_pin: Boolean(user.pin_hash),
+              permission_ids: [...(resolveEffectivePermissions(user.id)?.permissionIds ?? [])],
+              authorization_revision: effectivePermissionRevision(user.id),
+            },
+          });
+        } catch (error: unknown) {
+          console.error('[Server App] PIN login error:', error);
+          res.status(500).json({ error: 'Internal server error' });
+        }
+      },
+    );
+
+    app.get(
+      '/api/auth/me',
+      serverAppApiRateLimit,
+      requireServerAppAuth,
+      (req: Request, res: Response) => {
+        const user = (req as any).user as ServerAppUser;
+        const row = getDatabase()
+          .prepare(
+            'SELECT id, name, email, role, pin_hash FROM users WHERE id = ? AND is_active = 1',
+          )
+          .get(user.userId) as any;
+        if (!row) return res.status(401).json({ error: 'Invalid token' });
+        res.json({
+          user: {
+            id: row.id,
+            name: row.name,
+            email: row.email,
+            role: row.role,
+            has_pin: Boolean(row.pin_hash),
+            permission_ids: [...(resolveEffectivePermissions(row.id)?.permissionIds ?? [])],
+            authorization_revision: effectivePermissionRevision(row.id),
+          },
+        });
+      },
+    );
+
+    app.post(
+      '/api/auth/password/change',
+      authRateLimit(),
+      requireServerAppAuth,
+      asyncHandler(handlePasswordChange),
+    );
+
+    app.post(
+      '/api/auth/pin/change',
+      authRateLimit(),
+      requireServerAppAuth,
+      asyncHandler(handlePinChange),
+    );
+
+    app.post(
+      '/api/auth/logout',
+      serverAppApiRateLimit,
+      requireServerAppAuth,
+      (req: Request, res: Response) => {
+        const token = req.headers.authorization?.split(' ')[1];
+        const user = (req as Request & { user: ServerAppUser }).user;
+        if (token) revokeToken(token, typeof user.exp === 'number' ? user.exp * 1000 : undefined);
+        res.json({ success: true });
+      },
+    );
+
+    app.get(
+      '/api/settings/auto_lock_minutes',
+      serverAppApiRateLimit,
+      requireServerAppAuth,
+      (req, res) => forwardToMainApi(req, res, '/settings/auto_lock_minutes'),
+    );
+    app.get('/api/categories', serverAppApiRateLimit, requireServerAppAuth, (req, res) =>
+      forwardToMainApi(req, res, '/categories'),
+    );
+    app.get('/api/products', serverAppApiRateLimit, requireServerAppAuth, (req, res) =>
+      forwardToMainApi(req, res, '/products'),
+    );
+    app.get('/api/products/:id/image', serverAppApiRateLimit, (req, res) => {
+      if (!isServerAppEnabled()) return res.status(404).json({ error: 'Not found' });
+      return forwardToMainApi(
+        req,
+        res,
+        `/products/${encodeURIComponent(String(req.params.id))}/image`,
+      );
+    });
+    app.get('/api/tables', serverAppApiRateLimit, requireServerAppAuth, (req, res) =>
+      forwardToMainApi(req, res, '/tables'),
+    );
+    app.post(
+      '/api/tables/:id/move-order',
+      serverAppApiRateLimit,
+      requireServerAppAuth,
+      (req, res) =>
+        forwardToMainApi(
+          req,
+          res,
+          `/tables/${encodeURIComponent(String(req.params.id))}/move-order`,
+        ),
+    );
+    app.get('/api/orders', serverAppApiRateLimit, requireServerAppAuth, (req, res) =>
+      forwardToMainApi(req, res, '/orders'),
+    );
+    app.post('/api/orders', serverAppApiRateLimit, requireServerAppAuth, (req, res) =>
+      forwardToMainApi(req, res, '/orders'),
+    );
+    app.post('/api/orders/:id/items', serverAppApiRateLimit, requireServerAppAuth, (req, res) =>
+      forwardToMainApi(req, res, `/orders/${encodeURIComponent(String(req.params.id))}/items`),
+    );
+    app.get('/api/customers-search', serverAppApiRateLimit, requireServerAppAuth, (req, res) =>
+      forwardToMainApi(req, res, '/customers-search'),
+    );
+    app.get('/api/crm/lookup', serverAppApiRateLimit, requireServerAppAuth, (req, res) =>
+      forwardToMainApi(req, res, '/crm/lookup'),
+    );
     const customerWriteRateLimit = expressRateLimit({
       windowMs: 60 * 1000,
       limit: 150,
       standardHeaders: true,
       legacyHeaders: false,
     });
-    app.post('/api/customers', customerWriteRateLimit, requireServerAppAuth, (req, res) => forwardToMainApi(req, res, '/customers'));
+    app.post('/api/customers', customerWriteRateLimit, requireServerAppAuth, (req, res) =>
+      forwardToMainApi(req, res, '/customers'),
+    );
     const printForwardRateLimit = expressRateLimit({
       windowMs: 60 * 1000,
       limit: 30,
       standardHeaders: true,
       legacyHeaders: false,
     });
-    app.post('/api/printers/print-kot', printForwardRateLimit, requireServerAppAuth, (req, res) => forwardToMainApi(req, res, '/printers/print-kot'));
-    app.post('/api/printers/print-bill', printForwardRateLimit, requireServerAppAuth, (req, res) => forwardToMainApi(req, res, '/printers/print-bill'));
+    app.post('/api/printers/print-kot', printForwardRateLimit, requireServerAppAuth, (req, res) =>
+      forwardToMainApi(req, res, '/printers/print-kot'),
+    );
+    app.post(
+      '/api/printers/print-bill',
+      printForwardRateLimit,
+      requireServerAppAuth,
+      (req, res) => {
+        if (!isServerBillPrintingEnabled()) {
+          return res.status(403).json({
+            error:
+              'Bill printing is disabled for the Server Companion App. An owner or manager can enable it in Settings.',
+            code: 'BILL_PRINTING_DISABLED',
+          });
+        }
+        return forwardToMainApi(req, res, '/printers/print-bill');
+      },
+    );
 
     const staticDir = getStaticDir();
     if (staticDir) {
@@ -321,7 +655,9 @@ export function startServerApp(): Promise<void> {
         if (routePath && fs.existsSync(routePath)) {
           res.sendFile(routePath, { dotfiles: 'allow' });
         } else {
-          res.sendFile(path.join(staticDir, 'server-standalone', 'index.html'), { dotfiles: 'allow' });
+          res.sendFile(path.join(staticDir, 'server-standalone', 'index.html'), {
+            dotfiles: 'allow',
+          });
         }
       });
     } else {
@@ -352,13 +688,19 @@ export function startServerApp(): Promise<void> {
       const attemptedPort = currentPort;
       const onListening = () => {
         if (stopping) {
-          try { listeningServer.close(); } catch { return; }
+          try {
+            listeningServer.close();
+          } catch {
+            return;
+          }
           return;
         }
         startReject = null;
         listeningServer.off('error', onError);
         setServerAppPort(attemptedPort);
-        console.log(`[Server App] HTTP server running on http://localhost:${getActiveServerAppPort()}`);
+        console.log(
+          `[Server App] HTTP server running on http://localhost:${getActiveServerAppPort()}`,
+        );
         resolve();
       };
       const onError = (err: NodeJS.ErrnoException) => {
@@ -373,7 +715,9 @@ export function startServerApp(): Promise<void> {
             return;
           }
           currentPort++;
-          console.log(`[Server App] Port ${attemptedPort} in use (${err.code}), trying ${currentPort}`);
+          console.log(
+            `[Server App] Port ${attemptedPort} in use (${err.code}), trying ${currentPort}`,
+          );
           tryListen();
           return;
         }
@@ -400,10 +744,9 @@ export function stopServerApp(): Promise<void> {
   // Mark the server unavailable immediately while active requests drain.
   serverApp = null;
 
-  stopPromise = closeServerResources(serverToClose, null, 'Server App')
-    .then(() => {
-      console.log('[Server App] HTTP server stopped');
-    });
+  stopPromise = closeServerResources(serverToClose, null, 'Server App').then(() => {
+    console.log('[Server App] HTTP server stopped');
+  });
   return stopPromise;
 }
 

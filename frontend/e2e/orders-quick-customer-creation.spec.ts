@@ -2,9 +2,28 @@ import { test, expect } from '@playwright/test';
 import fs from 'node:fs';
 import path from 'node:path';
 import { E2E_BASE_URL as BASE } from './helpers/urls';
-import { E2E_PASSWORD } from './helpers/test-auth';
+import {
+  E2E_PASSWORD,
+  readOrdersLayout,
+  setOrdersLayout,
+  type E2EOrdersLayout,
+} from './helpers/test-auth';
 
 const EVIDENCE_DIR = process.env.EVIDENCE_DIR;
+
+// #639 made the Orders screen default to the master/detail split view, so this
+// spec pins the classic cards grid before driving OrderCard affordances. The
+// evidence for why lives in frontend/e2e/orders-master-detail.spec.ts.
+let ordersLayoutBefore: E2EOrdersLayout = 'split';
+
+test.beforeEach(async ({ page }) => {
+  ordersLayoutBefore = await readOrdersLayout(page);
+  await setOrdersLayout(page, 'cards');
+});
+
+test.afterEach(async ({ page }) => {
+  await setOrdersLayout(page, ordersLayoutBefore);
+});
 
 test('Orders page creates a customer and links it to an active order', async ({ page }) => {
   const loginResponse = await page.request.post(`${BASE}/api/auth/login`, {
@@ -46,7 +65,9 @@ test('Orders page creates a customer and links it to an active order', async ({ 
 
   const modal = page.locator('div.fixed.inset-0').filter({ has: page.getByRole('heading', { name: 'Add Customer' }) });
   await expect(modal).toBeVisible();
-  await modal.locator('input[type="text"]').fill(customerName);
+  // The name field is the first textbox; the customer-address field added for
+  // #920 makes `input[type="text"]` ambiguous.
+  await modal.getByRole('textbox').first().fill(customerName);
   await modal.locator('input[type="tel"]').fill(customerPhone);
 
   if (EVIDENCE_DIR) {

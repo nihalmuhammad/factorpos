@@ -1,0 +1,186 @@
+# Business time
+
+FloCafe stores every timestamp in UTC and presents it in the tenant's configured timezone. The
+stored value is the record; the timezone is a presentation and boundary concern layered on top.
+Getting the two apart is the whole discipline on this page.
+
+The primitives live in [`main/db.ts`](../../main/db.ts) and are used by reports, cash closures,
+refunds, printing, and the frontend.
+
+## The storage convention
+
+`now()` writes the SQLite `CURRENT_TIMESTAMP` format: `YYYY-MM-DD HH:MM:SS`, in UTC, with no zone
+suffix and no fractional seconds.
+
+That form is **not** what `new Date(string)` expects. In V8, a space-delimited timestamp parses as
+machine-local time, so a naive parse shifts every reading by the developer's own UTC offset.
+
+`parseDbTimestamp` in [`main/db.ts`](../../main/db.ts) handles both stored forms: it converts
+space-delimited UTC strings (`YYYY-MM-DD ...` and extended `+YYYYYY-MM-DD ...` years) to ISO
+`T...Z` form so V8 parses them as UTC rather than machine-local time, passes ISO strings through,
+and returns an invalid `Date` for a missing value rather than the epoch, so a missing timestamp
+fails a comparison instead of silently reading as 1970.
+
+The frontend has the matching `parseDbTimestamp` helper in
+[`frontend/src/lib/utils.ts`](../../frontend/src/lib/utils.ts) for standard `YYYY-MM-DD` and ISO
+timestamps. Use one or the other; never call `new Date()` on a value that came out of the database.
+
+## Day boundaries
+
+A business day is a half-open UTC range `[start, end)` for one calendar date in an IANA timezone,
+optionally shifted by a configured day-start offset.
+
+| Function | Returns |
+| --- | --- |
+| `dayBoundsInTimezone(date, timezone, startTime?)` | The `[start, end)` pair, formatted as `YYYY-MM-DD HH:MM:SS` UTC strings. |
+| `utcDayBounds(date, startTime?)` | The same shape for a UTC calendar date, with no timezone applied. |
+| `localDateInTimezone(instant, timezone, startTime?)` | The `YYYY-MM-DD` business date an instant falls on. |
+| `utcTodayDate()` | Today's date in UTC, for the cases that are genuinely not tenant-scoped. |
+
+The day-start offset comes from the `business_day_start_time` setting through
+`tenantBusinessDayStartTime`, which accepts `00:00` through `11:59` and falls back to `00:00` for
+anything absent or malformed. A start time later than midday is rejected because a business day
+longer than twelve hours is not a thing a store configures.
+
+`dayBoundsInTimezone` resolves the zone offset with `Intl.DateTimeFormat` and iterates the
+local-to-UTC conversion up to three times, which is what makes it correct across a daylight-saving
+transition. If the timezone is unusable it falls back to `utcDayBounds`.
+
+`localDateInTimezone` with a non-zero day start compares the instant against the day's start bound;
+an instant that falls before the start belongs to the previous calendar date. That is what makes a
+store that opens at 06:00 not split its 01:00 trade into the previous day's revenue.
+
+## The trap: an unresolved timezone silently means UTC
+
+This is the single most consequential failure mode in the codebase, and it is silent.
+
+`dayBoundsInTimezone` and `localDateInTimezone` take a `timezone` **string**. They do not look one
+up. If you pass `undefined`, an empty string, or an invalid zone, the `Intl` calls throw, the
+`catch` runs, and you get `utcDayBounds` behaviour. No error, no log - just a UTC answer.
+
+That produces wrong numbers rather than a failure. A store in `Asia/Kolkata` would see its closing
+hour counted in the previous UTC day; a store in `America/New_York` would see its opening hour
+counted in the next one.
+
+**The rule: resolve the timezone through the regional snapshot, or you get UTC.**
+
+`resolveRegionalSnapshot` in [`main/countries.ts`](../../main/countries.ts) is the only supported
+resolver. It has no default country, so an unconfigured tenant throws `RegionalNotConfiguredError`
+(a `409`) rather than guessing.
+
+The three call sites that had to learn this each carry the same comment explaining the failure mode:
+
+```ts
+function tenantTimezone(): string {
+  return resolveRegionalSnapshot({
+    country: getSettingValue('country') ?? undefined,
+    currency: getSettingValue('currency') ?? undefined,
+    timezone: getSettingValue('timezone') ?? undefined,
+  }).timezone;
+}
+```
+
+- [`main/routes/reports.ts`](../../main/routes/reports.ts), `tenantTimezone`, guards
+  `bucketByLocalHourAndWeekday` and `dayBoundsInTimezone` in reporting.
+- [`main/services/cash-drawer-movements.ts`](../../main/services/cash-drawer-movements.ts) defines
+  `tenantTimezone` (re-exported by [`main/routes/cash-closures.ts`](../../main/routes/cash-closures.ts)
+  for `cash-sessions.ts` and imported by [`main/routes/bills.ts`](../../main/routes/bills.ts)) so that
+  cash closures, shift sessions, and bill business-day checks resolve the same window rather than a
+  second, divergent one.
+- [`main/services/refund.ts`](../../main/services/refund.ts) resolves inline, because a wrong
+  business-day end there can wrongly accept or reject a manager-approved refund.
+
+Pass `getSettingValue('timezone')` straight into `dayBoundsInTimezone` and you have reintroduced
+the trap. Go through the snapshot.
+
+## Where the boundaries are applied
+
+### Reporting
+
+`main/routes/reports.ts` builds today's date and any requested date range from
+`dayBoundsInTimezone(date, tenantTimezone(), tenantStartTime())`, and buckets rows by local hour and
+weekday from the same resolved zone. Row-level dates use `localDateInTimezone` so a sale is
+attributed to the business date on which it happened in the store, not the one in UTC.
+
+### Cash closures
+
+`main/routes/cash-closures.ts` computes `todayLocal` the same way, and derives the start of the first
+day and the end of the last day from `dayBoundsInTimezone` at both ends. Cash movements, X-reports,
+and the day-close Z-report all key off the resulting `businessDate`, which is why a day-close total
+and a sales report for the same day agree.
+
+Shift session closures (`scope = 'session'` in `main/routes/cash-sessions.ts`) record their actual
+UTC `[period_start, period_end]` window (`opened_at` to `closed_at`), but file `business_date` under
+the shift's opening business date via `sessionBusinessDate(db, session)` (`opened_at` evaluated in
+the store timezone and `business_day_start_time` cutoff). A shift that crosses midnight or the
+business-day cutoff therefore stays filed under the business date on which it opened, while daily
+reporting and day-close aggregates continue to bound sales by each business day's `[start, end)`
+window.
+
+When the opt-in setting `one_shift_per_staff` is `'false'` (the default), at most one shift may be
+open across the store at a time. When `one_shift_per_staff` is `'true'`, each staff member can open
+and close at most one shift of their own (`cash_sessions_one_open_per_user` on `(opened_by) WHERE status = 'open'`).
+Cash payments, cash refunds, drawer movements, and cash expense entries attach to the authenticated
+actor's open shift (`getOpenSession(db, userId)`). Day close (`POST /api/cash-closures`) is blocked
+(`409 open_shift_blocks_day_close`) until all shifts opened on or before that business date are
+closed, and reconciles the combined day totals across all shifts (summing per-staff shift opening
+floats into the day's `opening_float` drawer movement). Two concurrent shifts sharing a single
+physical cash drawer are permitted, though individual shift drawer counts cannot be physically
+isolated in a shared drawer. For cross-shift bill tax attribution on shift X/Z reports, see
+[Taxation](taxation.md#where-the-amount-came-from).
+
+### Refunds
+
+`main/services/refund.ts` bounds manager refund approval by the anchor timestamp's
+(`released_at || created_at`) business day, computed with `localDateInTimezone` and
+`dayBoundsInTimezone`, alongside the configured `refund_manager_window` duration. `parseDbTimestamp`
+is used on both ends of that comparison so the boundary is evaluated as a UTC instant rather than a
+string comparison. See
+[product invariants](../reference/product-invariants.md#refunds-and-staff-approval-pins) for the
+approval tiers and refund policy settings.
+
+### Scheduled kitchen release
+
+Scheduled takeaway and delivery orders ([Order lifecycle](order-lifecycle.md#scheduled-orders-and-kitchen-release))
+accept `"Send to kitchen at"` (`scheduled_for`) through [`shared/scheduled-time.ts`](../../shared/scheduled-time.ts)
+and [`main/services/scheduled-orders.ts`](../../main/services/scheduled-orders.ts), resolving the
+store timezone via `resolveRegionalSnapshot`.
+
+- Wall-clock inputs (`YYYY-MM-DDTHH:MM` without an offset) are interpreted in the store timezone.
+  `parseScheduledForInput` probes surrounding candidate instants across `+-16` hours in 15-minute
+  steps and formats each back through `Intl.DateTimeFormat` in that IANA zone:
+  - Zero matching instants rejects nonexistent spring-forward daylight-saving times (`400` with
+    `DST_NONEXISTENT_TIME`).
+  - Multiple matching instants rejects ambiguous repeated fall-back daylight-saving times (`400`
+    with `DST_AMBIGUOUS_TIME`).
+  - Instants at or before the current UTC time are rejected (`400` with `PAST_SCHEDULED_TIME`).
+- Accepted inputs are persisted in `orders.scheduled_for` as canonical UTC ISO instants
+  (`YYYY-MM-DDTHH:MM:SS.sssZ`). Changing the store `timezone` setting later changes how the instant
+  is formatted for display, while preserving the exact saved UTC release instant.
+
+### Printing
+
+`main/printers/document-classic.ts`, `document-compact.ts`, and `document-kot.ts` all parse the
+document's timestamp with `parseDbTimestamp` and format it for the requested locale and timezone.
+The print timezone comes from the print language policy, not from the host machine, so a receipt
+prints the store's local time regardless of which machine renders it.
+
+## Frontend boundaries
+
+The renderer does not compute business days. It receives `businessDate` and the report rows from the
+API and renders them, and the only timestamp parsing it does is `parseDbTimestamp` for display
+values such as elapsed KDS time and image cache keys.
+
+## Verifying a change here
+
+| Concern | Command |
+| --- | --- |
+| Day and reporting boundaries across zones | `npm run test:timezone-report-boundaries` |
+| Stored timezone override | `npm run test:issue-389-timezone-override` |
+| Regional resolution contract | `npm run test:currency`, `npm run test:country-provenance` |
+| Server-side rendering of dates | `npm run test:i18n-ssr-timezone` |
+| Scheduled order timezone and DST rules | `npm run test:scheduled-orders` |
+
+When you add a code path that buckets or bounds time by day, test it at a tenant offset from UTC
+and across a daylight-saving transition. Both are covered by
+`tests/timezone-report-boundaries.test.ts`.

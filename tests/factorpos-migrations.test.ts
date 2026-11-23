@@ -10,13 +10,21 @@ const path = require('path');
 
 let activeTestDir = '';
 Module._load = function (request: string, parent: unknown, isMain: boolean) {
-  if (request === 'electron') return { app: { isPackaged: true, getPath: () => activeTestDir, getVersion: () => 'test' } };
+  if (request === 'electron')
+    return { app: { isPackaged: true, getPath: () => activeTestDir, getVersion: () => 'test' } };
   return originalLoad.apply(this, arguments as any);
 };
 
 const {
-  initDatabase, getDatabase, getCurrentSchemaVersion, MIGRATIONS, FACTORPOS_MIGRATIONS,
-  closeDatabase, buildIdealSchemaDb, SchemaVersionMismatchError,
+  initDatabase,
+  getDatabase,
+  getCurrentSchemaVersion,
+  MIGRATIONS,
+  FACTORPOS_MIGRATIONS,
+  closeDatabase,
+  buildIdealSchemaDb,
+  SchemaVersionMismatchError,
+  getTables,
 } = require('../main/db');
 
 const TOKEN_MIGRATION_ID = '2026-09-28-add-daily-close-token-number';
@@ -35,16 +43,36 @@ function freshDir(label: string) {
 }
 
 function hasTokenColumn(db: any): boolean {
-  return (db.prepare('PRAGMA table_info(orders)').all() as Array<{ name: string }>).some((column) => column.name === 'token_number');
+  return (db.prepare('PRAGMA table_info(orders)').all() as Array<{ name: string }>).some(
+    (column) => column.name === 'token_number',
+  );
 }
 
 function appliedIds(db: any): string[] {
-  return (db.prepare('SELECT id FROM _factorpos_migrations ORDER BY id').all() as Array<{ id: string }>).map((row) => row.id);
+  return (
+    db.prepare('SELECT id FROM _factorpos_migrations ORDER BY id').all() as Array<{ id: string }>
+  ).map((row) => row.id);
 }
 
 function backups(pattern: RegExp): string[] {
   const dir = path.join(activeTestDir, 'backups');
   return fs.existsSync(dir) ? fs.readdirSync(dir).filter((name: string) => pattern.test(name)) : [];
+}
+
+const ALL_MIGRATIONS = MIGRATIONS.slice();
+
+/** Opens a database built only from FloCafe 3.9.0's migrations (v84), like an old FactorPOS shop PC. */
+function initLegacyBaseDatabase() {
+  MIGRATIONS.splice(
+    0,
+    MIGRATIONS.length,
+    ...ALL_MIGRATIONS.filter((migration: any) => migration.version <= 84),
+  );
+  try {
+    initDatabase();
+  } finally {
+    MIGRATIONS.splice(0, MIGRATIONS.length, ...ALL_MIGRATIONS);
+  }
 }
 
 /** Rewinds the current database to the state an older FactorPOS build left it in. */
@@ -60,15 +88,23 @@ function rewindToLegacy(version: number, keepToken: boolean) {
 }
 
 function main() {
-  assert(MIGRATIONS.every((migration: any) => migration.name !== 'add_daily_close_token_number'),
-    'no FactorPOS migration uses an upstream schema number');
+  assert(
+    MIGRATIONS.every((migration: any) => migration.name !== 'add_daily_close_token_number'),
+    'no FactorPOS migration uses an upstream schema number',
+  );
 
   freshDir('fresh');
   initDatabase();
   let db = getDatabase();
-  assert(getCurrentSchemaVersion() === UPSTREAM_TARGET, 'fresh install stays on upstream numbering');
+  assert(
+    getCurrentSchemaVersion() === UPSTREAM_TARGET,
+    'fresh install stays on upstream numbering',
+  );
   assert(hasTokenColumn(db), 'fresh install includes orders.token_number');
-  assert(appliedIds(db).length === FACTORPOS_MIGRATIONS.length, 'fresh install records every FactorPOS migration');
+  assert(
+    appliedIds(db).length === FACTORPOS_MIGRATIONS.length,
+    'fresh install records every FactorPOS migration',
+  );
   closeDatabase();
 
   const ideal = buildIdealSchemaDb();
@@ -77,41 +113,93 @@ function main() {
 
   // Shop databases from FactorPOS 3.9.0–3.9.1-beta.1 sit at user_version 85.
   freshDir('legacy-v85');
-  initDatabase();
-  getDatabase().prepare(`INSERT INTO orders (order_number, type, status, token_number) VALUES ('ORD-LEGACY-85', 'takeaway', 'completed', 7)`).run();
+  initLegacyBaseDatabase();
+  getDatabase()
+    .prepare(
+      `INSERT INTO orders (order_number, type, status, token_number) VALUES ('ORD-LEGACY-85', 'takeaway', 'completed', 7)`,
+    )
+    .run();
   rewindToLegacy(85, true);
   initDatabase();
   db = getDatabase();
-  assert(getCurrentSchemaVersion() === UPSTREAM_TARGET, 'legacy v85 database rejoins upstream numbering');
-  assert(appliedIds(db).includes(TOKEN_MIGRATION_ID), 'legacy token migration is recorded as applied');
-  const legacy = db.prepare(`SELECT token_number FROM orders WHERE order_number = 'ORD-LEGACY-85'`).get() as any;
+  assert(
+    getCurrentSchemaVersion() === UPSTREAM_TARGET,
+    'legacy v85 database rejoins upstream numbering and runs FloCafe v85+',
+  );
+  assert(
+    getTables(db).includes('inventory_movements'),
+    "FloCafe's own v85 (inventory_movements) ran after the repair",
+  );
+  assert(
+    appliedIds(db).includes(TOKEN_MIGRATION_ID),
+    'legacy token migration is recorded as applied',
+  );
+  const legacy = db
+    .prepare(`SELECT token_number FROM orders WHERE order_number = 'ORD-LEGACY-85'`)
+    .get() as any;
   assert(legacy?.token_number === 7, 'repair keeps existing orders and their tokens');
   assert(backups(/pre-v85-to-v84\.db$/).length === 1, 'repair takes a backup first');
   const backupCount = backups(/\.db$/).length;
   closeDatabase();
   initDatabase();
-  assert(getCurrentSchemaVersion() === UPSTREAM_TARGET && backups(/\.db$/).length === backupCount, 'restart after repair is a no-op');
+  assert(
+    getCurrentSchemaVersion() === UPSTREAM_TARGET && backups(/\.db$/).length === backupCount,
+    'restart after repair is a no-op',
+  );
   closeDatabase();
 
   // A v84 database from before the token feature gets the column through the FactorPOS track.
   freshDir('v84');
-  initDatabase();
-  getDatabase().prepare(`INSERT INTO orders (order_number, type, status) VALUES ('ORD-LEGACY-84', 'takeaway', 'completed')`).run();
+  initLegacyBaseDatabase();
+  getDatabase()
+    .prepare(
+      `INSERT INTO orders (order_number, type, status) VALUES ('ORD-LEGACY-84', 'takeaway', 'completed')`,
+    )
+    .run();
   rewindToLegacy(84, false);
   initDatabase();
   db = getDatabase();
   assert(hasTokenColumn(db), 'v84 upgrade adds orders.token_number');
   assert(getCurrentSchemaVersion() === UPSTREAM_TARGET, 'v84 upgrade keeps upstream numbering');
-  const old = db.prepare(`SELECT token_number FROM orders WHERE order_number = 'ORD-LEGACY-84'`).get() as any;
+  const old = db
+    .prepare(`SELECT token_number FROM orders WHERE order_number = 'ORD-LEGACY-84'`)
+    .get() as any;
   assert(old && old.token_number === null, 'v84 upgrade preserves existing orders');
-  assert(backups(/pre-v84-to-v84\.db$/).length === 1, 'FactorPOS-only migration takes a backup first');
+  assert(backups(/pre-v84-to-v125\.db$/).length === 1, 'upgrade takes a backup first');
   closeDatabase();
 
-  // A real upstream v85 (inventory_movements exists) must not be mistaken for FactorPOS.
+  // A database that really ran FloCafe's v85 (inventory_movements exists) must not be rewound.
   freshDir('upstream-v85');
+  MIGRATIONS.splice(
+    0,
+    MIGRATIONS.length,
+    ...ALL_MIGRATIONS.filter((migration: any) => migration.version <= 85),
+  );
+  try {
+    initDatabase();
+  } finally {
+    MIGRATIONS.splice(0, MIGRATIONS.length, ...ALL_MIGRATIONS);
+  }
+  assert(
+    getCurrentSchemaVersion() === 85 && getTables(getDatabase()).includes('inventory_movements'),
+    'fixture ran FloCafe v85',
+  );
+  closeDatabase();
   initDatabase();
-  getDatabase().exec('CREATE TABLE inventory_movements (id INTEGER PRIMARY KEY)');
-  getDatabase().pragma('user_version = 85');
+  assert(
+    backups(/pre-v85-to-v84\.db$/).length === 0,
+    'an upstream-owned v85 database is not rewound',
+  );
+  assert(
+    getCurrentSchemaVersion() === UPSTREAM_TARGET,
+    'an upstream-owned v85 database upgrades normally',
+  );
+  closeDatabase();
+
+  // A database newer than this build is still refused, never rewritten.
+  freshDir('newer');
+  initDatabase();
+  getDatabase().pragma(`user_version = ${UPSTREAM_TARGET + 1}`);
   closeDatabase();
   let mismatch = false;
   try {
@@ -119,8 +207,10 @@ function main() {
   } catch (error) {
     mismatch = error instanceof SchemaVersionMismatchError;
   }
-  assert(mismatch, 'an upstream-owned v85 database is reported as newer, not rewritten');
-  try { closeDatabase(); } catch { }
+  assert(mismatch, 'a newer database is reported as newer, not rewritten');
+  try {
+    closeDatabase();
+  } catch {}
 
   fs.rmSync(activeTestDir, { recursive: true, force: true });
   console.log(`\n${passed}/${passed} passed`);

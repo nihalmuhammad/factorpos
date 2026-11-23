@@ -2,15 +2,19 @@ import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
 import type { Language } from '@/lib/i18n';
 import { defaultPrintLanguagePolicy } from '@print/policy';
-import type {
-  KotLanguagePolicy,
-  ReceiptLanguagePolicy,
-} from '@print/types';
+import type { KotLanguagePolicy, ReceiptLanguagePolicy } from '@print/types';
 
 export type PaperSize = 'thermal58' | 'thermal80';
 export type PrinterPrintMode = 'escpos' | 'browser';
 export type CoreBillTemplate = 'classic' | 'compact';
 export type BillTemplate = CoreBillTemplate | (string & {});
+export type AutoLockMinutes = 0 | 1 | 5 | 15 | 30;
+
+export function normalizeAutoLockMinutesValue(value: unknown): AutoLockMinutes {
+  const num = typeof value === 'number' ? value : Number(String(value ?? '0').trim());
+  if (num === 1 || num === 5 || num === 15 || num === 30) return num;
+  return 0;
+}
 
 export interface PosSettingsState {
   showProductImages: boolean;
@@ -37,6 +41,9 @@ export interface PosSettingsState {
   billTaxRegistrationNumber: string;
   billAddress: string;
   billPhone: string;
+  receiptLogo: string;
+  receiptLogoRaster: string;
+  billShowLogo: boolean;
   billShowName: boolean;
   billShowAddress: boolean;
   billShowPhone: boolean;
@@ -44,7 +51,9 @@ export interface PosSettingsState {
   billShowTaxBreakdown: boolean;
   billShowCustomerName: boolean;
   billShowCustomerPhone: boolean;
+  billDeliveryShowCustomerPhoneAlways: boolean;
   billShowTableNumber: boolean;
+  billShowLargeOrderNumber: boolean;
   // Thermal printer unicode support
   printerUseUnicode: boolean;
   // Printer firmware Arabic/Persian shaping; disabled by default for generic hardware.
@@ -59,10 +68,13 @@ export interface PosSettingsState {
   // Print language policies synced from backend settings.
   billLanguagePolicy: ReceiptLanguagePolicy;
   kotLanguagePolicy: KotLanguagePolicy;
+  // Idle auto-lock timeout in minutes (0 = off).
+  autoLockMinutes: AutoLockMinutes;
   // Actions
   setShowProductImages: (show: boolean) => void;
   setCustomerMandatory: (mandatory: boolean) => void;
   setEnforcePhoneLength: (enabled: boolean) => void;
+  setAutoLockMinutes: (minutes: AutoLockMinutes) => void;
   setLanguage: (lang: Language) => void;
   setPrinterPaperSize: (size: PaperSize) => void;
   setPrinterEnabled: (enabled: boolean) => void;
@@ -77,6 +89,9 @@ export interface PosSettingsState {
   setBillTaxRegistrationNumber: (g: string) => void;
   setBillAddress: (a: string) => void;
   setBillPhone: (p: string) => void;
+  setReceiptLogo: (l: string) => void;
+  setReceiptLogoRaster: (r: string) => void;
+  setBillShowLogo: (v: boolean) => void;
   setBillShowName: (v: boolean) => void;
   setBillShowAddress: (v: boolean) => void;
   setBillShowPhone: (v: boolean) => void;
@@ -84,7 +99,9 @@ export interface PosSettingsState {
   setBillShowTaxBreakdown: (v: boolean) => void;
   setBillShowCustomerName: (v: boolean) => void;
   setBillShowCustomerPhone: (v: boolean) => void;
+  setBillDeliveryShowCustomerPhoneAlways: (v: boolean) => void;
   setBillShowTableNumber: (v: boolean) => void;
+  setBillShowLargeOrderNumber: (v: boolean) => void;
   setBillingType: (v: 'postpaid' | 'prepaid') => void;
   setTablesRequired: (v: boolean) => void;
   setPrinterUseUnicode: (v: boolean) => void;
@@ -95,6 +112,49 @@ export interface PosSettingsState {
   setWhatsappEnabled: (v: boolean) => void;
   setBillLanguagePolicy: (policy: ReceiptLanguagePolicy) => void;
   setKotLanguagePolicy: (policy: KotLanguagePolicy) => void;
+  hydrateReceiptSettings: (data: ReceiptSettingsHydrationData) => void;
+}
+
+export interface ReceiptSettingsHydrationData {
+  bill_show_logo?: boolean | string | null;
+  billShowLogo?: boolean | string | null;
+  bill_show_name?: boolean | string | null;
+  billShowName?: boolean | string | null;
+  bill_show_address?: boolean | string | null;
+  billShowAddress?: boolean | string | null;
+  bill_show_phone?: boolean | string | null;
+  billShowPhone?: boolean | string | null;
+  bill_show_tax_id?: boolean | string | null;
+  billShowTaxId?: boolean | string | null;
+  bill_show_tax_breakdown?: boolean | string | null;
+  billShowTaxBreakdown?: boolean | string | null;
+  bill_show_customer_name?: boolean | string | null;
+  billShowCustomerName?: boolean | string | null;
+  bill_show_customer_phone?: boolean | string | null;
+  billShowCustomerPhone?: boolean | string | null;
+  bill_delivery_show_customer_phone_always?: boolean | string | null;
+  billDeliveryShowCustomerPhoneAlways?: boolean | string | null;
+  bill_show_table_number?: boolean | string | null;
+  billShowTableNumber?: boolean | string | null;
+  bill_show_large_order_number?: boolean | string | null;
+  billShowLargeOrderNumber?: boolean | string | null;
+  receipt_logo?: string | null;
+  receiptLogo?: string | null;
+  receipt_logo_raster?: string | null;
+  receiptLogoRaster?: string | null;
+  tax_registration_number?: string | null;
+  business_address?: string | null;
+  business_phone?: string | null;
+  bill_footer_message?: string | null;
+  bill_template?: string | null;
+  billTemplate?: string | null;
+  billTemplateSource?: 'core' | 'pack' | 'merchant' | null;
+  billing_type?: string | null;
+  billingType?: string | null;
+  tables_required?: boolean | string | null;
+  tablesRequired?: boolean | string | null;
+  auto_lock_minutes?: number | string | null;
+  autoLockMinutes?: number | string | null;
 }
 
 export const usePosSettingsStore = create<PosSettingsState>()(
@@ -122,6 +182,9 @@ export const usePosSettingsStore = create<PosSettingsState>()(
       billTaxRegistrationNumber: '',
       billAddress: '',
       billPhone: '',
+      receiptLogo: '',
+      receiptLogoRaster: '',
+      billShowLogo: false,
       billShowName: true,
       billShowAddress: true,
       billShowPhone: true,
@@ -129,7 +192,9 @@ export const usePosSettingsStore = create<PosSettingsState>()(
       billShowTaxBreakdown: true,
       billShowCustomerName: true,
       billShowCustomerPhone: true,
+      billDeliveryShowCustomerPhoneAlways: true,
       billShowTableNumber: true,
+      billShowLargeOrderNumber: true,
       printerUseUnicode: false,
       printerArabicShaping: false,
       printerTrimDecimals: false,
@@ -142,10 +207,13 @@ export const usePosSettingsStore = create<PosSettingsState>()(
       // the backend settings API (#441).
       billLanguagePolicy: defaultPrintLanguagePolicy(),
       kotLanguagePolicy: defaultPrintLanguagePolicy(),
+      autoLockMinutes: 0,
       // Actions
       setShowProductImages: (show) => set({ showProductImages: show }),
       setCustomerMandatory: (mandatory) => set({ customerMandatory: mandatory }),
       setEnforcePhoneLength: (enabled) => set({ enforcePhoneLength: enabled }),
+      setAutoLockMinutes: (autoLockMinutes) =>
+        set({ autoLockMinutes: normalizeAutoLockMinutesValue(autoLockMinutes) }),
       setLanguage: (language) => set({ language }),
       setPrinterPaperSize: (size) => set({ printerPaperSize: size }),
       setPrinterEnabled: (enabled) => set({ printerEnabled: enabled }),
@@ -160,6 +228,9 @@ export const usePosSettingsStore = create<PosSettingsState>()(
       setBillTaxRegistrationNumber: (g) => set({ billTaxRegistrationNumber: g }),
       setBillAddress: (a) => set({ billAddress: a }),
       setBillPhone: (p) => set({ billPhone: p }),
+      setReceiptLogo: (l) => set({ receiptLogo: l }),
+      setReceiptLogoRaster: (r) => set({ receiptLogoRaster: r }),
+      setBillShowLogo: (v) => set({ billShowLogo: v }),
       setBillShowName: (v) => set({ billShowName: v }),
       setBillShowAddress: (v) => set({ billShowAddress: v }),
       setBillShowPhone: (v) => set({ billShowPhone: v }),
@@ -167,7 +238,10 @@ export const usePosSettingsStore = create<PosSettingsState>()(
       setBillShowTaxBreakdown: (v) => set({ billShowTaxBreakdown: v }),
       setBillShowCustomerName: (v) => set({ billShowCustomerName: v }),
       setBillShowCustomerPhone: (v) => set({ billShowCustomerPhone: v }),
+      setBillDeliveryShowCustomerPhoneAlways: (v) =>
+        set({ billDeliveryShowCustomerPhoneAlways: v }),
       setBillShowTableNumber: (v) => set({ billShowTableNumber: v }),
+      setBillShowLargeOrderNumber: (v) => set({ billShowLargeOrderNumber: v }),
       setBillingType: (v) => set({ billingType: v }),
       setTablesRequired: (v) => set({ tablesRequired: v }),
       setPrinterUseUnicode: (v) => set({ printerUseUnicode: v }),
@@ -178,15 +252,132 @@ export const usePosSettingsStore = create<PosSettingsState>()(
       setWhatsappEnabled: (v: boolean) => set({ whatsappEnabled: v }),
       setBillLanguagePolicy: (billLanguagePolicy) => set({ billLanguagePolicy }),
       setKotLanguagePolicy: (kotLanguagePolicy) => set({ kotLanguagePolicy }),
+      hydrateReceiptSettings: (d) =>
+        set(() => {
+          const updates: Partial<PosSettingsState> = {};
+          const showLogo = d.bill_show_logo ?? d.billShowLogo;
+          if (showLogo !== undefined && showLogo !== null) {
+            updates.billShowLogo = showLogo === true || showLogo === 'true';
+          }
+          const showName = d.bill_show_name ?? d.billShowName;
+          if (showName !== undefined && showName !== null) {
+            updates.billShowName = showName !== false && showName !== 'false';
+          }
+          const showAddress = d.bill_show_address ?? d.billShowAddress;
+          if (showAddress !== undefined && showAddress !== null) {
+            updates.billShowAddress = showAddress !== false && showAddress !== 'false';
+          }
+          const showPhone = d.bill_show_phone ?? d.billShowPhone;
+          if (showPhone !== undefined && showPhone !== null) {
+            updates.billShowPhone = showPhone !== false && showPhone !== 'false';
+          }
+          const showTaxId = d.bill_show_tax_id ?? d.billShowTaxId;
+          if (showTaxId !== undefined && showTaxId !== null) {
+            updates.billShowTaxId = showTaxId === true || showTaxId === 'true';
+          }
+          const showTaxBreakdown = d.bill_show_tax_breakdown ?? d.billShowTaxBreakdown;
+          if (showTaxBreakdown !== undefined && showTaxBreakdown !== null) {
+            updates.billShowTaxBreakdown =
+              showTaxBreakdown !== false && showTaxBreakdown !== 'false';
+          }
+          const showCustName = d.bill_show_customer_name ?? d.billShowCustomerName;
+          if (showCustName !== undefined && showCustName !== null) {
+            updates.billShowCustomerName = showCustName !== false && showCustName !== 'false';
+          }
+          const showCustPhone = d.bill_show_customer_phone ?? d.billShowCustomerPhone;
+          if (showCustPhone !== undefined && showCustPhone !== null) {
+            updates.billShowCustomerPhone = showCustPhone !== false && showCustPhone !== 'false';
+          }
+          const showDeliveryPhone =
+            d.bill_delivery_show_customer_phone_always ?? d.billDeliveryShowCustomerPhoneAlways;
+          if (showDeliveryPhone !== undefined && showDeliveryPhone !== null) {
+            updates.billDeliveryShowCustomerPhoneAlways =
+              showDeliveryPhone !== false && showDeliveryPhone !== 'false';
+          }
+          const showTableNum = d.bill_show_table_number ?? d.billShowTableNumber;
+          if (showTableNum !== undefined && showTableNum !== null) {
+            updates.billShowTableNumber = showTableNum !== false && showTableNum !== 'false';
+          }
+          const showLargeOrderNum = d.bill_show_large_order_number ?? d.billShowLargeOrderNumber;
+          if (showLargeOrderNum !== undefined && showLargeOrderNum !== null) {
+            updates.billShowLargeOrderNumber =
+              showLargeOrderNum !== false && showLargeOrderNum !== 'false';
+          }
+          const logo = d.receipt_logo ?? d.receiptLogo;
+          if (logo !== undefined) {
+            updates.receiptLogo = logo || '';
+          }
+          const logoRaster = d.receipt_logo_raster ?? d.receiptLogoRaster;
+          if (logoRaster !== undefined) {
+            updates.receiptLogoRaster = logoRaster || '';
+          }
+          if (d.tax_registration_number !== undefined) {
+            updates.billTaxRegistrationNumber = d.tax_registration_number || '';
+          }
+          if (d.business_address !== undefined) {
+            updates.billAddress = d.business_address || '';
+          }
+          if (d.business_phone !== undefined) {
+            updates.billPhone = d.business_phone || '';
+          }
+          if (d.bill_footer_message !== undefined) {
+            updates.billFooterMessage = d.bill_footer_message || '';
+          }
+          const template = d.bill_template ?? d.billTemplate;
+          if (template !== undefined && template !== null) {
+            let templateId = String(template);
+            let templateSource: 'core' | 'pack' | 'merchant' | null = d.billTemplateSource ?? null;
+            if (templateId.trim().startsWith('{')) {
+              try {
+                const parsed = JSON.parse(templateId);
+                if (parsed && typeof parsed.id === 'string') {
+                  templateId = parsed.id;
+                  if (
+                    parsed.source === 'core' ||
+                    parsed.source === 'pack' ||
+                    parsed.source === 'merchant'
+                  ) {
+                    templateSource = parsed.source;
+                  }
+                }
+              } catch {
+                /* keep raw */
+              }
+            }
+            updates.billTemplate = templateId;
+            updates.billTemplateSource = templateSource ?? 'core';
+          }
+          const billingType = d.billing_type ?? d.billingType;
+          if (billingType !== undefined && billingType !== null) {
+            updates.billingType = billingType === 'prepaid' ? 'prepaid' : 'postpaid';
+          }
+          const tablesReq = d.tables_required ?? d.tablesRequired;
+          if (tablesReq !== undefined && tablesReq !== null) {
+            updates.tablesRequired =
+              typeof tablesReq === 'boolean' ? tablesReq : tablesReq !== 'false';
+          }
+          const autoLock = d.auto_lock_minutes ?? d.autoLockMinutes;
+          if (autoLock !== undefined && autoLock !== null) {
+            updates.autoLockMinutes = normalizeAutoLockMinutesValue(autoLock);
+          }
+          return updates;
+        }),
     }),
     {
       name: 'pos-settings',
-      // Exclude backend-synced fields (WhatsApp, print policies) from persistence.
-      partialize: (s) => Object.fromEntries(
-        Object.entries(s).filter(([k]) => k !== 'whatsappEnabled' && k !== 'billLanguagePolicy' && k !== 'kotLanguagePolicy'),
-      ) as PosSettingsState,
+      // Exclude backend-synced fields (WhatsApp, print policies, auto-lock) from persistence.
+      partialize: (s) =>
+        Object.fromEntries(
+          Object.entries(s).filter(
+            ([k]) =>
+              k !== 'whatsappEnabled' &&
+              k !== 'billLanguagePolicy' &&
+              k !== 'kotLanguagePolicy' &&
+              k !== 'autoLockMinutes',
+          ),
+        ) as PosSettingsState,
       // Migrates legacy store keys (GSTIN rename, removed A4/A5 paper sizes).
-      version: 3,
+      version: 6,
       migrate: (persisted, version) => {
         const state = persisted as Record<string, unknown>;
         if (version < 1) {
@@ -206,15 +397,29 @@ export const usePosSettingsStore = create<PosSettingsState>()(
           }
         }
         if (version < 3) {
-          if (!state.printerPaperSize && state.webPrintSize) state.printerPaperSize = state.webPrintSize;
+          if (!state.printerPaperSize && state.webPrintSize)
+            state.printerPaperSize = state.webPrintSize;
           delete state.webPrintSize;
           state.billShowTaxBreakdown ??= true;
           state.billShowCustomerName ??= true;
           state.billShowCustomerPhone ??= true;
           state.billShowTableNumber ??= true;
         }
+        if (version < 4) {
+          // Added after v3, which a store already at v3 never runs, so the field
+          // would stay undefined and the save would send nothing for it.
+          state.billDeliveryShowCustomerPhoneAlways ??= true;
+        }
+        if (version < 5) {
+          state.receiptLogo ??= '';
+          state.receiptLogoRaster ??= '';
+          state.billShowLogo ??= false;
+        }
+        if (version < 6) {
+          state.billShowLargeOrderNumber ??= true;
+        }
         return state as unknown as PosSettingsState;
       },
-    }
-  )
+    },
+  ),
 );

@@ -6,19 +6,32 @@ import {
   type LabelResolver,
   type KotDocument,
   type KotPrintData,
+  optionalPaymentAmount,
+  type PaymentSnapshot,
   type PrintContext,
   type PrintData,
   type PrintDocument,
 } from '@print/document';
 import { defaultPrintLanguagePolicy, resolveReceiptLanguages } from '@print/policy';
-import type { PrintLanguageCode, ReceiptLanguagePolicy, ResolvedPrintLanguages } from '@print/types';
+import type {
+  PrintLanguageCode,
+  ReceiptLanguagePolicy,
+  ResolvedPrintLanguages,
+} from '@print/types';
 import { createTranslator } from 'use-intl/core';
-import { getCachedMessages, loadLocaleMessages } from '@/lib/i18n/loader';
+import { getCachedMessages } from '@/lib/i18n/loader';
 import { LANGUAGES, getLanguageDirection, type Language } from '@/lib/i18n/languages';
+import {
+  awaitPrintPolicyBootstrap,
+  loadPrintLocaleWithDeadline,
+} from '@/lib/print-policy-bootstrap';
 import { usePosSettingsStore } from '@/store/pos-settings';
 import { getCountryByCode, getCurrencySymbol, resolveTenantCurrency } from '@countries';
 import { resolveTaxComponents } from './tax-components';
+import { shouldShowCustomerNumber } from '@print/document';
 import type { Bill, Order, OrderItem } from '@/lib/types';
+import { formatItemHeading } from './item-heading';
+import { isExcludedFromBillReceipt } from '../../../../shared/order-item-status';
 
 /** Business contact facts and visibility flags for one bill print run. */
 export interface BillBusinessOptions {
@@ -36,9 +49,14 @@ export interface BillBusinessOptions {
   useBillCustomer?: boolean;
   showTaxBreakdown?: boolean;
   showBusinessName?: boolean;
+  showLogo?: boolean;
+  receiptLogo?: string;
+  receiptLogoRaster?: string;
   showCustomerName?: boolean;
   showCustomerPhone?: boolean;
+  deliveryShowCustomerPhoneAlways?: boolean;
   showTableNumber?: boolean;
+  showLargeOrderNumber?: boolean;
   isReprint?: boolean;
 }
 
@@ -69,6 +87,14 @@ export function resolveBillPrintLanguages(uiLanguage?: Language): ResolvedPrintL
   return resolveReceiptLanguages(policy, resolveActiveUiLanguage(uiLanguage));
 }
 
+/** Waits for any in-flight auth print-policy bootstrap before resolving receipt languages. */
+export async function resolveReadyBillPrintLanguages(
+  uiLanguage?: Language,
+): Promise<ResolvedPrintLanguages> {
+  await awaitPrintPolicyBootstrap();
+  return resolveBillPrintLanguages(uiLanguage);
+}
+
 /** Synchronous per-language translator backed by the shared loader cache. */
 function translatorFor(language: Language | string): ((key: string) => string) | null {
   const lang = (Object.keys(LANGUAGES) as Language[]).includes(language as Language)
@@ -95,15 +121,21 @@ export const printLabelResolver: LabelResolver = (conceptId: string, language: s
 };
 
 /** Loads requested receipt language message bundles into memory before building documents. */
-export async function ensurePrintLanguagesLoaded(languages: ResolvedPrintLanguages): Promise<PrintLanguageCode[]> {
+export async function ensurePrintLanguagesLoaded(
+  languages: ResolvedPrintLanguages,
+  timeoutMs?: number,
+): Promise<PrintLanguageCode[]> {
+  await awaitPrintPolicyBootstrap();
   const outcomes = await Promise.allSettled(
-    languages.map((language) => loadLocaleMessages(language as Language)),
+    languages.map((language) => loadPrintLocaleWithDeadline(language as Language, timeoutMs)),
   );
   return languages.filter((_, index) => outcomes[index].status === 'rejected');
 }
 
 /** Base document direction for the primary language, from the central registry. */
-function baseDirectionFor(languages: ResolvedPrintLanguages): ReturnType<typeof getLanguageDirection> {
+function baseDirectionFor(
+  languages: ResolvedPrintLanguages,
+): ReturnType<typeof getLanguageDirection> {
   const primary = languages[0] as Language;
   try {
     return getLanguageDirection(primary);
@@ -112,25 +144,35 @@ function baseDirectionFor(languages: ResolvedPrintLanguages): ReturnType<typeof 
   }
 }
 
-function parsePaymentDetails(raw: Bill['payment_details']): Array<{ method: string; amount: number }> {
+function parsePaymentDetails(raw: Bill['payment_details']): PaymentSnapshot[] {
   if (!Array.isArray(raw)) return [];
-  return raw.map((entry) => ({
-    method: String(entry?.method ?? ''),
-    amount: Number(entry?.amount) || 0,
-  }));
+  return raw.map((entry) => {
+    const tendered = optionalPaymentAmount(entry?.tendered_amount);
+    const change = optionalPaymentAmount(entry?.change_amount);
+    return {
+      method: String(entry?.method ?? ''),
+      amount: Number(entry?.amount) || 0,
+      ...(tendered !== undefined ? { tendered } : {}),
+      ...(change !== undefined ? { change } : {}),
+    };
+  });
 }
 
 /** Normalize a Bill and nested Order into authoritative PrintData. */
 export function buildBillPrintData(bill: Bill, opts: BillBusinessOptions = {}): PrintData {
   const order = bill.order;
-  const billCustomer = (bill as Bill & { customer?: { name?: unknown; phone?: unknown; country_code?: unknown } }).customer;
-  const customer = opts.useBillCustomer === true ? billCustomer ?? order?.customer : order?.customer;
+  const billCustomer = (
+    bill as Bill & { customer?: { name?: unknown; phone?: unknown; country_code?: unknown } }
+  ).customer;
+  const customer =
+    opts.useBillCustomer === true ? (billCustomer ?? order?.customer) : order?.customer;
   const customerPhone = String(customer?.phone ?? '');
   const customerCountryCode = String(customer?.country_code ?? '');
-  const rasterCustomerPhone = customerCountryCode && customerPhone && !customerPhone.startsWith(customerCountryCode)
-    ? `${customerCountryCode} ${customerPhone}`
-    : customerPhone;
-  const items = order?.items ?? [];
+  const rasterCustomerPhone =
+    customerCountryCode && customerPhone && !customerPhone.startsWith(customerCountryCode)
+      ? `${customerCountryCode} ${customerPhone}`
+      : customerPhone;
+  const items = (order?.items ?? []).filter((item) => !isExcludedFromBillReceipt(item?.status));
 
   const showTaxId = opts.includeTaxId === true && !!opts.taxRegistrationNumber;
 
@@ -138,19 +180,28 @@ export function buildBillPrintData(bill: Bill, opts: BillBusinessOptions = {}): 
     isReprint: opts.isReprint === true,
     order: {
       orderNumber: String(order?.order_number ?? ''),
-      tokenNumber: Number.isInteger(Number(order?.token_number)) && Number(order?.token_number) > 0 ? Number(order?.token_number) : null,
+      tokenNumber:
+        Number.isInteger(Number(order?.token_number)) && Number(order?.token_number) > 0
+          ? Number(order?.token_number)
+          : null,
       createdAt: String(order?.created_at ?? ''),
       tableName: String(order?.table?.name ?? ''),
       onlinePlatform: String(order?.online_platform ?? ''),
       externalOrderId: String(order?.external_order_id ?? ''),
+      deliveryAddress: String(order?.delivery_address ?? ''),
       items: items.map((item) => ({
-        productName: String(item?.product_name ?? ''),
+        productName: formatItemHeading(String(item?.product_name ?? ''), item?.variant_selection),
         quantity: Number(item?.quantity) || 0,
         unitPrice: Number(item?.unit_price) || 0,
         total: Number(item?.total) || 0,
         addons: (Array.isArray(item?.addons) ? item.addons : []).map((addon) => {
-          const addonQty = (addon !== null && typeof addon === 'object' && 'quantity' in addon
-            && typeof addon.quantity === 'number' && addon.quantity) || 1;
+          const addonQty =
+            (addon !== null &&
+              typeof addon === 'object' &&
+              'quantity' in addon &&
+              typeof addon.quantity === 'number' &&
+              addon.quantity) ||
+            1;
           return {
             name: String(addon?.name ?? ''),
             price: (Number(addon?.price) || 0) * addonQty * (Number(item?.quantity) || 0),
@@ -169,6 +220,7 @@ export function buildBillPrintData(bill: Bill, opts: BillBusinessOptions = {}): 
       serviceCharge: Number(bill?.service_charge) || 0,
       deliveryCharge: Number(bill?.delivery_charge) || 0,
       packagingCharge: Number(bill?.packaging_charge) || 0,
+      chargesBreakdown: bill?.charges_breakdown ?? null,
       taxComponents: resolveTaxComponents(bill),
       payments: parsePaymentDetails(bill?.payment_details),
       pointsEarned: Number(bill?.points_earned) || 0,
@@ -186,17 +238,26 @@ export function buildBillPrintData(bill: Bill, opts: BillBusinessOptions = {}): 
       instagramHandle: String(opts.instagramHandle ?? ''),
       footerNote: String(opts.footerNote ?? ''),
       customerName: String(customer?.name ?? ''),
-      customerPhone: opts.maskCustomerPhone === true
-        ? maskPhoneOnReceipt(rasterCustomerPhone)
-        : customerPhone,
+      customerPhone:
+        opts.maskCustomerPhone === true ? maskPhoneOnReceipt(rasterCustomerPhone) : customerPhone,
+      showLogo: opts.showLogo === true,
+      receiptLogo: opts.receiptLogo,
+      receiptLogoRaster: opts.receiptLogoRaster,
       showName: opts.showBusinessName !== false,
       showAddress: !!opts.address,
       showPhone: !!opts.phone,
       showTaxId: showTaxId ? 'force' : 'never',
       showTaxBreakdown: opts.showTaxBreakdown === true,
       showTableNumber: opts.showTableNumber !== false,
+      ...(opts.showLargeOrderNumber !== undefined
+        ? { showLargeOrderNumber: opts.showLargeOrderNumber === true }
+        : {}),
       showCustomerName: opts.showCustomerName !== false,
-      showCustomerPhone: opts.showCustomerPhone !== false,
+      showCustomerPhone: shouldShowCustomerNumber({
+        showOnReceipts: opts.showCustomerPhone !== false,
+        alwaysForDeliveryOrders: opts.deliveryShowCustomerPhoneAlways !== false,
+        orderType: String(order?.type ?? ''),
+      }),
     },
   };
 }
@@ -218,7 +279,7 @@ export function buildBillPrintContext(opts: {
   trimDecimals?: boolean;
 }): PrintContext {
   const country = getCountryByCode(opts.tenant.country ?? '');
-  const currency = resolveTenantCurrency(opts.tenant.currency, opts.tenant.country);
+  const currency = resolveTenantCurrency(opts.tenant.currency, opts.tenant.country ?? '');
   return {
     columns: opts.columns ?? 42,
     languages: opts.languages,
@@ -236,7 +297,11 @@ export function buildBillPrintContext(opts: {
 export function buildFrontendBillDocument(
   bill: Bill,
   tenant: Parameters<typeof buildBillPrintContext>[0]['tenant'],
-  opts: BillBusinessOptions & { columns?: number; trimDecimals?: boolean; languages?: ResolvedPrintLanguages } = {},
+  opts: BillBusinessOptions & {
+    columns?: number;
+    trimDecimals?: boolean;
+    languages?: ResolvedPrintLanguages;
+  } = {},
 ): PrintDocument {
   const languages = opts.languages ?? resolveBillPrintLanguages();
   const printData = buildBillPrintData(bill, opts);
@@ -249,6 +314,10 @@ export function buildFrontendBillDocument(
   return buildBillDocument(printData, printContext);
 }
 
+/**
+ * Build a KotDocument v1 for frontend rasterization, normalizing order metadata,
+ * pending items, and any order-level notes into the ticket header.
+ */
 export function buildFrontendKotDocument(
   order: Order,
   opts: {
@@ -257,6 +326,7 @@ export function buildFrontendKotDocument(
     columns: number;
     language: string;
     timezone?: string;
+    showLargeOrderNumber?: boolean;
   },
 ): KotDocument {
   const orderShape = order as Order & {
@@ -264,6 +334,9 @@ export function buildFrontendKotDocument(
     tableName?: unknown;
     customer_name?: unknown;
     customerName?: unknown;
+    order_notes?: unknown;
+    orderNotes?: unknown;
+    notes?: unknown;
   };
   const firstText = (...values: unknown[]): string => {
     for (const value of values) {
@@ -281,32 +354,52 @@ export function buildFrontendKotDocument(
       }
     }
     if (!Array.isArray(candidates)) return [];
-    return candidates.filter((addon): addon is { name: string; quantity?: number } => (
-      typeof addon === 'object' && addon !== null && typeof (addon as { name?: unknown }).name === 'string'
-    ));
+    return candidates.filter(
+      (addon): addon is { name: string; quantity?: number } =>
+        typeof addon === 'object' &&
+        addon !== null &&
+        typeof (addon as { name?: unknown }).name === 'string',
+    );
   };
   const languages = [opts.language] as ResolvedPrintLanguages;
   const items = opts.items ?? order.items ?? [];
   const printData: KotPrintData = {
     stationName: String(opts.stationName ?? ''),
+    ...(typeof opts.showLargeOrderNumber === 'boolean'
+      ? { showLargeOrderNumber: opts.showLargeOrderNumber }
+      : {}),
     order: {
       orderNumber: String(order.order_number ?? ''),
       createdAt: String(order.created_at ?? ''),
       tableName: firstText(order.table?.name, orderShape.table_name, orderShape.tableName),
       orderType: String(order.type ?? '').trim(),
-      customerName: firstText(order.customer?.name, orderShape.customer_name, orderShape.customerName),
+      customerName: firstText(
+        order.customer?.name,
+        orderShape.customer_name,
+        orderShape.customerName,
+      ),
+      orderNotes: firstText(
+        order.special_instructions,
+        orderShape.order_notes,
+        orderShape.orderNotes,
+        orderShape.notes,
+      ).trim(),
     },
-    items: items.filter((item) => isKotItemPending(item.status)).map((item) => ({
-      productName: String(item.product_name ?? ''),
-      quantity: Number(item.quantity) || 0,
-      addons: parseKotAddons(item.addons).map((addon) => ({
-        name: String(addon?.name ?? ''),
-        ...(typeof addon?.quantity === 'number' && Number.isFinite(addon.quantity) && addon.quantity > 0
-          ? { quantity: addon.quantity }
-          : {}),
+    items: items
+      .filter((item) => isKotItemPending(item.status))
+      .map((item) => ({
+        productName: formatItemHeading(String(item.product_name ?? ''), item.variant_selection),
+        quantity: Number(item.quantity) || 0,
+        addons: parseKotAddons(item.addons).map((addon) => ({
+          name: String(addon?.name ?? ''),
+          ...(typeof addon?.quantity === 'number' &&
+          Number.isFinite(addon.quantity) &&
+          addon.quantity > 0
+            ? { quantity: addon.quantity }
+            : {}),
+        })),
+        specialInstructions: String(item.special_instructions ?? ''),
       })),
-      specialInstructions: String(item.special_instructions ?? ''),
-    })),
   };
   const printContext: PrintContext = {
     columns: opts.columns,

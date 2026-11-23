@@ -6,31 +6,157 @@ import { useTranslations } from 'use-intl';
 import { useAuthStore } from '@/store/auth';
 import api from '@/lib/api';
 import { showPrintLanguageLoadErrorsToast } from '@/lib/printer/warnings-toast';
+import { tenantCan } from '@/lib/permissions';
+import { clearStaleBodyPointerEvents, normalizePathname } from '@/lib/utils';
+import type { Tenant } from '@/lib/types';
 
-export function getLandingPage(): string {
-  return '/pos';
+export const LANDING_PAGE_CANDIDATES = [
+  ['pos.use', '/pos'],
+  ['dashboard.view', '/dashboard'],
+  ['orders.read', '/orders'],
+  ['kitchen.use', '/kds'],
+  ['tables.view', '/tables'],
+  ['whatsapp.use', '/whatsapp'],
+  ['catalog.manage', '/products'],
+  ['inventory.view', '/inventory'],
+  ['expenses.view', '/expenses'],
+  ['customers.view', '/customers'],
+  ['staff.view', '/staff'],
+  ['settings.view', '/settings'],
+  ['support.use', '/support'],
+  ['printers.manage', '/print-test'],
+] as const;
+
+export function getLandingPage(tenant?: Tenant | null): string {
+  return (
+    LANDING_PAGE_CANDIDATES.find(([permission]) => tenantCan(tenant, permission))?.[1] ??
+    '/auth/login'
+  );
 }
 
-const PUBLIC_PATHS = ['/kds', '/kds-standalone', '/server-standalone', '/auth/login', '/auth/register', '/auth/recover', '/setup'];
+export function resolveSafeRedirect(raw: string | null | undefined): string | null {
+  if (typeof raw !== 'string') return null;
+  const trimmed = raw.trim();
+  if (!trimmed.startsWith('/') || trimmed.startsWith('//')) {
+    return null;
+  }
+  for (let i = 0; i < trimmed.length; i += 1) {
+    const code = trimmed.charCodeAt(i);
+    if (code <= 0x1f || code === 0x7f || trimmed[i] === '\\') {
+      return null;
+    }
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(trimmed, 'http://localhost');
+  } catch {
+    return null;
+  }
+  if (parsed.origin !== 'http://localhost') {
+    return null;
+  }
+  const normalized = normalizePathname(parsed.pathname);
+  if (
+    !normalized.startsWith('/') ||
+    normalized.startsWith('//') ||
+    normalized.startsWith('/auth') ||
+    normalized.startsWith('/setup')
+  ) {
+    return null;
+  }
+  return normalized;
+}
+
+const PUBLIC_PATHS = [
+  '/kds',
+  '/kds-standalone',
+  '/server-standalone',
+  '/customer-display',
+  '/auth/login',
+  '/auth/register',
+  '/auth/recover',
+  '/setup',
+];
+
+export const PAGE_PERMISSIONS = [
+  ['/pos', 'pos.use'],
+  ['/dashboard', 'dashboard.view'],
+  ['/order-history-demo', 'dashboard.view'],
+  ['/orders', 'orders.read'],
+  ['/products', 'catalog.manage'],
+  ['/addon-groups', 'catalog.manage'],
+  ['/inventory', 'inventory.view'],
+  ['/expenses', 'expenses.view'],
+  ['/tables', 'tables.view'],
+  ['/customers', 'customers.view'],
+  ['/whatsapp', 'whatsapp.use'],
+  ['/support', 'support.use'],
+  ['/print-test', 'printers.manage'],
+] as const;
+
+const SETUP_STATUS_MAX_RETRIES = 2;
+const SETUP_STATUS_RETRY_DELAY_MS = 400;
 
 export default function AuthGuard({ children }: { children: React.ReactNode }) {
   const t = useTranslations('common');
-  const { user, currentTenant, loading, loadFromStorage } = useAuthStore();
+  const { user, currentTenant, loading, loadFromStorage, refreshAuthContext } = useAuthStore();
   const printLanguageLoadErrors = useAuthStore((s) => s.printLanguageLoadErrors);
   const router = useRouter();
-  const pathname = usePathname();
+  // Normalized once at the source so every comparison below (public paths,
+  // page permissions, the /staff and /settings gates) agrees with dev mode —
+  // see normalizePathname's doc comment for why this matters.
+  const pathname = normalizePathname(usePathname());
   const [needsSetup, setNeedsSetup] = useState<boolean | null>(null); // null = still checking
 
-  const isPublicPath = PUBLIC_PATHS.some(p => pathname === p || pathname?.startsWith(p + '/'));
+  const isPublicPath = PUBLIC_PATHS.some((p) => pathname === p || pathname?.startsWith(p + '/'));
   const isSetupPath = pathname === '/setup' || pathname?.startsWith('/setup/');
-  const isStandalonePath = pathname?.startsWith('/kds') || pathname?.startsWith('/server-standalone');
+  const isStandalonePath =
+    pathname?.startsWith('/kds') ||
+    pathname?.startsWith('/server-standalone') ||
+    pathname === '/customer-display' ||
+    pathname?.startsWith('/customer-display/');
+  const isDashboardKdsPath = pathname === '/kds';
 
   useEffect(() => {
-    // Standalone KDS and Server App pages manage their own auth sessions;
-    // skip loading shared POS auth store to avoid clearing their tokens.
-    if (isStandalonePath) return;
-    loadFromStorage();
-  }, [isStandalonePath, loadFromStorage]);
+    clearStaleBodyPointerEvents();
+  }, [pathname, user]);
+
+  useEffect(() => {
+    // Standalone KDS, Server App, and paired customer display pages manage their own
+    // auth sessions; skip loading shared POS auth store unless a dashboard tenant session
+    // is present on the in-dashboard /kds route.
+    const authState = typeof useAuthStore.getState === 'function' ? useAuthStore.getState() : null;
+    if (isStandalonePath) {
+      if (
+        isDashboardKdsPath &&
+        (!authState?.user || !authState?.currentTenant) &&
+        typeof window !== 'undefined' &&
+        Boolean(window.localStorage.getItem('token')) &&
+        Boolean(window.localStorage.getItem('tenant'))
+      ) {
+        loadFromStorage();
+      }
+      return;
+    }
+    if (!authState?.user || !authState?.currentTenant) {
+      loadFromStorage();
+    }
+  }, [isDashboardKdsPath, isStandalonePath, loadFromStorage]);
+
+  useEffect(() => {
+    if (isStandalonePath || !user || !currentTenant) return;
+    const refresh = () => {
+      void refreshAuthContext();
+    };
+    window.addEventListener('focus', refresh);
+    window.addEventListener('flo:authorization-denied', refresh);
+    const interval = window.setInterval(refresh, 30_000);
+    return () => {
+      window.removeEventListener('focus', refresh);
+      window.removeEventListener('flo:authorization-denied', refresh);
+      window.clearInterval(interval);
+    };
+  }, [currentTenant, isStandalonePath, refreshAuthContext, user]);
 
   useEffect(() => {
     showPrintLanguageLoadErrorsToast(printLanguageLoadErrors);
@@ -44,18 +170,36 @@ export default function AuthGuard({ children }: { children: React.ReactNode }) {
     if (!isStandalonePath && needsSetup === null) {
       const controller = new AbortController();
       let active = true;
-      api.get('/auth/setup/status', { signal: controller.signal })
-        .then(({ data }) => {
-          if (active) setNeedsSetup(data.needsSetup);
-        })
-        .catch((err) => {
-          if (!active || (err instanceof Error && (err.name === 'CanceledError' || err.name === 'AbortError'))) return;
-          console.error('[AuthGuard] Failed to check setup status:', err);
-          // Fail closed: do not allow normal app routes when setup state is unknown.
-          setNeedsSetup(true);
-        });
+      let retryTimer: ReturnType<typeof setTimeout> | null = null;
+
+      const checkSetupStatus = (attempt: number) => {
+        api
+          .get('/auth/setup/status', { signal: controller.signal })
+          .then(({ data }) => {
+            if (active) setNeedsSetup(Boolean(data?.needsSetup));
+          })
+          .catch((err) => {
+            if (
+              !active ||
+              (err instanceof Error && (err.name === 'CanceledError' || err.name === 'AbortError'))
+            )
+              return;
+            if (attempt < SETUP_STATUS_MAX_RETRIES) {
+              retryTimer = setTimeout(() => {
+                if (active) checkSetupStatus(attempt + 1);
+              }, SETUP_STATUS_RETRY_DELAY_MS);
+              return;
+            }
+            console.error('[AuthGuard] Failed to check setup status:', err);
+            // Fall back to normal auth routing rather than sending an initialized store to /setup.
+            setNeedsSetup(false);
+          });
+      };
+
+      checkSetupStatus(0);
       return () => {
         active = false;
+        if (retryTimer !== null) clearTimeout(retryTimer);
         controller.abort();
       }; // wait for the result before redirecting
     }
@@ -72,8 +216,55 @@ export default function AuthGuard({ children }: { children: React.ReactNode }) {
       router.push('/auth/login');
     } else if (!currentTenant) {
       router.push('/auth/login?select_tenant=true');
+    } else {
+      const pagePermission = PAGE_PERMISSIONS.find(
+        ([prefix]) => pathname === prefix || pathname?.startsWith(`${prefix}/`),
+      );
+      const canOpenStaff =
+        pathname === '/staff' &&
+        (tenantCan(currentTenant, 'staff.view') ||
+          tenantCan(currentTenant, 'authorization.manage'));
+      const canOpenSettings =
+        pathname === '/settings' &&
+        [
+          'settings.view',
+          'settings.manage',
+          'tax-packs.view-test',
+          'tax-configuration.manage',
+          'tax-packs.manage',
+          'printers.manage',
+          'print-templates.view',
+          'print-templates.manage',
+          'payment-methods.manage',
+          'cloud.manage',
+          'cloud.account.manage',
+          'google-drive.manage',
+          'database.manage',
+          'mobile-access.manage',
+          'kitchen.stations.manage',
+          'whatsapp.manage',
+        ].some((permission) =>
+          tenantCan(currentTenant, permission as import('@shared/permissions').PermissionId),
+        );
+      if (
+        (pagePermission && !tenantCan(currentTenant, pagePermission[1])) ||
+        (pathname === '/staff' && !canOpenStaff) ||
+        (pathname === '/settings' && !canOpenSettings)
+      ) {
+        router.replace(getLandingPage(currentTenant));
+      }
     }
-  }, [loading, user, currentTenant, isPublicPath, isSetupPath, isStandalonePath, needsSetup, router]);
+  }, [
+    loading,
+    user,
+    currentTenant,
+    isPublicPath,
+    isSetupPath,
+    isStandalonePath,
+    needsSetup,
+    pathname,
+    router,
+  ]);
 
   if (isStandalonePath || isSetupPath) {
     return <>{children}</>;

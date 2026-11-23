@@ -1,7 +1,23 @@
+import fs from 'node:fs';
+import path from 'node:path';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { TaxEngine, applyPayableRounding, resolveTaxCategory, type TaxEngineLine } from '../main/services/tax-engine';
-import { calculateItemTax, previewCategoryRate } from '../main/services/tax';
+import Decimal from 'decimal.js';
+import {
+  TaxEngine,
+  applyPayableRounding,
+  resolvePayableIncrement,
+  resolveTaxCategory,
+  type TaxEngineLine,
+} from '../main/services/tax-engine';
+import {
+  allocateDocumentTaxRounding,
+  calculateDocumentItemTaxes,
+  calculateItemTax,
+  computeDiscountTaxRatio,
+  previewCategoryRate,
+  scaleTaxSnapshots,
+} from '../main/services/tax';
 import type {
   CountryPack,
   PayableRounding,
@@ -104,37 +120,52 @@ test('category resolution follows all six precedence steps', () => {
     categoryId: 'transaction',
     source: 'transaction_override',
   });
-  assert.equal(resolveTaxCategory(pack, { ...full, transactionCategoryId: undefined }).categoryId, 'merchant');
-  assert.equal(resolveTaxCategory(pack, {
-    ...full,
-    transactionCategoryId: undefined,
-    merchantCategoryId: undefined,
-  }).categoryId, 'explicit');
-  assert.equal(resolveTaxCategory(pack, {
-    ...full,
-    transactionCategoryId: undefined,
-    merchantCategoryId: undefined,
-    productCategoryId: undefined,
-  }).categoryId, 'parent');
-  assert.deepEqual(resolveTaxCategory(pack, {
-    ...full,
-    transactionCategoryId: undefined,
-    merchantCategoryId: undefined,
-    productCategoryId: undefined,
-    parentProductCategoryId: undefined,
-  }), { categoryId: 'addon-default', source: 'charge_default' });
+  assert.equal(
+    resolveTaxCategory(pack, { ...full, transactionCategoryId: undefined }).categoryId,
+    'merchant',
+  );
+  assert.equal(
+    resolveTaxCategory(pack, {
+      ...full,
+      transactionCategoryId: undefined,
+      merchantCategoryId: undefined,
+    }).categoryId,
+    'explicit',
+  );
+  assert.equal(
+    resolveTaxCategory(pack, {
+      ...full,
+      transactionCategoryId: undefined,
+      merchantCategoryId: undefined,
+      productCategoryId: undefined,
+    }).categoryId,
+    'parent',
+  );
+  assert.deepEqual(
+    resolveTaxCategory(pack, {
+      ...full,
+      transactionCategoryId: undefined,
+      merchantCategoryId: undefined,
+      productCategoryId: undefined,
+      parentProductCategoryId: undefined,
+    }),
+    { categoryId: 'addon-default', source: 'charge_default' },
+  );
 
   const withoutDefault = {
     ...pack,
     defaultCategories: { ...pack.defaultCategories, addon: '' },
   };
-  assert.deepEqual(resolveTaxCategory(withoutDefault, {
-    ...full,
-    transactionCategoryId: undefined,
-    merchantCategoryId: undefined,
-    productCategoryId: undefined,
-    parentProductCategoryId: undefined,
-  }), { categoryId: 'unclassified', source: 'unclassified' });
+  assert.deepEqual(
+    resolveTaxCategory(withoutDefault, {
+      ...full,
+      transactionCategoryId: undefined,
+      merchantCategoryId: undefined,
+      productCategoryId: undefined,
+      parentProductCategoryId: undefined,
+    }),
+    { categoryId: 'unclassified', source: 'unclassified' },
+  );
   assert.deepEqual(resolveTaxCategory(pack, { ...full, transactionExempt: true }), {
     categoryId: null,
     source: 'transaction_exemption',
@@ -154,15 +185,28 @@ test('compound percent tax uses acyclic line-local dependencies', () => {
     },
   ]);
   const result = calculate(pack, [line()]);
-  assert.deepEqual(result.lines[0].components.map((component) => component.amount), ['10.00', '5.50']);
+  assert.deepEqual(
+    result.lines[0].components.map((component) => component.amount),
+    ['10.00', '5.50'],
+  );
   assert.equal(result.lines[0].taxAmount, '15.50');
 
   const cyclic = packWith([
     {
-      id: 'a', label: 'A', type: 'percent', categoryIds: ['explicit'], rate: '1', baseRuleIds: ['b'],
+      id: 'a',
+      label: 'A',
+      type: 'percent',
+      categoryIds: ['explicit'],
+      rate: '1',
+      baseRuleIds: ['b'],
     },
     {
-      id: 'b', label: 'B', type: 'percent', categoryIds: ['explicit'], rate: '1', baseRuleIds: ['a'],
+      id: 'b',
+      label: 'B',
+      type: 'percent',
+      categoryIds: ['explicit'],
+      rate: '1',
+      baseRuleIds: ['a'],
     },
   ]);
   assert.throws(() => calculate(cyclic, [line()]), /dependency cycle/);
@@ -171,18 +215,31 @@ test('compound percent tax uses acyclic line-local dependencies', () => {
 test('fixed inclusive tax is removed before solving percent taxes', () => {
   const pack = packWith([
     {
-      id: 'fixed', label: 'Fixed', type: 'fixed', categoryIds: ['explicit'], amount: '10', appliesPer: 'line',
+      id: 'fixed',
+      label: 'Fixed',
+      type: 'fixed',
+      categoryIds: ['explicit'],
+      amount: '10',
+      appliesPer: 'line',
     },
     { id: 'vat', label: 'VAT', type: 'percent', categoryIds: ['explicit'], rate: '10' },
   ]);
   const result = calculate(pack, [line({ unitPrice: '120', taxBehavior: 'inclusive' })]);
   assert.equal(result.lines[0].taxableBase, '100.00');
-  assert.deepEqual(result.lines[0].components.map((component) => component.amount), ['10.00', '10.00']);
+  assert.deepEqual(
+    result.lines[0].components.map((component) => component.amount),
+    ['10.00', '10.00'],
+  );
   assert.equal(result.payableTotal, '120');
 
   const fixedInBase = packWith([
     {
-      id: 'fixed', label: 'Fixed', type: 'fixed', categoryIds: ['explicit'], amount: '10', appliesPer: 'line',
+      id: 'fixed',
+      label: 'Fixed',
+      type: 'fixed',
+      categoryIds: ['explicit'],
+      amount: '10',
+      appliesPer: 'line',
     },
     {
       id: 'vat',
@@ -195,7 +252,10 @@ test('fixed inclusive tax is removed before solving percent taxes', () => {
   ]);
   const based = calculate(fixedInBase, [line({ unitPrice: '120', taxBehavior: 'inclusive' })]);
   assert.equal(based.lines[0].taxableBase, '99.09');
-  assert.deepEqual(based.lines[0].components.map((component) => component.amount), ['10.00', '10.91']);
+  assert.deepEqual(
+    based.lines[0].components.map((component) => component.amount),
+    ['10.00', '10.91'],
+  );
 
   assert.throws(
     () => calculate(pack, [line({ unitPrice: '5', taxBehavior: 'inclusive' })]),
@@ -221,7 +281,11 @@ test('tax rounding implements all four methods', () => {
 
 test('unit, line, and document scopes round at their declared boundaries', () => {
   const rule: TaxRule = {
-    id: 'tax', label: 'Tax', type: 'percent', categoryIds: ['explicit'], rate: '5',
+    id: 'tax',
+    label: 'Tax',
+    type: 'percent',
+    categoryIds: ['explicit'],
+    rate: '5',
   };
   const unitPack = packWith([rule], { scope: 'unit' });
   assert.equal(
@@ -241,31 +305,44 @@ test('unit, line, and document scopes round at their declared boundaries', () =>
     line({ lineId: 'line-a', unitPrice: '0.10' }),
   ]);
   assert.equal(document.taxAmount, '0.01');
-  assert.deepEqual(document.lines.map((entry) => entry.taxAmount), ['0.00', '0.01']);
+  assert.deepEqual(
+    document.lines.map((entry) => entry.taxAmount),
+    ['0.00', '0.01'],
+  );
 });
 
 test('largest remainder ties sort by ruleId, then lineId', () => {
-  const ruleTie = packWith([
-    { id: 'b-rule', label: 'B', type: 'percent', categoryIds: ['explicit'], rate: '0.5' },
-    { id: 'a-rule', label: 'A', type: 'percent', categoryIds: ['explicit'], rate: '0.5' },
-  ], { scope: 'document' });
+  const ruleTie = packWith(
+    [
+      { id: 'b-rule', label: 'B', type: 'percent', categoryIds: ['explicit'], rate: '0.5' },
+      { id: 'a-rule', label: 'A', type: 'percent', categoryIds: ['explicit'], rate: '0.5' },
+    ],
+    { scope: 'document' },
+  );
   const byRule = calculate(ruleTie, [line({ unitPrice: '1' })]);
   assert.deepEqual(
     byRule.lines[0].components.map((component) => [component.ruleId, component.amount]),
-    [['b-rule', '0.00'], ['a-rule', '0.01']],
+    [
+      ['b-rule', '0.00'],
+      ['a-rule', '0.01'],
+    ],
   );
 
-  const lineTie = packWith([
-    { id: 'tax', label: 'Tax', type: 'percent', categoryIds: ['explicit'], rate: '0.5' },
-  ], { scope: 'document' });
+  const lineTie = packWith(
+    [{ id: 'tax', label: 'Tax', type: 'percent', categoryIds: ['explicit'], rate: '0.5' }],
+    { scope: 'document' },
+  );
   const byLine = calculate(lineTie, [
     line({ lineId: 'z-line', unitPrice: '1' }),
     line({ lineId: 'a-line', unitPrice: '1' }),
   ]);
-  assert.deepEqual(byLine.lines.map((entry) => [entry.lineId, entry.taxAmount]), [
-    ['z-line', '0.00'],
-    ['a-line', '0.01'],
-  ]);
+  assert.deepEqual(
+    byLine.lines.map((entry) => [entry.lineId, entry.taxAmount]),
+    [
+      ['z-line', '0.00'],
+      ['a-line', '0.01'],
+    ],
+  );
 });
 
 test('payable rounding is independent and implements all four methods', () => {
@@ -353,9 +430,11 @@ test('dual-rate and flat-rate packs reproduce current fixed behavior as data', (
     [{ title: 'Tax C', rate: 5, amount: 5 }],
   );
 
-  const flat = calculate(flatRatePack, [
-    line({ unitPrice: '100', productCategoryId: 'standard', taxBehavior: 'exclusive' }),
-  ], { businessType: 'restaurant' });
+  const flat = calculate(
+    flatRatePack,
+    [line({ unitPrice: '100', productCategoryId: 'standard', taxBehavior: 'exclusive' })],
+    { businessType: 'restaurant' },
+  );
   assert.deepEqual(
     flat.lines[0].components.map((component) => ({
       title: component.label,
@@ -364,32 +443,52 @@ test('dual-rate and flat-rate packs reproduce current fixed behavior as data', (
     })),
     [{ title: 'Tax', rate: 7, amount: 7 }],
   );
-  assert.equal(dualRatePack.rules.every((rule) => rule.rate !== undefined), true);
+  assert.equal(
+    dualRatePack.rules.every((rule) => rule.rate !== undefined),
+    true,
+  );
   assert.equal(flatRatePack.rules[0].rate, '7');
 });
 
 test('unclassified products are taxed at the standard rate, never silently zero', () => {
-  const dual = calculate(dualRatePack, [
-    line({ unitPrice: '1000', productCategoryId: 'unclassified', taxBehavior: 'exclusive' }),
-  ], { businessType: 'restaurant', storeStateCode: 'KA' });
+  const dual = calculate(
+    dualRatePack,
+    [line({ unitPrice: '1000', productCategoryId: 'unclassified', taxBehavior: 'exclusive' })],
+    { businessType: 'restaurant', storeStateCode: 'KA' },
+  );
   assert.equal(dual.lines[0].taxAmount, '50.00');
   assert.deepEqual(
     dual.lines[0].components.map((component) => [component.label, component.amount]),
-    [['Tax A', '25.00'], ['Tax B', '25.00']],
+    [
+      ['Tax A', '25.00'],
+      ['Tax B', '25.00'],
+    ],
   );
 
-  const flat = calculate(flatRatePack, [
-    line({ unitPrice: '100', productCategoryId: 'unclassified', taxBehavior: 'exclusive' }),
-  ], { businessType: 'restaurant' });
+  const flat = calculate(
+    flatRatePack,
+    [line({ unitPrice: '100', productCategoryId: 'unclassified', taxBehavior: 'exclusive' })],
+    { businessType: 'restaurant' },
+  );
   assert.deepEqual(
     flat.lines[0].components.map((component) => [component.label, component.amount]),
     [['Tax', '7.00']],
   );
 
-  const dualUnclassified = dualRatePack.categories.find((category) => category.id === 'unclassified')!;
-  const flatUnclassified = flatRatePack.categories.find((category) => category.id === 'unclassified')!;
-  assert.ok(dualUnclassified.ruleIds.length > 0, 'dual-rate unclassified category must carry real tax rules');
-  assert.ok(flatUnclassified.ruleIds.length > 0, 'flat-rate unclassified category must carry real tax rules');
+  const dualUnclassified = dualRatePack.categories.find(
+    (category) => category.id === 'unclassified',
+  )!;
+  const flatUnclassified = flatRatePack.categories.find(
+    (category) => category.id === 'unclassified',
+  )!;
+  assert.ok(
+    dualUnclassified.ruleIds.length > 0,
+    'dual-rate unclassified category must carry real tax rules',
+  );
+  assert.ok(
+    flatUnclassified.ruleIds.length > 0,
+    'flat-rate unclassified category must carry real tax rules',
+  );
 });
 
 test('products without a resolved tax category charge no tax, regardless of legacy tax_type/tax_rate', () => {
@@ -427,8 +526,20 @@ test('previewCategoryRate only counts rules the category actually claims via rul
   // claims via ruleIds, so checkout silently excludes 'orphan'. Before this
   // fix, previewCategoryRate selected by rule.categoryIds alone and would
   // have shown the merchant a rate (14%) checkout never actually charges.
-  const realRule: TaxRule = { id: 'real', label: 'Real Tax', type: 'percent', categoryIds: ['standard'], rate: '5' };
-  const orphanRule: TaxRule = { id: 'orphan', label: 'Orphan Tax', type: 'percent', categoryIds: ['standard'], rate: '9' };
+  const realRule: TaxRule = {
+    id: 'real',
+    label: 'Real Tax',
+    type: 'percent',
+    categoryIds: ['standard'],
+    rate: '5',
+  };
+  const orphanRule: TaxRule = {
+    id: 'orphan',
+    label: 'Orphan Tax',
+    type: 'percent',
+    categoryIds: ['standard'],
+    rate: '9',
+  };
   const pack: CountryPack = {
     ...packWith([realRule, orphanRule]),
     categories: [
@@ -438,15 +549,646 @@ test('previewCategoryRate only counts rules the category actually claims via rul
   };
 
   const preview = previewCategoryRate(pack, 'restaurant', 'standard');
-  assert.deepEqual(preview, { percent: 5, label: 'Real Tax 5%' },
-    'preview only counts the rule the category actually claims via ruleIds, not every rule that merely names the category');
+  assert.deepEqual(
+    preview,
+    { percent: 5, label: 'Real Tax 5%' },
+    'preview only counts the rule the category actually claims via ruleIds, not every rule that merely names the category',
+  );
 
-  const result = calculate(pack, [
-    line({ unitPrice: '100', productCategoryId: 'standard', taxBehavior: 'exclusive' }),
-  ], { businessType: 'restaurant' });
+  const result = calculate(
+    pack,
+    [line({ unitPrice: '100', productCategoryId: 'standard', taxBehavior: 'exclusive' })],
+    { businessType: 'restaurant' },
+  );
   assert.deepEqual(
     result.lines[0].components.map((component) => [component.label, component.amount]),
     [['Real Tax', '5.00']],
     'checkout applies the same single rule preview now reports — no more preview/checkout mismatch',
   );
+});
+
+test('signed official-india two-item document rounding allocates 10.01 tax across items', () => {
+  const indiaPack = JSON.parse(
+    fs.readFileSync(path.join(__dirname, 'fixtures/legacy-tax-packs/official-india.json'), 'utf8'),
+  ) as CountryPack;
+  const result = TaxEngine.calculate({
+    pack: indiaPack,
+    currency: 'INR',
+    country: 'IN',
+    businessType: 'restaurant',
+    storeStateCode: 'KA',
+    transactionDate: new Date().toISOString(),
+    customer: null,
+    lines: [
+      {
+        lineId: 'line-0001',
+        kind: 'product',
+        quantity: '1',
+        unitPrice: '100.10',
+        productCategoryId: 'standard',
+        taxBehavior: 'exclusive',
+      },
+      {
+        lineId: 'line-0002',
+        kind: 'product',
+        quantity: '1',
+        unitPrice: '100.10',
+        productCategoryId: 'standard',
+        taxBehavior: 'exclusive',
+      },
+    ],
+  });
+  assert.equal(result.taxAmount, '10.01');
+  assert.equal(result.payableTotal, '210.21');
+  assert.deepEqual(
+    result.lines.map((l) => l.taxAmount),
+    ['5.01', '5.00'],
+  );
+  const cgstTotal = result.lines
+    .flatMap((l) => l.components)
+    .filter((c) => c.ruleId === 'b-cgst')
+    .reduce((sum, c) => sum + Number(c.amount), 0);
+  const sgstTotal = result.lines
+    .flatMap((l) => l.components)
+    .filter((c) => c.ruleId === 'a-sgst')
+    .reduce((sum, c) => sum + Number(c.amount), 0);
+  assert.equal(cgstTotal.toFixed(2), '5.00');
+  assert.equal(sgstTotal.toFixed(2), '5.01');
+});
+
+test('US document rounding allocates 0.01 tax across two 0.05 items at 8%', () => {
+  const usPack = packWith(
+    [
+      {
+        id: 'sales-tax',
+        label: 'Sales Tax',
+        type: 'percent',
+        categoryIds: ['standard'],
+        rate: '8',
+      },
+    ],
+    {
+      scope: 'document',
+      method: 'half_up',
+      decimalPlaces: 2,
+      remainderAllocation: 'largest_remainder',
+    },
+  );
+  const result = calculate(usPack, [
+    line({
+      lineId: 'line-0001',
+      unitPrice: '0.05',
+      productCategoryId: 'standard',
+      taxBehavior: 'exclusive',
+    }),
+    line({
+      lineId: 'line-0002',
+      unitPrice: '0.05',
+      productCategoryId: 'standard',
+      taxBehavior: 'exclusive',
+    }),
+  ]);
+  assert.equal(result.taxAmount, '0.01');
+  assert.equal(result.payableTotal, '0.11');
+  assert.deepEqual(
+    result.lines.map((l) => l.taxAmount),
+    ['0.01', '0.00'],
+  );
+});
+
+test('calculateDocumentItemTaxes handles mixed categorized + uncategorized, scope line, and single-item wrapper', () => {
+  const tenant = {
+    country: 'IN',
+    business_type: 'restaurant',
+    state_code: 'KA',
+    currency: 'INR',
+    taxes_enabled: true,
+  };
+
+  // 1. Mixed categorized and uncategorized items (using exempt behavior to test without DB pack)
+  const mixedResults = calculateDocumentItemTaxes(tenant, [
+    { lineId: 'line-0001', product: { tax_type: 'none', tax_rate: 0 }, taxableAmount: 100 },
+    {
+      lineId: 'line-0002',
+      product: {
+        tax_type: 'none',
+        tax_rate: 0,
+        tax_category_id: 'standard',
+        tax_behavior: 'exempt',
+      },
+      taxableAmount: 100,
+    },
+  ]);
+  assert.equal(mixedResults[0].tax_amount, 0);
+  assert.equal(mixedResults[0].tax_snapshot, null);
+  assert.equal(mixedResults[1].tax_amount, 0);
+  assert.ok(mixedResults[1].tax_snapshot);
+  assert.equal(mixedResults[1].tax_type, 'none');
+
+  // 2. Single-item calculateItemTax wrapper
+  const single = calculateItemTax(
+    tenant,
+    { tax_type: 'none', tax_rate: 0, tax_category_id: 'standard', tax_behavior: 'exempt' },
+    100,
+    null,
+  );
+  assert.equal(single.tax_amount, 0);
+  assert.ok(single.tax_snapshot);
+  assert.equal(single.tax_snapshot.lines.length, 1);
+
+  // 3. Scope line pack rounds lines independently
+  const lineScopePack = packWith(
+    [{ id: 'tax-5', label: 'Tax', type: 'percent', categoryIds: ['standard'], rate: '5' }],
+    { scope: 'line', method: 'half_up', decimalPlaces: 2 },
+  );
+  const lineScopeResult = calculate(lineScopePack, [
+    line({ lineId: 'line-0001', unitPrice: '10.05', productCategoryId: 'standard' }),
+    line({ lineId: 'line-0002', unitPrice: '10.05', productCategoryId: 'standard' }),
+  ]);
+  // 10.05 * 0.05 = 0.5025 -> rounded per line to 0.50 each, total 1.00
+  assert.deepEqual(
+    lineScopeResult.lines.map((l) => l.taxAmount),
+    ['0.50', '0.50'],
+  );
+  assert.equal(lineScopeResult.taxAmount, '1.00');
+});
+
+test('calculateDocumentItemTaxes does not skip zero-price categorized items', () => {
+  const tenant = {
+    country: 'IN',
+    business_type: 'restaurant',
+    state_code: 'KA',
+    currency: 'INR',
+    taxes_enabled: true,
+  };
+
+  const results = calculateDocumentItemTaxes(tenant, [
+    {
+      lineId: 'free-item',
+      product: {
+        tax_type: 'none',
+        tax_rate: 0,
+        tax_category_id: 'standard',
+        tax_behavior: 'exempt',
+      },
+      taxableAmount: 0,
+    },
+  ]);
+  assert.equal(results[0].tax_amount, 0);
+  assert.ok(results[0].tax_snapshot, 'zero-price categorized item must receive a tax snapshot');
+});
+
+test('allocateDocumentTaxRounding applies order discount ratio before document largest_remainder rounding', () => {
+  const officialIndiaPack = JSON.parse(
+    fs.readFileSync(path.join(__dirname, 'fixtures/legacy-tax-packs/official-india.json'), 'utf8'),
+  ) as CountryPack;
+  for (const price of ['100.10', '100.05']) {
+    const undiscounted = TaxEngine.calculate({
+      pack: officialIndiaPack,
+      currency: 'INR',
+      country: 'IN',
+      businessType: 'restaurant',
+      storeStateCode: 'KA',
+      transactionDate: '2026-06-01',
+      lines: [
+        line({
+          lineId: 'line-0001',
+          unitPrice: price,
+          productCategoryId: 'standard',
+          taxBehavior: 'exclusive',
+        }),
+        line({
+          lineId: 'line-0002',
+          unitPrice: price,
+          productCategoryId: 'standard',
+          taxBehavior: 'exclusive',
+        }),
+      ],
+    });
+    const oracle = TaxEngine.calculate({
+      pack: officialIndiaPack,
+      currency: 'INR',
+      country: 'IN',
+      businessType: 'restaurant',
+      storeStateCode: 'KA',
+      transactionDate: '2026-06-01',
+      lines: [
+        line({
+          lineId: 'line-0001',
+          unitPrice: price,
+          discount: new Decimal(price).div(2).toString(),
+          productCategoryId: 'standard',
+          taxBehavior: 'exclusive',
+        }),
+        line({
+          lineId: 'line-0002',
+          unitPrice: price,
+          discount: new Decimal(price).div(2).toString(),
+          productCategoryId: 'standard',
+          taxBehavior: 'exclusive',
+        }),
+      ],
+    });
+
+    const allocated = allocateDocumentTaxRounding({
+      items: undiscounted.lines.map((l) => ({
+        snapshot: { ...undiscounted.snapshot, lines: [l] },
+        lineIdOverride: l.lineId,
+      })),
+      chargeTaxes: { taxAmount: 0, exclusiveTaxAmount: 0, breakdowns: [], snapshotJson: [] },
+      currency: 'INR',
+      itemTaxRatio: new Decimal('0.5'),
+    });
+
+    const totalAllocatedTax = allocated.itemOutputs
+      .reduce((acc, out) => acc.plus(out.taxAmount), new Decimal(0))
+      .toFixed(2);
+    assert.equal(totalAllocatedTax, oracle.taxAmount);
+  }
+
+  // 100.20 item + 100.10 charge with 100% item discount (itemTaxRatio = 0)
+  const undiscountedWithCharge = TaxEngine.calculate({
+    pack: officialIndiaPack,
+    currency: 'INR',
+    country: 'IN',
+    businessType: 'restaurant',
+    storeStateCode: 'KA',
+    transactionDate: '2026-06-01',
+    lines: [
+      line({
+        lineId: 'line-0001',
+        unitPrice: '100.20',
+        productCategoryId: 'standard',
+        taxBehavior: 'exclusive',
+      }),
+      line({
+        lineId: 'charge:packaging',
+        kind: 'packaging',
+        unitPrice: '100.10',
+        merchantCategoryId: 'standard',
+        taxBehavior: 'country_default',
+      }),
+    ],
+  });
+  const chargeOracle = TaxEngine.calculate({
+    pack: officialIndiaPack,
+    currency: 'INR',
+    country: 'IN',
+    businessType: 'restaurant',
+    storeStateCode: 'KA',
+    transactionDate: '2026-06-01',
+    lines: [
+      line({
+        lineId: 'line-0001',
+        unitPrice: '100.20',
+        discount: '100.20',
+        productCategoryId: 'standard',
+        taxBehavior: 'exclusive',
+      }),
+      line({
+        lineId: 'charge:packaging',
+        kind: 'packaging',
+        unitPrice: '100.10',
+        merchantCategoryId: 'standard',
+        taxBehavior: 'country_default',
+      }),
+    ],
+  });
+
+  const allocatedWithCharge = allocateDocumentTaxRounding({
+    items: [
+      {
+        snapshot: { ...undiscountedWithCharge.snapshot, lines: [undiscountedWithCharge.lines[0]] },
+        lineIdOverride: 'line-0001',
+      },
+    ],
+    chargeTaxes: {
+      taxAmount: Number(undiscountedWithCharge.lines[1].taxAmount),
+      exclusiveTaxAmount: Number(undiscountedWithCharge.lines[1].taxAmount),
+      breakdowns: [[]],
+      snapshotJson: [
+        JSON.stringify({
+          ...undiscountedWithCharge.snapshot,
+          lines: [undiscountedWithCharge.lines[1]],
+          chargeKind: 'packaging',
+        }),
+      ],
+    },
+    currency: 'INR',
+    itemTaxRatio: new Decimal(0),
+  });
+
+  assert.equal(allocatedWithCharge.itemOutputs[0].taxAmount, 0);
+  assert.equal(allocatedWithCharge.chargeTaxes.taxAmount.toFixed(2), chargeOracle.taxAmount);
+
+  const single10010 = TaxEngine.calculate({
+    pack: officialIndiaPack,
+    currency: 'INR',
+    country: 'IN',
+    businessType: 'restaurant',
+    storeStateCode: 'KA',
+    transactionDate: '2026-06-01',
+    lines: [
+      line({
+        lineId: 'line-0001',
+        unitPrice: '100.10',
+        productCategoryId: 'standard',
+        taxBehavior: 'exclusive',
+      }),
+    ],
+  });
+  const charge10010 = TaxEngine.calculate({
+    pack: { ...officialIndiaPack, version: '2026.2.0' },
+    currency: 'INR',
+    country: 'IN',
+    businessType: 'restaurant',
+    storeStateCode: 'KA',
+    transactionDate: '2026-06-01',
+    lines: [
+      line({
+        lineId: 'charge:packaging',
+        kind: 'packaging',
+        unitPrice: '100.10',
+        merchantCategoryId: 'standard',
+        taxBehavior: 'country_default',
+      }),
+    ],
+  });
+  const mixedVersionItemsAlloc = allocateDocumentTaxRounding({
+    items: [
+      {
+        snapshot: { ...single10010.snapshot, lines: [single10010.lines[0]] },
+        lineIdOverride: 'line-0001',
+      },
+      {
+        snapshot: { ...charge10010.snapshot, lines: [single10010.lines[0]] },
+        lineIdOverride: 'line-0002',
+      },
+    ],
+    chargeTaxes: { taxAmount: 0, exclusiveTaxAmount: 0, breakdowns: [], snapshotJson: [] },
+    currency: 'INR',
+    itemTaxRatio: new Decimal('0.5'),
+  });
+  const mixedItemTax = mixedVersionItemsAlloc.itemOutputs
+    .reduce((acc, out) => acc.plus(out.taxAmount), new Decimal(0))
+    .toFixed(2);
+  assert.equal(mixedItemTax, '5.01');
+
+  const mixedVersionItemAndChargeAlloc = allocateDocumentTaxRounding({
+    items: [
+      {
+        snapshot: { ...single10010.snapshot, lines: [single10010.lines[0]] },
+        lineIdOverride: 'line-0001',
+      },
+    ],
+    chargeTaxes: {
+      taxAmount: Number(charge10010.lines[0].taxAmount),
+      exclusiveTaxAmount: Number(charge10010.lines[0].taxAmount),
+      breakdowns: [[]],
+      snapshotJson: [
+        JSON.stringify({
+          ...charge10010.snapshot,
+          lines: [charge10010.lines[0]],
+          chargeKind: 'packaging',
+        }),
+      ],
+    },
+    currency: 'INR',
+  });
+  const mixedItemAndChargeTax = new Decimal(mixedVersionItemAndChargeAlloc.itemOutputs[0].taxAmount)
+    .plus(mixedVersionItemAndChargeAlloc.chargeTaxes.taxAmount)
+    .toFixed(2);
+  assert.equal(mixedItemAndChargeTax, '10.01');
+
+  // Repeating-decimal flat discount ratio: 104.00 item + 0.10 charge with 88.00 flat discount (16 / 104)
+  const item104WithCharge = TaxEngine.calculate({
+    pack: officialIndiaPack,
+    currency: 'INR',
+    country: 'IN',
+    businessType: 'restaurant',
+    storeStateCode: 'KA',
+    transactionDate: '2026-06-01',
+    lines: [
+      line({
+        lineId: 'line-0001',
+        unitPrice: '104.00',
+        productCategoryId: 'standard',
+        taxBehavior: 'exclusive',
+      }),
+      line({
+        lineId: 'charge:packaging',
+        kind: 'packaging',
+        unitPrice: '0.10',
+        merchantCategoryId: 'standard',
+        taxBehavior: 'country_default',
+      }),
+    ],
+  });
+  const repeatingRatio = computeDiscountTaxRatio('16.00', '104.00');
+  const repeatingAlloc = allocateDocumentTaxRounding({
+    items: [
+      {
+        snapshot: { ...item104WithCharge.snapshot, lines: [item104WithCharge.lines[0]] },
+        lineIdOverride: 'line-0001',
+      },
+    ],
+    chargeTaxes: {
+      taxAmount: Number(item104WithCharge.lines[1].taxAmount),
+      exclusiveTaxAmount: Number(item104WithCharge.lines[1].taxAmount),
+      breakdowns: [[]],
+      snapshotJson: [
+        JSON.stringify({
+          ...item104WithCharge.snapshot,
+          lines: [item104WithCharge.lines[1]],
+          chargeKind: 'packaging',
+        }),
+      ],
+    },
+    currency: 'INR',
+    itemTaxRatio: repeatingRatio,
+  });
+  assert.equal(repeatingAlloc.itemOutputs[0].taxAmount.toFixed(2), '0.80');
+  assert.equal(repeatingAlloc.chargeTaxes.taxAmount.toFixed(2), '0.01');
+
+  // Line-scoped scaleTaxSnapshots keeps line-rounded amounts and does not sum discarded remainders
+  const lineScopedScaled = scaleTaxSnapshots(
+    [
+      JSON.stringify({
+        packId: 'line-pack',
+        taxRounding: { scope: 'line', method: 'half_up' },
+        lines: [
+          {
+            lineId: 'line-0001',
+            grossAmount: '10.16',
+            taxableBase: '10.16',
+            taxAmount: '0.50',
+            components: [
+              {
+                ruleId: 'a',
+                name: 'Tax A',
+                rate: '2.5',
+                amount: '0.25',
+                roundingRemainder: '0.004',
+              },
+              {
+                ruleId: 'b',
+                name: 'Tax B',
+                rate: '2.5',
+                amount: '0.25',
+                roundingRemainder: '0.004',
+              },
+            ],
+          },
+        ],
+      }),
+    ],
+    computeDiscountTaxRatio('10.14', '10.16'),
+    100,
+  );
+  const parsedLineScoped = JSON.parse(lineScopedScaled[0]);
+  assert.equal(parsedLineScoped.lines[0].taxAmount, '0.50');
+
+  // Line-scoped scaleTaxSnapshots preserves full Decimal ratio precision (16.10 / 104.00)
+  const lineScopedRepeating = scaleTaxSnapshots(
+    [
+      JSON.stringify({
+        packId: 'line-pack',
+        taxRounding: { scope: 'line', method: 'half_up' },
+        lines: [
+          {
+            lineId: 'line-0001',
+            grossAmount: '104.00',
+            taxableBase: '104.00',
+            taxAmount: '5.20',
+            components: [
+              {
+                ruleId: 'cgst',
+                name: 'CGST',
+                rate: '2.5',
+                amount: '2.60',
+                roundingRemainder: '0',
+              },
+              {
+                ruleId: 'sgst',
+                name: 'SGST',
+                rate: '2.5',
+                amount: '2.60',
+                roundingRemainder: '0',
+              },
+            ],
+          },
+        ],
+      }),
+    ],
+    computeDiscountTaxRatio('16.10', '104.00'),
+    100,
+  );
+  const parsedLineRepeating = JSON.parse(lineScopedRepeating[0]);
+  assert.equal(parsedLineRepeating.lines[0].taxAmount, '0.81');
+});
+
+test('3-decimal (KWD, BHD, OMR, JOD, TND) and 0-decimal (JPY, KRW, VND, COP) currency precision and Japan pack', () => {
+  const genericPack: CountryPack = {
+    ...packWith([
+      { id: 'vat-5', label: 'VAT', type: 'percent', categoryIds: ['standard'], rate: '5' },
+    ]),
+    currency: 'XXX',
+  };
+
+  for (const code of ['KWD', 'BHD', 'OMR', 'JOD', 'TND']) {
+    assert.equal(
+      resolvePayableIncrement(genericPack, code),
+      '0.001',
+      `${code} resolves to 0.001 payable increment on generic XXX pack`,
+    );
+    const exact3dp = applyPayableRounding(1.234, genericPack, code);
+    assert.equal(exact3dp.total, 1.234, `${code} preserves 1.234 payable total`);
+    assert.equal(exact3dp.adjustment, 0);
+    const fourFils = applyPayableRounding(0.004, genericPack, code);
+    assert.equal(fourFils.total, 0.004, `${code} preserves 0.004 payable total`);
+    assert.equal(fourFils.adjustment, 0);
+
+    const calc3dp = TaxEngine.calculate({
+      pack: genericPack,
+      currency: code,
+      country: 'KW',
+      transactionDate: '2026-07-27',
+      lines: [
+        line({
+          unitPrice: '1.234',
+          productCategoryId: 'standard',
+          taxBehavior: 'exclusive',
+        }),
+      ],
+    });
+    assert.equal(calc3dp.lines[0].grossAmount, '1.234');
+    assert.equal(calc3dp.lines[0].taxableBase, '1.234');
+    assert.equal(calc3dp.lines[0].taxAmount, '0.062');
+    assert.equal(calc3dp.taxAmount, '0.062');
+    assert.equal(calc3dp.payableTotal, '1.296');
+  }
+
+  for (const code of ['JPY', 'KRW', 'VND', 'COP']) {
+    assert.equal(
+      resolvePayableIncrement(genericPack, code),
+      '1',
+      `${code} resolves to whole-unit payable increment '1' on generic XXX pack`,
+    );
+    const rounded0dp = applyPayableRounding(1080.4, genericPack, code);
+    assert.equal(rounded0dp.total, 1080, `${code} rounds payable total to whole unit`);
+    assert.equal(rounded0dp.adjustment, 0);
+
+    const calc0dp = TaxEngine.calculate({
+      pack: genericPack,
+      currency: code,
+      country: 'JP',
+      transactionDate: '2026-07-27',
+      lines: [
+        line({
+          unitPrice: '105',
+          productCategoryId: 'standard',
+          taxBehavior: 'exclusive',
+        }),
+      ],
+    });
+    assert.equal(calc0dp.taxAmount, '5');
+    assert.equal(calc0dp.payableTotal, '110');
+    assert.equal(calc0dp.payableRoundingAdjustment, '0');
+  }
+
+  const japanPack = JSON.parse(
+    fs.readFileSync(path.join(__dirname, '../main/tax-packs/community-japan.json'), 'utf8'),
+  ) as CountryPack;
+  assert.equal(japanPack.country, 'JP');
+  assert.equal(japanPack.currency, 'JPY');
+  assert.equal(resolvePayableIncrement(japanPack, 'JPY'), '1');
+
+  const jpCalc = TaxEngine.calculate({
+    pack: japanPack,
+    currency: 'JPY',
+    country: 'JP',
+    transactionDate: '2026-08-24',
+    lines: [
+      line({
+        lineId: 'dine-in-ramen',
+        unitPrice: '1100',
+        productCategoryId: 'standard',
+        taxBehavior: 'inclusive',
+      }),
+      line({
+        lineId: 'takeaway-bento',
+        unitPrice: '1080',
+        productCategoryId: 'takeaway',
+        taxBehavior: 'inclusive',
+      }),
+    ],
+  });
+  assert.equal(jpCalc.snapshot.taxRounding.decimalPlaces, 0);
+  assert.equal(jpCalc.snapshot.payableRounding.increment, '1');
+  assert.equal(jpCalc.lines[0].taxableBase, '1000');
+  assert.equal(jpCalc.lines[0].taxAmount, '100');
+  assert.equal(jpCalc.lines[1].taxableBase, '1000');
+  assert.equal(jpCalc.lines[1].taxAmount, '80');
+  assert.equal(jpCalc.taxAmount, '180');
+  assert.equal(jpCalc.payableTotal, '2180');
 });

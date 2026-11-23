@@ -1,124 +1,1118 @@
 'use client';
 
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
+import { useTranslations } from 'use-intl';
 import api from '@/lib/api';
 import { useAuthStore } from '@/store/auth';
-import type { Order } from '@/lib/types';
+import { useFormatDate } from '@/hooks/useFormatDate';
+import {
+  CUSTOMER_DISPLAY_DEFAULTS,
+  CUSTOMER_DISPLAY_FEED_PATH,
+  MAX_DISPLAY_FEED_PAGES,
+  fetchSignedInBoardOrders,
+  isCustomerDisplayConfig,
+  isCustomerDisplayFeed,
+  type BoardOrder,
+  type CustomerDisplayConfig,
+  type CustomerDisplayFeed,
+  type SignedInOrdersPageResponse,
+} from '@/lib/customer-display';
+import {
+  clearStoredDisplayToken,
+  consumeDisplayTokenFromUrl,
+  readStoredDisplayToken,
+} from '@/lib/customer-display-token';
 
-const ACTIVE_STATUSES = new Set<Order['status']>(['pending', 'preparing', 'ready']);
+type OrderGroup = 'priority' | 'ordinary';
 
-function getCustomerOrderNumber(order: Order): string {
-  return order.bill?.bill_number || order.order_number;
+interface OrderBoardPage {
+  orderIds: string[];
+  group: OrderGroup;
+  cycle: number;
+}
+
+interface OrderBoardSectionProps {
+  accent: 'blue' | 'emerald';
+  emptyMessage: string;
+  hint: string;
+  isReady: boolean;
+  newlyReadyOrderIds: ReadonlySet<string>;
+  onPriorityOrdersShown: (orderIds: string[]) => void;
+  orders: BoardOrder[];
+  title: string;
+}
+
+const ORDER_PAGE_INTERVAL_MS = 10_000;
+const CUSTOMER_DISPLAY_REQUEST_TIMEOUT_MS = 10_000;
+const CUSTOMER_DISPLAY_RATE_LIMIT_WINDOW_MS = 60_000;
+const CUSTOMER_DISPLAY_READ_LIMIT_PER_WINDOW = 120;
+const ORDER_ROW_GAP_FALLBACK = 12;
+const ORDER_ROW_HEIGHT_FALLBACK = 72;
+
+function getPollIntervalMs(refreshSeconds: number, pageRequests: number): number {
+  const configuredMs = refreshSeconds * 1000;
+  const pages = Math.max(1, pageRequests);
+  const maxPollsPerWindow = Math.max(
+    1,
+    Math.floor(CUSTOMER_DISPLAY_READ_LIMIT_PER_WINDOW / pages) - (pages > 1 ? 1 : 0),
+  );
+  const rateLimitFloorMs = Math.ceil(CUSTOMER_DISPLAY_RATE_LIMIT_WINDOW_MS / maxPollsPerWindow);
+  return Math.max(configuredMs, rateLimitFloorMs);
+}
+
+function getOrderId(order: BoardOrder): string {
+  return String(order.id);
+}
+
+function getPageKey(orderIds: string[]): string {
+  return orderIds.join('\u001f');
+}
+
+function paginateOrders(
+  orders: BoardOrder[],
+  availableHeight: number,
+  rowHeights: ReadonlyMap<string, number>,
+  rowGap: number,
+): BoardOrder[][] {
+  if (orders.length === 0) return [];
+  if (availableHeight <= 0) return [orders];
+
+  const pages: BoardOrder[][] = [];
+  let page: BoardOrder[] = [];
+  let usedHeight = 0;
+
+  for (const order of orders) {
+    const rowHeight = rowHeights.get(getOrderId(order)) ?? ORDER_ROW_HEIGHT_FALLBACK;
+    const nextHeight = rowHeight + (page.length > 0 ? rowGap : 0);
+    if (page.length > 0 && usedHeight + nextHeight > availableHeight) {
+      pages.push(page);
+      page = [];
+      usedHeight = 0;
+    }
+    if (page.length > 0) usedHeight += rowGap;
+    page.push(order);
+    usedHeight += rowHeight;
+  }
+
+  if (page.length > 0) pages.push(page);
+  return pages;
+}
+
+function orderIdsFit(
+  orderIds: string[],
+  availableHeight: number,
+  rowHeights: ReadonlyMap<string, number>,
+  rowGap: number,
+): boolean {
+  if (availableHeight <= 0) return true;
+  const height = orderIds.reduce(
+    (total, id) => total + (rowHeights.get(id) ?? ORDER_ROW_HEIGHT_FALLBACK),
+    Math.max(0, orderIds.length - 1) * rowGap,
+  );
+  return height <= availableHeight + 1;
+}
+
+function OrderBoardRow({
+  accent,
+  measureRef,
+  order,
+}: {
+  accent: 'blue' | 'emerald';
+  measureRef?: (node: HTMLDivElement | null) => void;
+  order: BoardOrder;
+}) {
+  return (
+    <div
+      ref={measureRef}
+      data-testid="customer-display-order-row"
+      data-order-id={getOrderId(order)}
+      className={`min-w-0 rounded-2xl border bg-slate-900/80 px-4 py-3 text-center md:px-6 md:py-4 ${accent === 'blue' ? 'border-blue-900/60' : 'border-emerald-900/60'}`}
+    >
+      <span className="block min-w-0 break-all text-[clamp(1.875rem,1.5vw,3.75rem)] font-black leading-tight">
+        {order.number}
+      </span>
+    </div>
+  );
+}
+
+function OrderBoardSection({
+  accent,
+  emptyMessage,
+  hint,
+  isReady,
+  newlyReadyOrderIds,
+  onPriorityOrdersShown,
+  orders,
+  title,
+}: OrderBoardSectionProps) {
+  const [isPagedLayout, setIsPagedLayout] = useState(false);
+  const [isPageVisible, setIsPageVisible] = useState(true);
+  const [metrics, setMetrics] = useState<{
+    availableHeight: number;
+    rowHeights: Map<string, number>;
+    rowGap: number;
+  }>({ availableHeight: 0, rowHeights: new Map(), rowGap: ORDER_ROW_GAP_FALLBACK });
+  const [activePage, setActivePage] = useState<OrderBoardPage>({
+    orderIds: [],
+    group: 'ordinary',
+    cycle: 0,
+  });
+  const activePageRef = useRef(activePage);
+  const ordinaryPageCursorRef = useRef(0);
+  const listRef = useRef<HTMLDivElement>(null);
+  const probeContainerRef = useRef<HTMLDivElement>(null);
+  const probeRowsRef = useRef(new Map<string, HTMLDivElement>());
+  const priorityCallbackRef = useRef(onPriorityOrdersShown);
+
+  const orderById = useMemo(
+    () => new Map(orders.map((order) => [getOrderId(order), order])),
+    [orders],
+  );
+  const activePriorityIdSet = useMemo(
+    () =>
+      isReady && activePage.group === 'priority' ? new Set(activePage.orderIds) : new Set<string>(),
+    [activePage.group, activePage.orderIds, isReady],
+  );
+  const priorityOrders = useMemo(
+    () =>
+      isReady
+        ? orders.filter(
+            (order) =>
+              newlyReadyOrderIds.has(getOrderId(order)) &&
+              !activePriorityIdSet.has(getOrderId(order)),
+          )
+        : [],
+    [activePriorityIdSet, isReady, newlyReadyOrderIds, orders],
+  );
+  const activePriorityOrders = useMemo(
+    () =>
+      isReady && activePriorityIdSet.size > 0
+        ? orders.filter((order) => activePriorityIdSet.has(getOrderId(order)))
+        : [],
+    [activePriorityIdSet, isReady, orders],
+  );
+  const ordinaryOrders = useMemo(
+    () => (isReady ? orders.filter((order) => !newlyReadyOrderIds.has(getOrderId(order))) : orders),
+    [isReady, newlyReadyOrderIds, orders],
+  );
+  const displayOrdinaryOrders = useMemo(
+    () =>
+      isReady
+        ? orders.filter(
+            (order) =>
+              !newlyReadyOrderIds.has(getOrderId(order)) &&
+              !activePriorityIdSet.has(getOrderId(order)),
+          )
+        : orders,
+    [activePriorityIdSet, isReady, newlyReadyOrderIds, orders],
+  );
+  const areOrdersMeasured = useMemo(
+    () =>
+      metrics.availableHeight > 0 &&
+      orders.every((order) => metrics.rowHeights.has(getOrderId(order))),
+    [metrics.availableHeight, metrics.rowHeights, orders],
+  );
+  const combinedPages = useMemo(
+    () => paginateOrders(orders, metrics.availableHeight, metrics.rowHeights, metrics.rowGap),
+    [metrics.availableHeight, metrics.rowGap, metrics.rowHeights, orders],
+  );
+  const priorityPages = useMemo(
+    () =>
+      combinedPages.length <= 1 || priorityOrders.length === 0
+        ? []
+        : paginateOrders(
+            priorityOrders,
+            metrics.availableHeight,
+            metrics.rowHeights,
+            metrics.rowGap,
+          ),
+    [
+      combinedPages.length,
+      metrics.availableHeight,
+      metrics.rowGap,
+      metrics.rowHeights,
+      priorityOrders,
+    ],
+  );
+  const activePriorityPages = useMemo(
+    () =>
+      combinedPages.length <= 1 || activePriorityOrders.length === 0
+        ? []
+        : paginateOrders(
+            activePriorityOrders,
+            metrics.availableHeight,
+            metrics.rowHeights,
+            metrics.rowGap,
+          ),
+    [
+      activePriorityOrders,
+      combinedPages.length,
+      metrics.availableHeight,
+      metrics.rowGap,
+      metrics.rowHeights,
+    ],
+  );
+  const ordinaryPages = useMemo(
+    () =>
+      combinedPages.length <= 1 || priorityOrders.length === 0
+        ? combinedPages
+        : paginateOrders(
+            ordinaryOrders,
+            metrics.availableHeight,
+            metrics.rowHeights,
+            metrics.rowGap,
+          ),
+    [
+      combinedPages,
+      metrics.availableHeight,
+      metrics.rowGap,
+      metrics.rowHeights,
+      ordinaryOrders,
+      priorityOrders.length,
+    ],
+  );
+  const displayOrdinaryPages = useMemo(
+    () =>
+      combinedPages.length <= 1 ||
+      (priorityOrders.length === 0 && activePriorityOrders.length === 0)
+        ? combinedPages
+        : paginateOrders(
+            displayOrdinaryOrders,
+            metrics.availableHeight,
+            metrics.rowHeights,
+            metrics.rowGap,
+          ),
+    [
+      activePriorityOrders.length,
+      combinedPages,
+      displayOrdinaryOrders,
+      metrics.availableHeight,
+      metrics.rowGap,
+      metrics.rowHeights,
+      priorityOrders.length,
+    ],
+  );
+  const hasMultiplePages = isPagedLayout && combinedPages.length > 1;
+  const allPages = useMemo(
+    () =>
+      activePriorityPages.length > 0 || priorityPages.length > 0
+        ? [
+            ...displayOrdinaryPages.map((page) => ({ page, group: 'ordinary' as const })),
+            ...activePriorityPages.map((page) => ({ page, group: 'priority' as const })),
+            ...priorityPages.map((page) => ({ page, group: 'priority' as const })),
+          ]
+        : combinedPages.map((page) => ({ page, group: 'ordinary' as const })),
+    [activePriorityPages, combinedPages, displayOrdinaryPages, priorityPages],
+  );
+  const priorityPagesRef = useRef(priorityPages);
+  const ordinaryPagesRef = useRef(ordinaryPages);
+
+  useLayoutEffect(() => {
+    priorityCallbackRef.current = onPriorityOrdersShown;
+    priorityPagesRef.current = priorityPages;
+    ordinaryPagesRef.current = ordinaryPages;
+  }, [onPriorityOrdersShown, ordinaryPages, priorityPages]);
+
+  const updateActivePage = useCallback(
+    (nextPage: Omit<OrderBoardPage, 'cycle'>, resetTimer = true) => {
+      const current = activePageRef.current;
+      if (
+        current.group === nextPage.group &&
+        getPageKey(current.orderIds) === getPageKey(nextPage.orderIds)
+      ) {
+        return;
+      }
+      const updated: OrderBoardPage = {
+        ...nextPage,
+        cycle: resetTimer ? current.cycle + 1 : current.cycle,
+      };
+      activePageRef.current = updated;
+      setActivePage(updated);
+    },
+    [],
+  );
+
+  const selectNextPage = useCallback(
+    (currentPriorityPages: BoardOrder[][], currentOrdinaryPages: BoardOrder[][]) => {
+      const active = activePageRef.current;
+      const activeKey = getPageKey(active.orderIds);
+      const hasAlternateOrdinaryPage = currentOrdinaryPages.some(
+        (page) => getPageKey(page.map(getOrderId)) !== activeKey,
+      );
+      let selectedGroup: OrderGroup | null = null;
+      if (active.group === 'priority' && hasAlternateOrdinaryPage) {
+        selectedGroup = 'ordinary';
+      } else if (currentPriorityPages.length > 0) {
+        selectedGroup = 'priority';
+      } else if (currentOrdinaryPages.length > 0) {
+        selectedGroup = 'ordinary';
+      }
+      if (!selectedGroup) return;
+
+      let selectedPage: BoardOrder[] | undefined;
+      if (selectedGroup === 'priority') {
+        selectedPage = currentPriorityPages[0];
+      } else {
+        const cursor = ordinaryPageCursorRef.current % currentOrdinaryPages.length;
+        let selectedIndex = cursor;
+        for (let offset = 0; offset < currentOrdinaryPages.length; offset += 1) {
+          const candidateIndex = (cursor + offset) % currentOrdinaryPages.length;
+          const candidateKey = getPageKey(currentOrdinaryPages[candidateIndex].map(getOrderId));
+          if (candidateKey !== activeKey || currentOrdinaryPages.length === 1) {
+            selectedIndex = candidateIndex;
+            break;
+          }
+        }
+        selectedPage = currentOrdinaryPages[selectedIndex];
+        ordinaryPageCursorRef.current = (selectedIndex + 1) % currentOrdinaryPages.length;
+      }
+
+      if (!selectedPage) return;
+      const orderIds = selectedPage.map(getOrderId);
+      updateActivePage({ orderIds, group: selectedGroup });
+      if (selectedGroup === 'priority') {
+        priorityCallbackRef.current(orderIds);
+      }
+    },
+    [updateActivePage],
+  );
+
+  const measureRows = useCallback(() => {
+    if (!isPagedLayout || !isPageVisible) return;
+    const list = listRef.current;
+    const probes = probeContainerRef.current;
+    if (!list || !probes) return;
+
+    const style = window.getComputedStyle(list);
+    const availableHeight = Math.max(
+      0,
+      list.clientHeight -
+        Number.parseFloat(style.paddingTop) -
+        Number.parseFloat(style.paddingBottom),
+    );
+    const measuredRowGap = Number.parseFloat(window.getComputedStyle(probes).rowGap);
+    const rowGap = Number.isFinite(measuredRowGap) ? measuredRowGap : ORDER_ROW_GAP_FALLBACK;
+    const rowHeights = new Map(
+      [...probeRowsRef.current].map(([id, row]) => [id, row.getBoundingClientRect().height]),
+    );
+    setMetrics((current) => {
+      const sameHeights =
+        current.rowHeights.size === rowHeights.size &&
+        [...rowHeights].every(([id, height]) => {
+          const previousHeight = current.rowHeights.get(id);
+          return previousHeight !== undefined && Math.abs(previousHeight - height) < 0.5;
+        });
+      if (
+        Math.abs(current.availableHeight - availableHeight) < 0.5 &&
+        Math.abs(current.rowGap - rowGap) < 0.5 &&
+        sameHeights
+      ) {
+        return current;
+      }
+      return { availableHeight, rowHeights, rowGap };
+    });
+  }, [isPagedLayout, isPageVisible]);
+
+  useEffect(() => {
+    const media = window.matchMedia('(min-width: 768px)');
+    const updateLayout = () => setIsPagedLayout(media.matches);
+    updateLayout();
+    media.addEventListener('change', updateLayout);
+    return () => media.removeEventListener('change', updateLayout);
+  }, []);
+
+  useEffect(() => {
+    const updateVisibility = () => setIsPageVisible(document.visibilityState === 'visible');
+    updateVisibility();
+    document.addEventListener('visibilitychange', updateVisibility);
+    return () => document.removeEventListener('visibilitychange', updateVisibility);
+  }, []);
+
+  useEffect(() => {
+    if (!isPagedLayout || !isPageVisible) return;
+    const list = listRef.current;
+    const probes = probeContainerRef.current;
+    if (!list || !probes) return;
+
+    const observer = new ResizeObserver(measureRows);
+    observer.observe(list);
+    observer.observe(probes);
+    measureRows();
+    return () => observer.disconnect();
+  }, [isPagedLayout, isPageVisible, measureRows]);
+
+  useLayoutEffect(() => {
+    measureRows();
+  }, [measureRows, orders]);
+
+  useLayoutEffect(() => {
+    const active = activePageRef.current;
+    const eligible = new Set(orders.map(getOrderId));
+    const retainedIds = active.orderIds.filter((id) => eligible.has(id));
+
+    if (!isPagedLayout) {
+      if (getPageKey(active.orderIds) !== getPageKey(retainedIds)) {
+        updateActivePage({ group: active.group, orderIds: retainedIds }, false);
+      }
+      return;
+    }
+
+    if (orders.length === 0) {
+      updateActivePage({ orderIds: [], group: 'ordinary' }, false);
+      ordinaryPageCursorRef.current = 0;
+      return;
+    }
+
+    if (!areOrdersMeasured) {
+      if (getPageKey(active.orderIds) !== getPageKey(retainedIds)) {
+        updateActivePage({ group: active.group, orderIds: retainedIds }, false);
+      }
+      return;
+    }
+
+    if (combinedPages.length === 1) {
+      const orderIds = combinedPages[0].map(getOrderId);
+      updateActivePage(
+        {
+          orderIds,
+          group: 'ordinary',
+        },
+        false,
+      );
+      ordinaryPageCursorRef.current = 0;
+      if (priorityOrders.length > 0) {
+        priorityCallbackRef.current(priorityOrders.map(getOrderId));
+      }
+      return;
+    }
+
+    if (
+      retainedIds.length > 0 &&
+      orderIdsFit(retainedIds, metrics.availableHeight, metrics.rowHeights, metrics.rowGap)
+    ) {
+      if (getPageKey(active.orderIds) !== getPageKey(retainedIds)) {
+        updateActivePage({ group: active.group, orderIds: retainedIds }, false);
+      }
+      return;
+    }
+
+    if (retainedIds.length > 0) {
+      const currentPage = allPages.find(({ page }) =>
+        page.some((order) => getOrderId(order) === retainedIds[0]),
+      );
+      if (currentPage) {
+        const orderIds = currentPage.page.map(getOrderId);
+        updateActivePage({ orderIds, group: currentPage.group });
+        if (currentPage.group === 'priority') {
+          priorityCallbackRef.current(orderIds);
+        } else {
+          const pageIndex = ordinaryPages.findIndex(
+            (page) => getPageKey(page.map(getOrderId)) === getPageKey(orderIds),
+          );
+          ordinaryPageCursorRef.current = (pageIndex + 1) % ordinaryPages.length;
+        }
+        return;
+      }
+    }
+
+    selectNextPage(priorityPages, ordinaryPages);
+  }, [
+    allPages,
+    areOrdersMeasured,
+    combinedPages,
+    isPagedLayout,
+    metrics.availableHeight,
+    metrics.rowGap,
+    metrics.rowHeights,
+    orders,
+    ordinaryPages,
+    priorityOrders,
+    priorityPages,
+    selectNextPage,
+    updateActivePage,
+  ]);
+
+  useEffect(() => {
+    if (!isPagedLayout || !isPageVisible || !hasMultiplePages) return;
+    const interval = window.setInterval(() => {
+      if (document.visibilityState !== 'visible') return;
+      selectNextPage(priorityPagesRef.current, ordinaryPagesRef.current);
+    }, ORDER_PAGE_INTERVAL_MS);
+    return () => window.clearInterval(interval);
+  }, [activePage.cycle, hasMultiplePages, isPagedLayout, isPageVisible, selectNextPage]);
+
+  const visibleOrders = isPagedLayout
+    ? activePage.orderIds
+        .map((id) => orderById.get(id))
+        .filter((order): order is BoardOrder => !!order)
+    : orders;
+  const totalPages = allPages.length;
+  const activePageIndex = useMemo(() => {
+    if (allPages.length === 0) return 0;
+    const activeIdsKey = getPageKey(activePage.orderIds);
+    const exactMatch = allPages.findIndex(
+      (entry) =>
+        entry.group === activePage.group && getPageKey(entry.page.map(getOrderId)) === activeIdsKey,
+    );
+    if (exactMatch >= 0) return exactMatch;
+    if (activePage.orderIds.length > 0) {
+      const firstId = activePage.orderIds[0];
+      const byFirstOrder = allPages.findIndex((entry) =>
+        entry.page.some((order) => getOrderId(order) === firstId),
+      );
+      if (byFirstOrder >= 0) return byFirstOrder;
+    }
+    return 0;
+  }, [activePage.group, activePage.orderIds, allPages]);
+  const hiddenOrderCount = Math.max(0, orders.length - visibleOrders.length);
+  const dataTestId = isReady
+    ? 'customer-display-ready-scroll'
+    : 'customer-display-preparing-scroll';
+
+  return (
+    <section
+      className={`flex min-w-0 flex-col overflow-hidden rounded-3xl border ${accent === 'blue' ? 'border-blue-900/70 bg-blue-950/60' : 'border-emerald-900/70 bg-emerald-950/60'}`}
+    >
+      <div
+        className={`relative shrink-0 border-b px-5 py-4 md:px-6 md:py-5 ${accent === 'blue' ? 'border-blue-800/60 bg-blue-900/50' : 'border-emerald-800/60 bg-emerald-900/50'}`}
+      >
+        <div className="flex min-w-0 items-start justify-between gap-4">
+          <div className="min-w-0">
+            <h2 className="text-[clamp(1.875rem,1.5vw,3.75rem)] font-extrabold uppercase tracking-wide">
+              {title}
+            </h2>
+            <p
+              className={`mt-1 text-[clamp(1rem,0.8vw,2rem)] ${accent === 'blue' ? 'text-blue-200/70' : 'text-emerald-200/70'}`}
+            >
+              {hint}
+            </p>
+          </div>
+          {hasMultiplePages && (
+            <div
+              data-testid="customer-display-page-indicator"
+              className="ltr-island flex shrink-0 flex-col items-end gap-1.5 pt-1"
+            >
+              <div className="flex items-center gap-2">
+                <span
+                  className={`rounded-full border px-2.5 py-0.5 text-sm font-bold tabular-nums md:px-3 md:py-1 md:text-base ${
+                    accent === 'blue'
+                      ? 'border-blue-400/40 bg-blue-950/80 text-blue-100'
+                      : 'border-emerald-400/40 bg-emerald-950/80 text-emerald-100'
+                  }`}
+                >
+                  {activePageIndex + 1} / {totalPages}
+                </span>
+                {hiddenOrderCount > 0 && (
+                  <span
+                    data-testid="customer-display-overflow-count"
+                    className={`rounded-full border px-2.5 py-0.5 text-sm font-extrabold tabular-nums md:px-3 md:py-1 md:text-base ${
+                      accent === 'blue'
+                        ? 'border-blue-300/50 bg-blue-500/25 text-blue-100'
+                        : 'border-emerald-300/50 bg-emerald-500/25 text-emerald-100'
+                    }`}
+                  >
+                    +{hiddenOrderCount}
+                  </span>
+                )}
+              </div>
+              <div className="flex h-2 shrink-0 flex-nowrap items-center justify-end gap-1.5 overflow-hidden">
+                {(() => {
+                  const maxVisibleDots = 7;
+                  const windowSize = Math.min(allPages.length, maxVisibleDots);
+                  const dotWindowStart = Math.max(
+                    0,
+                    Math.min(
+                      activePageIndex - Math.floor(windowSize / 2),
+                      allPages.length - windowSize,
+                    ),
+                  );
+                  return allPages
+                    .slice(dotWindowStart, dotWindowStart + windowSize)
+                    .map((entry, offset) => {
+                      const index = dotWindowStart + offset;
+                      const isActive = index === activePageIndex;
+                      return (
+                        <span
+                          key={`${entry.group}:${getPageKey(entry.page.map(getOrderId))}`}
+                          data-testid="customer-display-page-dot"
+                          data-active={isActive ? 'true' : 'false'}
+                          className={`h-2 shrink-0 rounded-full transition-all duration-300 ${
+                            isActive
+                              ? accent === 'blue'
+                                ? 'w-5 bg-blue-300'
+                                : 'w-5 bg-emerald-300'
+                              : accent === 'blue'
+                                ? 'w-2 bg-blue-300/35'
+                                : 'w-2 bg-emerald-300/35'
+                          }`}
+                        />
+                      );
+                    });
+                })()}
+              </div>
+            </div>
+          )}
+        </div>
+        {hasMultiplePages && (
+          <div
+            data-testid="customer-display-page-timer"
+            aria-hidden="true"
+            className={`pointer-events-none absolute inset-x-0 bottom-0 h-1.5 w-full overflow-hidden ${
+              accent === 'blue' ? 'bg-blue-950/80' : 'bg-emerald-950/80'
+            }`}
+          >
+            {isPageVisible && (
+              <div
+                key={activePage.cycle}
+                data-testid="customer-display-page-timer-bar"
+                className={`flo-display-page-timer-bar ${
+                  accent === 'blue' ? 'bg-blue-400' : 'bg-emerald-400'
+                }`}
+                style={{ animationDuration: `${ORDER_PAGE_INTERVAL_MS}ms` }}
+              />
+            )}
+          </div>
+        )}
+      </div>
+      <div
+        ref={listRef}
+        data-testid={dataTestId}
+        className="relative min-w-0 p-4 md:min-h-0 md:flex-1 md:overflow-hidden md:p-6"
+      >
+        {visibleOrders.length === 0 ? (
+          <div className="py-8 text-center text-lg text-slate-500 md:flex md:h-full md:items-center md:justify-center">
+            {emptyMessage}
+          </div>
+        ) : (
+          <div className="flex min-w-0 flex-col gap-3">
+            {visibleOrders.map((order) => (
+              <OrderBoardRow key={getOrderId(order)} accent={accent} order={order} />
+            ))}
+          </div>
+        )}
+        {isPagedLayout && (
+          <div
+            ref={probeContainerRef}
+            aria-hidden="true"
+            className="pointer-events-none invisible absolute inset-x-4 top-4 flex min-w-0 flex-col gap-3 md:inset-x-6 md:top-6"
+          >
+            {orders.map((order) => {
+              const id = getOrderId(order);
+              return (
+                <OrderBoardRow
+                  key={id}
+                  accent={accent}
+                  measureRef={(node) => {
+                    if (node) probeRowsRef.current.set(id, node);
+                    else probeRowsRef.current.delete(id);
+                  }}
+                  order={order}
+                />
+              );
+            })}
+          </div>
+        )}
+      </div>
+    </section>
+  );
 }
 
 export default function CustomerDisplayPage() {
   const router = useRouter();
+  const t = useTranslations('customerDisplay');
+  const tc = useTranslations('common');
+  const { formatTime } = useFormatDate();
   const { user, currentTenant, loading: authLoading, loadFromStorage } = useAuthStore();
-  const [orders, setOrders] = useState<Order[]>([]);
+  const userId = user?.id ?? null;
+  const tenantId = currentTenant?.id ?? null;
+  const [orders, setOrders] = useState<BoardOrder[]>([]);
+  const [newlyReadyOrderIds, setNewlyReadyOrderIds] = useState<Set<string>>(new Set());
+  const [pairedToken, setPairedToken] = useState<string | null | undefined>(undefined);
+  const [unpaired, setUnpaired] = useState(false);
+  const [businessName, setBusinessName] = useState('');
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(false);
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
+  const [config, setConfig] = useState<CustomerDisplayConfig>(CUSTOMER_DISPLAY_DEFAULTS);
+  const feedSessionRef = useRef(0);
+  const feedRequestRef = useRef(0);
+  const feedInFlightRef = useRef<{
+    session: number;
+    request: number;
+    controller: AbortController;
+    timeout: number;
+  } | null>(null);
+  const previousReadyOrderIdsRef = useRef<Set<string> | null>(null);
+  const readyTrackingContextRef = useRef<{
+    pairedToken: string | null;
+    userId: number | null;
+    tenantId: number | null;
+  } | null>(null);
+  const configRef = useRef(config);
+  const pollPageCountRef = useRef(1);
+  const syncPollIntervalRef = useRef<
+    ((refreshSeconds: number, pageRequests: number) => void) | null
+  >(null);
+  useLayoutEffect(() => {
+    configRef.current = config;
+  }, [config]);
+
+  const acceptOrders = useCallback((nextOrders: BoardOrder[]) => {
+    const nextReadyIds = new Set(
+      nextOrders.filter((order) => order.status === 'ready').map(getOrderId),
+    );
+    const previousReadyIds = previousReadyOrderIdsRef.current;
+    if (previousReadyIds) {
+      setNewlyReadyOrderIds((current) => {
+        const next = new Set([...current].filter((id) => nextReadyIds.has(id)));
+        for (const id of nextReadyIds) {
+          if (!previousReadyIds.has(id)) next.add(id);
+        }
+        return next;
+      });
+    } else {
+      setNewlyReadyOrderIds(new Set());
+    }
+    previousReadyOrderIdsRef.current = nextReadyIds;
+    setOrders(nextOrders);
+  }, []);
+
+  const fetchPairedFeed = useCallback(
+    async (token: string, session: number) => {
+      if (feedInFlightRef.current?.session === session) return;
+      const request = ++feedRequestRef.current;
+      const controller = new AbortController();
+      const inFlight = { session, request, controller, timeout: 0 };
+      const resetRequestTimeout = () => {
+        window.clearTimeout(inFlight.timeout);
+        inFlight.timeout = window.setTimeout(
+          () => controller.abort(),
+          CUSTOMER_DISPLAY_REQUEST_TIMEOUT_MS,
+        );
+      };
+      feedInFlightRef.current = inFlight;
+      let pageRequests = 0;
+      try {
+        let firstFeed: CustomerDisplayFeed | null = null;
+        const pages: BoardOrder[][] = [];
+        const visitedCursors = new Set<string>();
+        let cursor: string | null = null;
+
+        for (let pageIndex = 0; pageIndex < MAX_DISPLAY_FEED_PAGES; pageIndex += 1) {
+          const url = new URL(`/api${CUSTOMER_DISPLAY_FEED_PATH}`, window.location.origin);
+          if (cursor) {
+            url.searchParams.set('cursor', cursor);
+          }
+          pageRequests += 1;
+          resetRequestTimeout();
+          const response = await fetch(url.toString(), {
+            headers: { Authorization: `Bearer ${token}` },
+            cache: 'no-store',
+            signal: controller.signal,
+          });
+          if (response.status === 401) {
+            if (session !== feedSessionRef.current) return;
+            feedSessionRef.current += 1;
+            feedRequestRef.current += 1;
+            window.clearTimeout(inFlight.timeout);
+            feedInFlightRef.current = null;
+            previousReadyOrderIdsRef.current = null;
+            setNewlyReadyOrderIds(new Set());
+            clearStoredDisplayToken();
+            setOrders([]);
+            setLastUpdated(null);
+            setError(false);
+            setUnpaired(true);
+            return;
+          }
+          const feed: unknown = await response.json();
+          if (!response.ok || !isCustomerDisplayFeed(feed)) throw new Error('feed unavailable');
+          if (session !== feedSessionRef.current || request !== feedRequestRef.current) return;
+          if (!firstFeed) {
+            firstFeed = feed;
+          }
+          pages.push(feed.orders);
+          const nextCursor =
+            feed.has_more === false
+              ? null
+              : typeof feed.next_cursor === 'string' && feed.next_cursor.length > 0
+                ? feed.next_cursor
+                : null;
+          if (!nextCursor || visitedCursors.has(nextCursor)) break;
+          visitedCursors.add(nextCursor);
+          cursor = nextCursor;
+        }
+
+        if (!firstFeed || session !== feedSessionRef.current || request !== feedRequestRef.current)
+          return;
+        const mergedById = new Map<string, BoardOrder>();
+        for (let i = pages.length - 1; i >= 0; i -= 1) {
+          for (const order of pages[i]) {
+            const id = getOrderId(order);
+            if (mergedById.has(id)) {
+              mergedById.delete(id);
+            }
+            mergedById.set(id, order);
+          }
+        }
+        const mergedOrders = [...mergedById.values()];
+        configRef.current = firstFeed.config;
+        setConfig(firstFeed.config);
+        setBusinessName(firstFeed.business_name);
+        acceptOrders(mergedOrders);
+        setError(false);
+        setLastUpdated(new Date());
+      } catch {
+        if (session === feedSessionRef.current && request === feedRequestRef.current)
+          setError(true);
+      } finally {
+        if (
+          feedInFlightRef.current?.session === session &&
+          feedInFlightRef.current.request === request
+        ) {
+          window.clearTimeout(inFlight.timeout);
+          feedInFlightRef.current = null;
+        }
+        if (session === feedSessionRef.current && request === feedRequestRef.current) {
+          if (pageRequests > 0) {
+            pollPageCountRef.current = pageRequests;
+            syncPollIntervalRef.current?.(configRef.current.refresh_seconds, pageRequests);
+          }
+          setLoading(false);
+        }
+      }
+    },
+    [acceptOrders],
+  );
+
+  const fetchOrders = useCallback(
+    async (session: number) => {
+      if (feedInFlightRef.current?.session === session) return;
+      const request = ++feedRequestRef.current;
+      const controller = new AbortController();
+      const inFlight = { session, request, controller, timeout: 0 };
+      const resetRequestTimeout = () => {
+        window.clearTimeout(inFlight.timeout);
+        inFlight.timeout = window.setTimeout(
+          () => controller.abort(),
+          CUSTOMER_DISPLAY_REQUEST_TIMEOUT_MS,
+        );
+      };
+      feedInFlightRef.current = inFlight;
+      let pageRequests = 0;
+      try {
+        resetRequestTimeout();
+        const { data: latestConfig } = await api
+          .get('/settings/customer-display', { signal: controller.signal })
+          .catch(() => ({ data: null }));
+        const validConfig = isCustomerDisplayConfig(latestConfig) ? latestConfig : null;
+        const activeConfig: CustomerDisplayConfig = validConfig ?? configRef.current;
+        const { orders: nextOrders, stale } = await fetchSignedInBoardOrders({
+          config: activeConfig,
+          fetchPage: async (params) => {
+            pageRequests += 1;
+            resetRequestTimeout();
+            const response: { data?: SignedInOrdersPageResponse } = await api.get('/orders', {
+              params,
+              signal: controller.signal,
+            });
+            return response.data ?? {};
+          },
+          isStale: () => session !== feedSessionRef.current || request !== feedRequestRef.current,
+        });
+        if (stale) return;
+        configRef.current = activeConfig;
+        setConfig(activeConfig);
+        acceptOrders(nextOrders);
+        setError(false);
+        setLastUpdated(new Date());
+      } catch {
+        if (session === feedSessionRef.current && request === feedRequestRef.current)
+          setError(true);
+      } finally {
+        if (
+          feedInFlightRef.current?.session === session &&
+          feedInFlightRef.current.request === request
+        ) {
+          window.clearTimeout(inFlight.timeout);
+          feedInFlightRef.current = null;
+        }
+        if (session === feedSessionRef.current && request === feedRequestRef.current) {
+          if (pageRequests > 0) {
+            pollPageCountRef.current = pageRequests;
+            syncPollIntervalRef.current?.(configRef.current.refresh_seconds, pageRequests);
+          }
+          setLoading(false);
+        }
+      }
+    },
+    [acceptOrders],
+  );
+
+  const markPriorityOrdersShown = useCallback((orderIds: string[]) => {
+    const shown = new Set(orderIds);
+    setNewlyReadyOrderIds((current) => new Set([...current].filter((id) => !shown.has(id))));
+  }, []);
 
   useEffect(() => {
-    loadFromStorage();
+    const resolve = setTimeout(() => {
+      const token = consumeDisplayTokenFromUrl() ?? readStoredDisplayToken();
+      setPairedToken(token);
+      if (!token) loadFromStorage();
+    }, 0);
+    return () => clearTimeout(resolve);
   }, [loadFromStorage]);
 
   useEffect(() => {
-    if (!authLoading && !user) {
-      router.replace('/auth/login?redirect=/customer-display');
+    if (pairedToken === null && !authLoading && (!user || !currentTenant)) {
+      router.replace(
+        user
+          ? '/auth/login?select_tenant=true&redirect=/customer-display'
+          : '/auth/login?redirect=/customer-display',
+      );
     }
-  }, [authLoading, user, router]);
-
-  const fetchOrders = async () => {
-    try {
-      const { data } = await api.get('/orders', { params: { per_page: 50 } });
-      const nextOrders = (data.orders || [])
-        .filter((order: Order) => ACTIVE_STATUSES.has(order.status))
-        .sort((a: Order, b: Order) => a.created_at.localeCompare(b.created_at));
-      setOrders(nextOrders);
-      setError(false);
-      setLastUpdated(new Date());
-    } catch {
-      setError(true);
-    } finally {
-      setLoading(false);
-    }
-  };
+  }, [pairedToken, authLoading, user, currentTenant, router]);
 
   useEffect(() => {
-    if (!user || !currentTenant) return;
-    const initial = setTimeout(fetchOrders, 0);
-    const interval = setInterval(fetchOrders, 3000);
+    if (pairedToken === undefined || unpaired) return;
+    if (pairedToken === null && (userId === null || tenantId === null)) {
+      readyTrackingContextRef.current = null;
+      previousReadyOrderIdsRef.current = null;
+      return;
+    }
+
+    const readyTrackingContext = {
+      pairedToken,
+      userId,
+      tenantId,
+    };
+    const previousContext = readyTrackingContextRef.current;
+    if (
+      !previousContext ||
+      previousContext.pairedToken !== readyTrackingContext.pairedToken ||
+      previousContext.userId !== readyTrackingContext.userId ||
+      previousContext.tenantId !== readyTrackingContext.tenantId
+    ) {
+      previousReadyOrderIdsRef.current = null;
+      readyTrackingContextRef.current = readyTrackingContext;
+    }
+
+    pollPageCountRef.current = 1;
+    const session = ++feedSessionRef.current;
+    const refresh = () =>
+      pairedToken ? fetchPairedFeed(pairedToken, session) : fetchOrders(session);
+    let activeIntervalMs = getPollIntervalMs(
+      configRef.current.refresh_seconds,
+      pollPageCountRef.current,
+    );
+    let interval = setInterval(refresh, activeIntervalMs);
+    syncPollIntervalRef.current = (refreshSeconds: number, pageRequests: number) => {
+      const nextIntervalMs = getPollIntervalMs(refreshSeconds, pageRequests);
+      if (nextIntervalMs !== activeIntervalMs) {
+        activeIntervalMs = nextIntervalMs;
+        clearInterval(interval);
+        interval = setInterval(refresh, activeIntervalMs);
+      }
+    };
+    const initial = setTimeout(refresh, 0);
     return () => {
+      syncPollIntervalRef.current = null;
       clearTimeout(initial);
       clearInterval(interval);
+      if (feedSessionRef.current === session) feedSessionRef.current += 1;
+      const inFlight = feedInFlightRef.current;
+      if (inFlight?.session === session) {
+        window.clearTimeout(inFlight.timeout);
+        inFlight.controller.abort();
+      }
     };
-  }, [user, currentTenant]);
+  }, [pairedToken, unpaired, userId, tenantId, fetchOrders, fetchPairedFeed]);
 
   const preparing = useMemo(
     () => orders.filter((order) => order.status === 'pending' || order.status === 'preparing'),
     [orders],
   );
   const ready = useMemo(() => orders.filter((order) => order.status === 'ready'), [orders]);
+  const showPreparing = config.statuses.some((status) => status !== 'ready');
+  const showReady = config.statuses.includes('ready');
 
-  if (authLoading || !user || !currentTenant) {
+  if (unpaired) {
     return (
-      <main className="min-h-screen bg-slate-950 text-white flex items-center justify-center">
-        <div className="text-slate-400">Loading…</div>
+      <main className="flex h-screen min-h-0 flex-col items-center justify-center gap-2 bg-slate-950 p-6 text-center text-white">
+        <h1 className="text-2xl font-bold">{t('unpairedTitle')}</h1>
+        <p className="text-slate-400">{t('unpairedHint')}</p>
+      </main>
+    );
+  }
+
+  if (
+    pairedToken === undefined ||
+    (pairedToken === null && (authLoading || !user || !currentTenant))
+  ) {
+    return (
+      <main className="flex h-screen min-h-0 flex-col items-center justify-center bg-slate-950 text-white">
+        <div className="text-slate-400">{tc('loading')}</div>
       </main>
     );
   }
 
   return (
-    <main className="min-h-screen bg-slate-950 text-white p-6 md:p-10 select-none">
-      <header className="max-w-7xl mx-auto flex items-end justify-between gap-4 mb-8">
-        <div>
-          <div className="text-2xl md:text-3xl font-bold tracking-tight">{currentTenant.business_name}</div>
-          <div className="text-slate-400 mt-1 text-sm md:text-base">Order status</div>
+    <main className="flex h-screen min-h-0 min-w-0 flex-col overflow-hidden bg-slate-950 p-4 text-white md:p-10 select-none">
+      <header className="mx-auto mb-5 flex w-full shrink-0 min-w-0 items-end justify-between gap-4 md:mb-8">
+        <div className="min-w-0">
+          <div className="break-all text-[clamp(1.875rem,1.5vw,3.75rem)] font-bold tracking-tight">
+            {pairedToken ? businessName : currentTenant?.business_name}
+          </div>
+          <div className="mt-1 text-[clamp(1rem,0.8vw,2rem)] text-slate-400">
+            {t('orderStatus')}
+          </div>
         </div>
-        <div className="text-end text-xs text-slate-500">
-          {error ? 'Connection problem — retrying…' : lastUpdated ? `Updated ${lastUpdated.toLocaleTimeString()}` : 'Connecting…'}
+        <div className="max-w-[50%] shrink-0 text-end text-[clamp(0.75rem,0.65vw,1.5rem)] text-slate-500">
+          {error
+            ? lastUpdated
+              ? t('staleData')
+              : t('connectionProblem')
+            : lastUpdated
+              ? config.show_updated
+                ? t('updatedAt', { time: formatTime(lastUpdated, { second: '2-digit' }) })
+                : null
+              : t('connecting')}
         </div>
       </header>
 
       {loading ? (
-        <div className="max-w-7xl mx-auto text-center text-slate-400 py-20">Loading orders…</div>
+        <div className="mx-auto max-w-7xl py-20 text-center text-slate-400">
+          {t('loadingOrders')}
+        </div>
       ) : (
-        <div className="max-w-7xl mx-auto grid grid-cols-1 md:grid-cols-2 gap-6">
-          <section className="rounded-3xl bg-blue-950/60 border border-blue-900/70 overflow-hidden">
-            <div className="px-6 py-5 bg-blue-900/50 border-b border-blue-800/60">
-              <h1 className="text-2xl md:text-3xl font-extrabold tracking-wide">PREPARING</h1>
-              <p className="text-blue-200/70 mt-1">We are preparing your order</p>
-            </div>
-            <div className="p-6 grid grid-cols-2 sm:grid-cols-3 gap-4">
-              {preparing.length === 0 ? (
-                <div className="col-span-full py-12 text-center text-slate-500 text-lg">No orders currently being prepared</div>
-              ) : preparing.map((order) => (
-                <div key={order.id} className="rounded-2xl bg-slate-900/80 border border-blue-900/60 p-5 text-center">
-                  <div className="text-xs uppercase tracking-widest text-slate-500 mb-2">Order</div>
-                  <div className="text-3xl md:text-4xl font-black">{getCustomerOrderNumber(order)}</div>
-                </div>
-              ))}
-            </div>
-          </section>
-
-          <section className="rounded-3xl bg-emerald-950/60 border border-emerald-900/70 overflow-hidden">
-            <div className="px-6 py-5 bg-emerald-900/50 border-b border-emerald-800/60">
-              <h1 className="text-2xl md:text-3xl font-extrabold tracking-wide">READY FOR PICKUP</h1>
-              <p className="text-emerald-200/70 mt-1">Please collect your order</p>
-            </div>
-            <div className="p-6 grid grid-cols-2 sm:grid-cols-3 gap-4">
-              {ready.length === 0 ? (
-                <div className="col-span-full py-12 text-center text-slate-500 text-lg">No orders are ready yet</div>
-              ) : ready.map((order) => (
-                <div key={order.id} className="rounded-2xl bg-slate-900/80 border border-emerald-900/60 p-5 text-center">
-                  <div className="text-xs uppercase tracking-widest text-slate-500 mb-2">Order</div>
-                  <div className="text-3xl md:text-4xl font-black">{getCustomerOrderNumber(order)}</div>
-                </div>
-              ))}
-            </div>
-          </section>
+        <div
+          className={`mx-auto grid w-full min-w-0 flex-1 min-h-0 grid-cols-1 gap-4 overflow-x-hidden overflow-y-auto ${showPreparing && showReady ? 'md:grid-cols-2' : ''} md:gap-6 md:overflow-hidden`}
+        >
+          {showPreparing && (
+            <OrderBoardSection
+              accent="blue"
+              emptyMessage={t('noPreparing')}
+              hint={t('preparingHint')}
+              isReady={false}
+              newlyReadyOrderIds={newlyReadyOrderIds}
+              onPriorityOrdersShown={markPriorityOrdersShown}
+              orders={preparing}
+              title={t('preparingTitle')}
+            />
+          )}
+          {showReady && (
+            <OrderBoardSection
+              accent="emerald"
+              emptyMessage={t('noReady')}
+              hint={t('readyHint')}
+              isReady
+              newlyReadyOrderIds={newlyReadyOrderIds}
+              onPriorityOrdersShown={markPriorityOrdersShown}
+              orders={ready}
+              title={t('readyTitle')}
+            />
+          )}
         </div>
       )}
     </main>

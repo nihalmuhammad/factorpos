@@ -1,0 +1,1005 @@
+import type { AppendAttemptStorage } from './append-attempt';
+import { ORDER_CREATE_DISPLAY_CODES } from '../../../shared/order-create-display-codes';
+import {
+  cartItemToOrderItem,
+  type OrderItemPayload,
+  type OrderItemSource,
+} from './cart-order-item';
+
+export { ORDER_CREATE_DISPLAY_CODES };
+
+/** Global key used by builds before prepaid attempts became user scoped. */
+export const PREPAID_ATTEMPT_STORAGE_KEY = 'flo.prepaid.checkout.attempt';
+const ORDER_ATTEMPT_USER_SUFFIX = '.user.';
+
+/** Raised when new-order attempt state cannot be durably read or written.
+ * Callers must not send the order request when this is thrown. */
+export class OrderAttemptStorageError extends Error {
+  constructor() {
+    super('Order attempt storage is unavailable');
+    this.name = 'OrderAttemptStorageError';
+  }
+}
+
+export interface StoredOrderAttempt {
+  userId: string;
+  storeId?: string | number;
+}
+
+interface CompletedOrderAttempt {
+  completed: true;
+  userId: string;
+  completedAt: number;
+}
+
+/** Prepaid attempts are user scoped. A single shared key let one cashier's read
+ * drop another cashier's pending retry, which hands a possibly committed
+ * request a fresh idempotency key. */
+export function getPrepaidOrderAttemptStorageKey(userId: string): string {
+  return `${PREPAID_ATTEMPT_STORAGE_KEY}${ORDER_ATTEMPT_USER_SUFFIX}${encodeURIComponent(userId)}`;
+}
+
+export const POSTPAID_PAYMENT_ATTEMPT_STORAGE_KEY = 'flo.postpaid.payment.attempt';
+
+export interface StoredPostpaidPaymentAttempt {
+  userId: string;
+  storeId?: string | number;
+  billId: string;
+  idempotencyKey: string;
+  paymentFingerprint: string;
+  receiptIdempotencyKey?: string;
+}
+
+/** Postpaid payment attempts are scoped by cashier user, store, and bill id so
+ * switching staff or counters never replays another cashier's pending payment key. */
+export function getPostpaidPaymentAttemptStorageKey(
+  userId: string,
+  storeId: string | number | null | undefined,
+  billId: string,
+): string {
+  const normalizedStore = normalizeAttemptStoreId(storeId) || 'default';
+  return `${POSTPAID_PAYMENT_ATTEMPT_STORAGE_KEY}${ORDER_ATTEMPT_USER_SUFFIX}${encodeURIComponent(userId)}.store.${encodeURIComponent(normalizedStore)}.bill.${encodeURIComponent(billId)}`;
+}
+
+export function loadPostpaidPaymentAttempt(
+  storage: Pick<Storage, 'getItem'> | null | undefined,
+  key: string,
+): StoredPostpaidPaymentAttempt | null {
+  if (!storage) return null;
+  try {
+    const raw = storage.getItem(key);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as Partial<StoredPostpaidPaymentAttempt> | null;
+    if (
+      !parsed ||
+      typeof parsed !== 'object' ||
+      typeof parsed.userId !== 'string' ||
+      typeof parsed.billId !== 'string' ||
+      typeof parsed.idempotencyKey !== 'string' ||
+      typeof parsed.paymentFingerprint !== 'string'
+    ) {
+      return null;
+    }
+    return parsed as StoredPostpaidPaymentAttempt;
+  } catch {
+    return null;
+  }
+}
+
+export function savePostpaidPaymentAttempt(
+  storage: Pick<Storage, 'setItem'> | null | undefined,
+  key: string,
+  attempt: StoredPostpaidPaymentAttempt,
+): void {
+  if (!storage) return;
+  try {
+    storage.setItem(key, JSON.stringify(attempt));
+  } catch {
+    // Session storage quota/unavailable falls back to in-memory attempt ref.
+  }
+}
+
+export function clearPostpaidPaymentAttempt(
+  storage: Pick<Storage, 'removeItem'> | null | undefined,
+  key: string,
+): void {
+  if (!storage) return;
+  try {
+    storage.removeItem(key);
+  } catch {
+    // Ignore storage cleanup errors.
+  }
+}
+
+export interface CartStateForFingerprint {
+  tableId: string | null;
+  customerId: number | string | null;
+  orderType: string;
+  guestCount: number;
+  orderNotes?: string | null;
+  scheduledFor?: string | null;
+  onlinePlatform?: string | null;
+  externalOrderId?: string | null;
+  deliveryAddress?: string | null;
+  expectedPaymentMethod?: string | null;
+  expectedPaymentMethodId?: number | string | null;
+  deliveryNote?: string | null;
+  items: OrderItemSource[];
+  waivedChargeIds: Set<string>;
+  optedInChargeIds: Set<string>;
+}
+
+export function buildCartFingerprintFromState(
+  cartState: CartStateForFingerprint,
+  orderItems: OrderItemPayload[] = cartState.items.map(cartItemToOrderItem),
+): string {
+  return JSON.stringify({
+    table_id: cartState.tableId,
+    customer_id: cartState.customerId,
+    type: cartState.orderType,
+    guest_count: cartState.guestCount,
+    special_instructions: cartState.orderNotes,
+    scheduled_for:
+      cartState.orderType === 'takeaway' || cartState.orderType === 'delivery'
+        ? cartState.scheduledFor?.trim() || undefined
+        : undefined,
+    online_platform: cartState.orderType === 'online' ? cartState.onlinePlatform : undefined,
+    external_order_id: cartState.orderType === 'online' ? cartState.externalOrderId : undefined,
+    delivery_address:
+      cartState.orderType === 'delivery' ? cartState.deliveryAddress || undefined : undefined,
+    expected_payment_method:
+      cartState.orderType === 'delivery' ? cartState.expectedPaymentMethod || undefined : undefined,
+    expected_payment_method_id:
+      cartState.orderType === 'delivery'
+        ? (cartState.expectedPaymentMethodId ?? undefined)
+        : undefined,
+    delivery_note:
+      cartState.orderType === 'delivery' ? cartState.deliveryNote || undefined : undefined,
+    items: orderItems,
+    waived_charge_ids: Array.from(cartState.waivedChargeIds),
+    opted_in_charge_ids: Array.from(cartState.optedInChargeIds),
+  });
+}
+
+export function parseStoredAttemptScheduledFor(
+  fingerprint: string | undefined,
+): string | undefined {
+  if (!fingerprint) return undefined;
+  try {
+    const parsed = JSON.parse(fingerprint) as { scheduled_for?: unknown };
+    return typeof parsed?.scheduled_for === 'string' && parsed.scheduled_for.trim()
+      ? parsed.scheduled_for.trim()
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+export function stripScheduledForFromFingerprint(fingerprint: string): string {
+  try {
+    const parsed = JSON.parse(fingerprint) as Record<string, unknown>;
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return fingerprint;
+    const { scheduled_for: _ignored, ...rest } = parsed;
+    return JSON.stringify(rest);
+  } catch {
+    return fingerprint;
+  }
+}
+
+export function normalizeAttemptStoreId(
+  storeId: string | number | null | undefined,
+): string | undefined {
+  if (storeId === null || storeId === undefined) return undefined;
+  const trimmed = String(storeId).trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+}
+
+export function doesAttemptMatchStore(
+  attempt: { storeId?: string | number | null } | null | undefined,
+  currentStoreId: string | number | null | undefined,
+  legacyOriginStoreId?: string | number | null,
+): boolean {
+  if (!attempt) return false;
+  const normalizedCurrent = normalizeAttemptStoreId(currentStoreId) || 'default';
+  const normalizedAttemptStore = normalizeAttemptStoreId(attempt.storeId);
+  if (normalizedAttemptStore) {
+    return normalizedAttemptStore === normalizedCurrent;
+  }
+  const normalizedLegacyOrigin = normalizeAttemptStoreId(legacyOriginStoreId);
+  if (normalizedLegacyOrigin) {
+    return normalizedLegacyOrigin === normalizedCurrent;
+  }
+  return true;
+}
+
+export function fingerprintsMatchAcrossScheduleToggle(
+  storedFingerprint: string | undefined,
+  currentFingerprint: string,
+): boolean {
+  if (!storedFingerprint) return false;
+  if (storedFingerprint === currentFingerprint) return true;
+  if (
+    parseStoredAttemptScheduledFor(storedFingerprint) &&
+    !parseStoredAttemptScheduledFor(currentFingerprint)
+  ) {
+    return (
+      stripScheduledForFromFingerprint(storedFingerprint) ===
+      stripScheduledForFromFingerprint(currentFingerprint)
+    );
+  }
+  return false;
+}
+
+export function resolveRetryScheduledFor(params: {
+  orderType: string;
+  scheduledOrdersEnabled: boolean;
+  cartScheduledFor?: string | null;
+  preservedScheduledFor?: string;
+}): string | undefined {
+  if (params.orderType !== 'takeaway' && params.orderType !== 'delivery') {
+    return undefined;
+  }
+  const currentScheduledFor = params.scheduledOrdersEnabled
+    ? params.cartScheduledFor?.trim() || undefined
+    : undefined;
+  return currentScheduledFor || params.preservedScheduledFor?.trim() || undefined;
+}
+
+export function resolveCartScheduledForAfterSettingRead(params: {
+  settingReadSucceeded: boolean;
+  scheduledOrdersEnabled: boolean;
+  cartScheduledFor?: string | null;
+  preservedScheduledFor?: string;
+  attemptStoreId?: string | number | null;
+  currentStoreId?: string | number | null;
+  legacyOriginStoreId?: string | number | null;
+}): string {
+  const current = params.cartScheduledFor?.trim() || '';
+  const storeMatches =
+    params.attemptStoreId === undefined && params.currentStoreId === undefined
+      ? true
+      : doesAttemptMatchStore(
+          { storeId: params.attemptStoreId },
+          params.currentStoreId,
+          params.legacyOriginStoreId,
+        );
+  const preserved = storeMatches ? params.preservedScheduledFor?.trim() || '' : '';
+  if (params.scheduledOrdersEnabled || preserved) {
+    return current || preserved;
+  }
+  if (!params.settingReadSucceeded) {
+    return '';
+  }
+  return '';
+}
+
+function isCompletedAttempt(value: unknown): value is CompletedOrderAttempt {
+  return (
+    !!value && typeof value === 'object' && (value as { completed?: unknown }).completed === true
+  );
+}
+
+interface ReadOrderAttemptOptions<T extends StoredOrderAttempt> {
+  /** Set for global keys written before attempts were user scoped. Those keys
+   * are shared, so a foreign or unreadable value means "not mine" instead of
+   * "damaged", and mutating it would drop another cashier's pending retry. */
+  sharedKey?: boolean;
+  /** Structural check for the fields the caller needs. A record that fails it
+   * is damaged, not absent. */
+  isValid?: (attempt: T) => boolean;
+}
+
+/** Read an attempt back from the durable store. Fails closed rather than
+ * reporting "no attempt" when the stored value cannot be trusted, so a caller
+ * never starts a second order under a fresh idempotency key. */
+export function readOrderAttempt<T extends StoredOrderAttempt>(
+  storage: AppendAttemptStorage,
+  key: string,
+  userId: string,
+  options: ReadOrderAttemptOptions<T> = {},
+): T | null {
+  let raw: string | null;
+  try {
+    raw = storage.getItem(key);
+  } catch {
+    throw new OrderAttemptStorageError();
+  }
+  if (storage.hasUnverifiedRead?.(key)) throw new OrderAttemptStorageError();
+  if (raw === null) return null;
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    if (options.sharedKey) return null;
+    throw new OrderAttemptStorageError();
+  }
+  if (isCompletedAttempt(parsed)) {
+    // The order was confirmed; this record only survived because cleanup could
+    // not delete it. Its keys must never be reused for a later sale.
+    if (parsed.userId === userId) clearOrderAttempt(storage, key, parsed);
+    return null;
+  }
+  const usable =
+    !!parsed &&
+    typeof parsed === 'object' &&
+    !Array.isArray(parsed) &&
+    (parsed as StoredOrderAttempt).userId === userId &&
+    (options.isValid?.(parsed as T) ?? true);
+  if (!usable) {
+    if (options.sharedKey) return null;
+    throw new OrderAttemptStorageError();
+  }
+  return parsed as T;
+}
+
+/** Persist an attempt before its request is sent, through the safe storage
+ * wrapper's verified write. Throws when no backend accepted the value. */
+export function persistOrderAttempt(
+  storage: AppendAttemptStorage,
+  key: string,
+  attempt: StoredOrderAttempt,
+): void {
+  let serialized: string;
+  try {
+    serialized = JSON.stringify(attempt);
+  } catch {
+    throw new OrderAttemptStorageError();
+  }
+  try {
+    storage.setItem(key, serialized);
+  } catch {
+    throw new OrderAttemptStorageError();
+  }
+}
+
+/** Close an attempt whose response was confirmed. The completion marker is
+ * stored before removal so a record the browser refuses to delete is still
+ * never read back as a reusable attempt. Returns false when not even the marker
+ * could be stored, which the caller reports as a storage problem. */
+export function clearOrderAttempt(
+  storage: AppendAttemptStorage,
+  key: string,
+  attempt: StoredOrderAttempt,
+): boolean {
+  const marker: CompletedOrderAttempt = {
+    completed: true,
+    userId: attempt.userId,
+    completedAt: Date.now(),
+  };
+  const serializedMarker = JSON.stringify(marker);
+  let markerPersisted = false;
+  try {
+    storage.setItem(key, serializedMarker);
+    markerPersisted = storage.getItem(key) === serializedMarker;
+  } catch {
+    markerPersisted = false;
+  }
+  let removed = false;
+  try {
+    removed = storage.removeItem(key) !== false;
+  } catch {
+    removed = false;
+  }
+  const removalVerified = removed && !storage.hasUnverifiedRemoval?.(key);
+  return removalVerified || markerPersisted;
+}
+
+export type OperationFailureMetadata = {
+  reasonCode: string | null;
+  operation: string;
+  stage: string | null;
+  outcome: 'not_applied' | 'applied' | 'partial' | 'unknown' | 'not_applicable' | null;
+  classification: 'expected_rejection' | 'unexpected_failure' | null;
+  correlationId: string | null;
+  displayCode: string | null;
+  failureClass: string | null;
+  stockRefusal: { stock_scope: string; stock_shortfall: string } | null;
+  serverError: string | null;
+  trusted: boolean;
+};
+
+export type OperationName =
+  | 'order.create'
+  | 'payment.create'
+  | 'order.append'
+  | 'order.discount'
+  | 'bill.discount'
+  | 'bill.generate'
+  | 'bill.charge.update';
+type FailureDefinition = {
+  stage: string;
+  classification: OperationFailureMetadata['classification'];
+  outcomes: readonly NonNullable<OperationFailureMetadata['outcome']>[];
+};
+
+const STRUCTURED_FAILURES: Record<
+  OperationName,
+  Record<string, Record<string, FailureDefinition>>
+> = {
+  'order.create': {
+    validation: {
+      'order.quantity_invalid': {
+        stage: 'validation',
+        classification: 'expected_rejection',
+        outcomes: ['not_applied'],
+      },
+      'order.stock_insufficient': {
+        stage: 'validation',
+        classification: 'expected_rejection',
+        outcomes: ['not_applied'],
+      },
+      'order.addon_selection_required': {
+        stage: 'validation',
+        classification: 'expected_rejection',
+        outcomes: ['not_applied'],
+      },
+      'order.addon_unavailable': {
+        stage: 'validation',
+        classification: 'expected_rejection',
+        outcomes: ['not_applied'],
+      },
+      'validation.rejected': {
+        stage: 'validation',
+        classification: 'expected_rejection',
+        outcomes: ['not_applied'],
+      },
+    },
+    persistence: {
+      'persistence.failed': {
+        stage: 'persistence',
+        classification: 'unexpected_failure',
+        outcomes: ['not_applied', 'partial', 'unknown'],
+      },
+      'server.internal_error': {
+        stage: 'persistence',
+        classification: 'unexpected_failure',
+        outcomes: ['not_applied', 'partial', 'unknown'],
+      },
+    },
+    completion: {
+      'operation.completion_failed': {
+        stage: 'completion',
+        classification: 'unexpected_failure',
+        outcomes: ['applied'],
+      },
+    },
+    submission: {
+      'request.transport_failed': {
+        stage: 'submission',
+        classification: 'unexpected_failure',
+        outcomes: ['unknown'],
+      },
+    },
+    recovery: {
+      'request.outcome_unknown': {
+        stage: 'recovery',
+        classification: 'unexpected_failure',
+        outcomes: ['unknown'],
+      },
+    },
+  },
+  'payment.create': {
+    validation: {
+      'payment.invalid': {
+        stage: 'validation',
+        classification: 'expected_rejection',
+        outcomes: ['not_applied'],
+      },
+    },
+    persistence: {
+      'persistence.failed': {
+        stage: 'persistence',
+        classification: 'unexpected_failure',
+        outcomes: ['not_applied', 'partial', 'unknown'],
+      },
+    },
+    completion: {
+      'operation.completion_failed': {
+        stage: 'completion',
+        classification: 'unexpected_failure',
+        outcomes: ['applied'],
+      },
+    },
+    submission: {
+      'request.transport_failed': {
+        stage: 'submission',
+        classification: 'unexpected_failure',
+        outcomes: ['unknown'],
+      },
+    },
+    recovery: {
+      'request.outcome_unknown': {
+        stage: 'recovery',
+        classification: 'unexpected_failure',
+        outcomes: ['unknown'],
+      },
+    },
+  },
+  'order.append': {
+    validation: {
+      'validation.rejected': {
+        stage: 'validation',
+        classification: 'expected_rejection',
+        outcomes: ['not_applied'],
+      },
+    },
+    persistence: {
+      'persistence.failed': {
+        stage: 'persistence',
+        classification: 'unexpected_failure',
+        outcomes: ['not_applied'],
+      },
+    },
+    completion: {
+      'operation.completion_failed': {
+        stage: 'completion',
+        classification: 'unexpected_failure',
+        outcomes: ['applied'],
+      },
+    },
+    submission: {
+      'request.transport_failed': {
+        stage: 'submission',
+        classification: 'unexpected_failure',
+        outcomes: ['unknown'],
+      },
+    },
+    recovery: {
+      'request.outcome_unknown': {
+        stage: 'recovery',
+        classification: 'unexpected_failure',
+        outcomes: ['unknown'],
+      },
+    },
+  },
+  'order.discount': {
+    validation: {
+      'discount.rejected': {
+        stage: 'validation',
+        classification: 'expected_rejection',
+        outcomes: ['not_applied'],
+      },
+    },
+    persistence: {
+      'persistence.failed': {
+        stage: 'persistence',
+        classification: 'unexpected_failure',
+        outcomes: ['not_applied'],
+      },
+    },
+    completion: {
+      'operation.completion_failed': {
+        stage: 'completion',
+        classification: 'unexpected_failure',
+        outcomes: ['applied'],
+      },
+    },
+  },
+  'bill.discount': {
+    validation: {
+      'discount.rejected': {
+        stage: 'validation',
+        classification: 'expected_rejection',
+        outcomes: ['not_applied'],
+      },
+    },
+    persistence: {
+      'persistence.failed': {
+        stage: 'persistence',
+        classification: 'unexpected_failure',
+        outcomes: ['not_applied'],
+      },
+    },
+    completion: {
+      'operation.completion_failed': {
+        stage: 'completion',
+        classification: 'unexpected_failure',
+        outcomes: ['applied'],
+      },
+    },
+  },
+  'bill.generate': {
+    validation: {
+      'bill.order_unavailable': {
+        stage: 'validation',
+        classification: 'expected_rejection',
+        outcomes: ['not_applied'],
+      },
+    },
+    persistence: {
+      'persistence.failed': {
+        stage: 'persistence',
+        classification: 'unexpected_failure',
+        outcomes: ['not_applied', 'partial', 'unknown'],
+      },
+    },
+    completion: {
+      'operation.completion_failed': {
+        stage: 'completion',
+        classification: 'unexpected_failure',
+        outcomes: ['applied'],
+      },
+    },
+  },
+  'bill.charge.update': {
+    validation: {
+      'bill.charge_rejected': {
+        stage: 'validation',
+        classification: 'expected_rejection',
+        outcomes: ['not_applied'],
+      },
+    },
+    persistence: {
+      'persistence.failed': {
+        stage: 'persistence',
+        classification: 'unexpected_failure',
+        outcomes: ['not_applied', 'unknown'],
+      },
+    },
+    completion: {
+      'operation.completion_failed': {
+        stage: 'completion',
+        classification: 'unexpected_failure',
+        outcomes: ['applied'],
+      },
+    },
+  },
+};
+
+const DISCOUNT_DISPLAY_CODES = [
+  'invalid_type',
+  'invalid_value',
+  'disabled',
+  'type_disabled',
+  'limit_exceeded',
+  'order_not_discountable',
+  'bill_not_discountable',
+  'split_check',
+  'refunded',
+  'paid',
+] as const;
+const PAYMENT_DISPLAY_CODES = [
+  'transaction_reference_used',
+  'transaction_reference_reused',
+  'bill_refunded',
+  'bill_already_paid',
+  'payment_exceeds_balance',
+  'customer_mismatch',
+  'customer_unavailable',
+  'wallet_customer_required',
+  'amount_required',
+  'non_cash_exceeds_balance',
+  'cash_reference_zero_applied',
+  'wallet_insufficient',
+  'kitchen_undelivered',
+  'idempotency_conflict',
+  'payment_method_unavailable',
+  'payment_input_invalid',
+  'cash_session_required',
+  'card_transaction_id_required',
+] as const;
+const CHARGE_DISPLAY_CODES = [
+  'charge_required',
+  'bill_not_found',
+  'split_check',
+  'bill_paid',
+  'bill_refunded',
+  'order_not_found',
+  'order_cancelled',
+  'charge_unavailable',
+  'order_type_unsupported',
+  'change_required',
+  'invalid_change_type',
+  'charge_not_waivable',
+  'charge_always_applied',
+] as const;
+const STOCK_SCOPES = ['product', 'variant', 'addon'] as const;
+const STOCK_SHORTFALLS = ['out_of_stock', 'partial'] as const;
+const PERSISTENCE_FAILURE_CLASSES = [
+  'busy_or_locked',
+  'constraint',
+  'read_only',
+  'disk_full',
+  'io_error',
+  'schema_or_migration',
+  'unknown',
+] as const;
+
+export function isSupportedFailureOperation(value: string): value is OperationName {
+  return Object.prototype.hasOwnProperty.call(STRUCTURED_FAILURES, value);
+}
+
+const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+function plainRecord(value: unknown): value is Record<string, unknown> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+export function sanitizeServerError(rawError: unknown): string | null {
+  if (typeof rawError !== 'string') return null;
+  const trimmed = rawError.trim();
+  if (!trimmed) return null;
+  const bounded = trimmed.length > 255 ? trimmed.slice(0, 255) : trimmed;
+  if (
+    /[\r\n]/.test(bounded) ||
+    /\bat\s+\S+\s+\(/.test(bounded) ||
+    /\bat\s+.*:\d+:\d+/.test(bounded)
+  ) {
+    return null;
+  }
+  if (
+    /(?:sqlite|syntax error|database (?:locked|disk image)|no such (?:table|column)|foreign key constraint|unique constraint|primary key constraint|check constraint|table\s+\w+|column\s+\w+|select\s+.+from|insert\s+into|update\s+.+set|delete\s+from|drop\s+table|alter\s+table)/i.test(
+      bounded,
+    )
+  ) {
+    return null;
+  }
+  if (
+    /^(?:[A-Z][a-zA-Z0-9_]*(?:Error|Exception)|TypeError|RangeError|SyntaxError|ReferenceError|SystemError):/i.test(
+      bounded,
+    )
+  ) {
+    return null;
+  }
+  if (
+    /\b(?:ENOENT|EACCES|EPERM|ECONNREFUSED|ECONNRESET|EADDRINUSE|ETIMEDOUT|EPIPE)\b/i.test(bounded)
+  ) {
+    return null;
+  }
+  if (/(?:^|[\s"'`])(?:(?:\/|[a-zA-Z]:[\\/])\w+|(?:\.\.?[\\/]\w+))/i.test(bounded)) {
+    return null;
+  }
+  if (
+    /\b(?:bearer\s+[a-zA-Z0-9._-]+|jwt|api[_-]?key|client[_-]?secret|secret[_-]?key|private[_-]?key|password)\b/i.test(
+      bounded,
+    )
+  ) {
+    return null;
+  }
+  return bounded;
+}
+
+/** Trusts additive server metadata only when the closed tuple and operation reference match. */
+export function classifyOrderRequestFailure(
+  error: unknown,
+  expected: { operation: OperationName; correlationId: string } = {
+    operation: 'order.create',
+    correlationId: '',
+  },
+): {
+  code: string;
+  detail: string;
+  status: number | null;
+} & OperationFailureMetadata {
+  const response = (error as { response?: { status?: unknown; data?: unknown } } | null)?.response;
+  let rawStatus = Number.NaN;
+  try {
+    rawStatus = Number(response?.status);
+  } catch {
+    // A malformed transport error must not break the cashier's fallback message.
+  }
+  const status = Number.isInteger(rawStatus) && rawStatus > 0 ? rawStatus : null;
+  const fallback = {
+    code:
+      status !== null
+        ? 'order.place.rejected'
+        : (error as { isAxiosError?: unknown } | null)?.isAxiosError === true
+          ? 'order.place.unreachable'
+          : 'order.place.failed',
+    detail:
+      status !== null
+        ? `The local server response did not confirm the result (HTTP ${status})`
+        : (error as { isAxiosError?: unknown } | null)?.isAxiosError === true
+          ? 'The request did not receive confirmation from the local server'
+          : 'The request result could not be confirmed on this device',
+    status,
+    reasonCode: null,
+    operation: expected.operation,
+    stage: null,
+    outcome: 'unknown' as const,
+    classification: null,
+    correlationId: null,
+    displayCode: null,
+    failureClass: null,
+    stockRefusal: null,
+    serverError: null,
+    trusted: false,
+  };
+
+  if (!UUID_V4.test(expected.correlationId) || !plainRecord(response?.data)) return fallback;
+  const payload = response.data;
+  if (
+    payload.operation !== expected.operation ||
+    typeof payload.reason_code !== 'string' ||
+    typeof payload.stage !== 'string'
+  )
+    return fallback;
+  const allowsPersistenceFailureClass =
+    payload.reason_code === 'persistence.failed' &&
+    payload.stage === 'persistence' &&
+    (expected.operation === 'order.create' || expected.operation === 'bill.generate');
+  const allowsStockRefusal =
+    payload.reason_code === 'order.stock_insufficient' &&
+    payload.stage === 'validation' &&
+    expected.operation === 'order.create';
+  let failureClass: string | null = null;
+  let stockRefusal: OperationFailureMetadata['stockRefusal'] = null;
+  if (payload.facts !== undefined) {
+    if (!plainRecord(payload.facts)) return fallback;
+    const factKeys = Object.keys(payload.facts);
+    if (factKeys.length > 0) {
+      if (allowsStockRefusal) {
+        const { stock_scope: scope, stock_shortfall: shortfall } = payload.facts;
+        if (
+          factKeys.length !== 2 ||
+          typeof scope !== 'string' ||
+          typeof shortfall !== 'string' ||
+          !(STOCK_SCOPES as readonly string[]).includes(scope) ||
+          !(STOCK_SHORTFALLS as readonly string[]).includes(shortfall)
+        ) {
+          return fallback;
+        }
+        stockRefusal = { stock_scope: scope, stock_shortfall: shortfall };
+      } else {
+        if (
+          !allowsPersistenceFailureClass ||
+          factKeys.length !== 1 ||
+          factKeys[0] !== 'failure_class' ||
+          typeof payload.facts.failure_class !== 'string' ||
+          !(PERSISTENCE_FAILURE_CLASSES as readonly string[]).includes(payload.facts.failure_class)
+        ) {
+          return fallback;
+        }
+        failureClass = payload.facts.failure_class;
+      }
+    }
+  }
+  const operationDefinitions = STRUCTURED_FAILURES[expected.operation];
+  if (!Object.prototype.hasOwnProperty.call(operationDefinitions, payload.stage)) return fallback;
+  const stageDefinitions = operationDefinitions[payload.stage];
+  if (!Object.prototype.hasOwnProperty.call(stageDefinitions, payload.reason_code)) return fallback;
+  const definition = stageDefinitions[payload.reason_code];
+  const displayCode = payload.display_code;
+  const isDiscountRejection =
+    payload.reason_code === 'discount.rejected' &&
+    (expected.operation === 'order.discount' || expected.operation === 'bill.discount');
+  const isPaymentRejection =
+    payload.reason_code === 'payment.invalid' && expected.operation === 'payment.create';
+  const isChargeRejection =
+    payload.reason_code === 'bill.charge_rejected' && expected.operation === 'bill.charge.update';
+  const isOrderCreateRejection =
+    payload.reason_code === 'validation.rejected' && expected.operation === 'order.create';
+  const allowedDisplayCodes: readonly string[] = isDiscountRejection
+    ? DISCOUNT_DISPLAY_CODES
+    : isPaymentRejection
+      ? PAYMENT_DISPLAY_CODES
+      : isChargeRejection
+        ? CHARGE_DISPLAY_CODES
+        : isOrderCreateRejection
+          ? ORDER_CREATE_DISPLAY_CODES
+          : [];
+  if (
+    !definition ||
+    payload.stage !== definition.stage ||
+    payload.classification !== definition.classification ||
+    typeof payload.outcome !== 'string' ||
+    !definition.outcomes.includes(
+      payload.outcome as NonNullable<OperationFailureMetadata['outcome']>,
+    ) ||
+    payload.correlation_id !== expected.correlationId ||
+    (displayCode !== undefined &&
+      (typeof displayCode !== 'string' || !allowedDisplayCodes.includes(displayCode)))
+  )
+    return fallback;
+
+  const serverError = sanitizeServerError(payload.error);
+  const detail = serverError ?? fallback.detail;
+
+  return {
+    ...fallback,
+    code: payload.reason_code,
+    reasonCode: payload.reason_code,
+    stage: definition.stage,
+    outcome: payload.outcome as NonNullable<OperationFailureMetadata['outcome']>,
+    classification: definition.classification,
+    correlationId: expected.correlationId,
+    displayCode: typeof displayCode === 'string' ? displayCode : null,
+    failureClass,
+    stockRefusal,
+    serverError,
+    detail,
+    trusted: true,
+  };
+}
+
+export const SCHEDULE_REJECTION_CODES = [
+  'SCHEDULED_ORDERS_DISABLED',
+  'PAST_SCHEDULED_TIME',
+  'INVALID_FORMAT',
+  'INVALID_TIMEZONE',
+  'INVALID_CALENDAR_DATE',
+  'DST_NONEXISTENT_TIME',
+  'DST_AMBIGUOUS_TIME',
+  'UNSUPPORTED_ORDER_TYPE',
+] as const;
+
+export type ScheduleRejectionCode = (typeof SCHEDULE_REJECTION_CODES)[number];
+
+export function getScheduleRejectionCode(error: unknown): ScheduleRejectionCode | null {
+  const data = (error as { response?: { data?: unknown } } | null)?.response?.data;
+  if (!plainRecord(data) || typeof data.code !== 'string') return null;
+  return (SCHEDULE_REJECTION_CODES as readonly string[]).includes(data.code)
+    ? (data.code as ScheduleRejectionCode)
+    : null;
+}
+
+export function isDefinitiveScheduleRejection(
+  error: unknown,
+  correlationId?: string | null,
+): boolean {
+  const response = (error as { response?: { status?: unknown; data?: unknown } } | null)?.response;
+  if (!plainRecord(response?.data)) return false;
+  const payload = response.data;
+  const scheduleCode = getScheduleRejectionCode(error);
+  const status = Number(response?.status);
+  const isExpectedRejectionStatus = status === 400 || status === 409;
+
+  if (correlationId && UUID_V4.test(correlationId)) {
+    const classified = classifyOrderRequestFailure(error, {
+      operation: 'order.create',
+      correlationId,
+    });
+    if (classified.trusted) {
+      return (
+        classified.outcome === 'not_applied' &&
+        (scheduleCode !== null || classified.reasonCode === 'validation.rejected')
+      );
+    }
+    if (
+      payload.correlation_id === undefined &&
+      payload.operation === undefined &&
+      payload.outcome === undefined &&
+      scheduleCode !== null &&
+      isExpectedRejectionStatus
+    ) {
+      return true;
+    }
+    return false;
+  }
+
+  return (
+    scheduleCode !== null &&
+    isExpectedRejectionStatus &&
+    payload.outcome !== 'applied' &&
+    payload.outcome !== 'unknown'
+  );
+}
+
+export function reconcileRejectedScheduledOrderAttempt(params: {
+  storage: AppendAttemptStorage;
+  key: string;
+  attempt: StoredOrderAttempt | null | undefined;
+  attemptedScheduledFor?: string | null;
+  error: unknown;
+  correlationId?: string | null;
+}): {
+  reconciledNotApplied: boolean;
+  rejectionCode: ScheduleRejectionCode | null;
+} {
+  if (
+    !params.attemptedScheduledFor?.trim() ||
+    !isDefinitiveScheduleRejection(params.error, params.correlationId)
+  ) {
+    return { reconciledNotApplied: false, rejectionCode: null };
+  }
+  if (params.attempt) {
+    clearOrderAttempt(params.storage, params.key, params.attempt);
+  }
+  return {
+    reconciledNotApplied: true,
+    rejectionCode: getScheduleRejectionCode(params.error),
+  };
+}

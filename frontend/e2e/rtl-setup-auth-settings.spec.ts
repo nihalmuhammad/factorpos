@@ -63,7 +63,9 @@ async function logout(page: Page): Promise<void> {
   });
 }
 
-test('login page is LTR in English and RTL in Persian with LTR email and end-aligned toggle', async ({ page }) => {
+test('login page is LTR in English and RTL in Persian with LTR email and end-aligned toggle', async ({
+  page,
+}) => {
   // 1. English (LTR)
   await page.goto(`${BASE}/auth/login`);
   await expect(page.locator('html')).toHaveAttribute('dir', 'ltr');
@@ -93,7 +95,9 @@ test('login page is LTR in English and RTL in Persian with LTR email and end-ali
   await captureScreenshot(page, 'auth-login-rtl-fa.png');
 });
 
-test('recover password page is LTR in English and RTL in Persian with .rtl-flip arrow and LTR email', async ({ page }) => {
+test('recover password page is LTR in English and RTL in Persian with .rtl-flip arrow and LTR email', async ({
+  page,
+}) => {
   await page.route('**/api/auth/setup/status', (route) => {
     route.fulfill({
       status: 200,
@@ -126,7 +130,9 @@ test('recover password page is LTR in English and RTL in Persian with .rtl-flip 
   await captureScreenshot(page, 'auth-recover-rtl-fa.png');
 });
 
-test('setup wizard renders with logical navigation, .rtl-flip directional arrows, and all selectable language options', async ({ page }) => {
+test('setup wizard renders with logical navigation, .rtl-flip directional arrows, and all selectable language options', async ({
+  page,
+}) => {
   await page.route('**/api/auth/setup/status', (route) => {
     route.fulfill({
       status: 200,
@@ -144,8 +150,20 @@ test('setup wizard renders with logical navigation, .rtl-flip directional arrows
   const languageButtons = page.locator('button', { hasText: /English|Inglés|Inglês/ });
   await expect(languageButtons.first()).toBeVisible();
   const allButtonsText = await page.locator('button').allInnerTexts();
-  const hasPersianOption = allButtonsText.some((text) => text.includes('فارسی') || text.includes('FA'));
-  expect(hasPersianOption, 'Persian (fa) must be available as a selectable UI language').toBeTruthy();
+  const hasPersianOption = allButtonsText.some(
+    (text) => text.includes('فارسی') || text.includes('FA'),
+  );
+  expect(
+    hasPersianOption,
+    'Persian (fa) must be available as a selectable UI language',
+  ).toBeTruthy();
+  const hasRussianOption = allButtonsText.some(
+    (text) => text.includes('Русский') || text.includes('RU'),
+  );
+  expect(
+    hasRussianOption,
+    'Russian (ru) must be available as a selectable UI language',
+  ).toBeTruthy();
 
   // Forward arrow has rtl-flip class
   const continueArrow = page.locator('button svg.rtl-flip').first();
@@ -161,8 +179,16 @@ test('setup wizard renders with logical navigation, .rtl-flip directional arrows
   await expect(page.locator('html')).toHaveAttribute('dir', 'rtl');
   await captureScreenshot(page, 'setup-step1-rtl-fa.png');
 
+  // A country must be selected before continuing — there is no default
+  // (docs/reference/product-invariants.md, "Regional settings come from signup, never
+  // from a fallback"). Pick the first listed country.
+  await page.locator('.max-h-72 button').first().click();
+
   // Advance to Step 2 (Master PIN)
-  await page.locator('button', { hasText: /ادامه|Continue/ }).first().click();
+  await page
+    .locator('button', { hasText: /ادامه|Continue/ })
+    .first()
+    .click();
   await expect(page.locator('#master-pin')).toBeVisible();
   await captureScreenshot(page, 'setup-step2-master-pin-rtl-fa.png');
 
@@ -171,7 +197,10 @@ test('setup wizard renders with logical navigation, .rtl-flip directional arrows
   await page.locator('#master-pin-confirm').fill('1234');
   await page.locator('#owner-approval-pin').fill('5678');
   await page.locator('#owner-approval-pin-confirm').fill('5678');
-  await page.locator('button', { hasText: /ادامه|Continue/ }).first().click();
+  await page
+    .locator('button', { hasText: /ادامه|Continue/ })
+    .first()
+    .click();
 
   // Step 3 (Owner Account)
   await expect(page.locator('#email')).toBeVisible();
@@ -184,7 +213,16 @@ test('setup wizard renders with logical navigation, .rtl-flip directional arrows
 test.describe('setup with a Persian browser language', () => {
   test.use({ locale: 'fa-IR' });
 
-  test('setup wizard offers Persian as a language option when the browser language is fa', async ({ page }) => {
+  test('setup wizard offers Persian as a language option when the browser language is fa', async ({
+    page,
+  }) => {
+    const hydrationErrors: string[] = [];
+    page.on('console', (message) => {
+      if (/hydration/i.test(message.text())) hydrationErrors.push(message.text());
+    });
+    page.on('pageerror', (error) => {
+      if (/hydration/i.test(error.message)) hydrationErrors.push(error.message);
+    });
     await page.route('**/api/auth/setup/status', (route) => {
       route.fulfill({
         status: 200,
@@ -195,6 +233,12 @@ test.describe('setup with a Persian browser language', () => {
 
     await page.goto(`${BASE}/setup`);
 
+    // After mount, the fa browser preference moves Persian to the first option.
+    const firstLanguageOption = page.locator('[data-slot="card"] button').first();
+    await expect(firstLanguageOption).toContainText('فارسی');
+    await expect(firstLanguageOption).toContainText('FA');
+    expect(hydrationErrors).toEqual([]);
+
     // A fa browser locale surfaces the Persian option, labeled in Persian.
     const persianOption = page.locator('button', { hasText: 'فارسی' }).first();
     await expect(persianOption).toBeVisible();
@@ -203,11 +247,15 @@ test.describe('setup with a Persian browser language', () => {
     // Persian is preselected (browser locale fa) and switching languages
     // moves the selected state. Options re-render with localized labels, so
     // target them by the constant language-code subtitle (EN/FA).
-    const englishOption = page.locator('button').filter({ has: page.getByText('EN', { exact: true }) });
+    const englishOption = page
+      .locator('button')
+      .filter({ has: page.getByText('EN', { exact: true }) });
     await expect(englishOption).toBeVisible();
     await englishOption.click();
     await expect(englishOption).toHaveClass(/border-primary/);
-    const persianOptionAfterSwitch = page.locator('button').filter({ has: page.getByText('FA', { exact: true }) });
+    const persianOptionAfterSwitch = page
+      .locator('button')
+      .filter({ has: page.getByText('FA', { exact: true }) });
     await expect(persianOptionAfterSwitch).not.toHaveClass(/border-primary/);
     await persianOptionAfterSwitch.click();
     await expect(persianOptionAfterSwitch).toHaveClass(/border-primary/);
@@ -216,7 +264,9 @@ test.describe('setup with a Persian browser language', () => {
   });
 });
 
-test('settings renders RTL without horizontal overflow, mirrors toggles and tabs, and isolates LTR data', async ({ page }) => {
+test('settings renders RTL without horizontal overflow, mirrors toggles and tabs, and isolates LTR data', async ({
+  page,
+}) => {
   await loginAsManager(page);
   await setLanguage(page, 'fa');
 
@@ -224,19 +274,23 @@ test('settings renders RTL without horizontal overflow, mirrors toggles and tabs
     // 1. Store tab in Persian (RTL)
     await page.goto(`${BASE}/settings?tab=store`);
     await expect(page.locator('html')).toHaveAttribute('dir', 'rtl');
-    await expect(page.locator('nav')).toBeVisible();
+    const settingsNav = page.locator('[data-slot="tabs"] nav');
+    await expect(settingsNav).toBeVisible();
 
     // The Settings left nav mirrors to the inline-end in RTL: radix Tabs must
     // follow the document direction instead of forcing dir="ltr" (Refs #241).
     await expect(page.locator('[data-slot="tabs"]')).toHaveAttribute('dir', 'rtl');
-    const settingsNavBox = await page.locator('nav').boundingBox();
+    const settingsNavBox = await settingsNav.boundingBox();
     expect(settingsNavBox, 'settings nav must have a bounding box').not.toBeNull();
     expect(settingsNavBox!.x, 'settings nav must sit on the right side in RTL').toBeGreaterThan(
-      (page.viewportSize()?.width ?? 0) / 2
+      (page.viewportSize()?.width ?? 0) / 2,
     );
 
     // Verify language dropdown in Settings offers all selectable languages.
-    const languageSelect = page.locator('select').filter({ has: page.locator('option[value="en"]') }).first();
+    const languageSelect = page
+      .locator('select')
+      .filter({ has: page.locator('option[value="en"]') })
+      .first();
     await expect(languageSelect).toBeVisible();
     const options = await languageSelect.locator('option').all();
     const optionValues = await Promise.all(options.map((opt) => opt.getAttribute('value')));
@@ -244,15 +298,19 @@ test('settings renders RTL without horizontal overflow, mirrors toggles and tabs
     expect(optionValues).toContain('es');
     expect(optionValues).toContain('pt');
     expect(optionValues).toContain('fa');
+    expect(optionValues).toContain('ja');
+    expect(optionValues).toContain('hi');
+    expect(optionValues).toContain('th');
 
     // Check document does not overflow horizontally in RTL
     const storeOverflow = await page.evaluate(() => ({
       scrollWidth: document.documentElement.scrollWidth,
       clientWidth: document.documentElement.clientWidth,
     }));
-    expect(storeOverflow.scrollWidth, 'settings store tab must not overflow horizontally in RTL').toBeLessThanOrEqual(
-      storeOverflow.clientWidth + 1
-    );
+    expect(
+      storeOverflow.scrollWidth,
+      'settings store tab must not overflow horizontally in RTL',
+    ).toBeLessThanOrEqual(storeOverflow.clientWidth + 1);
 
     await captureScreenshot(page, 'settings-store-rtl-fa.png');
 
@@ -287,9 +345,10 @@ test('settings renders RTL without horizontal overflow, mirrors toggles and tabs
       scrollWidth: document.documentElement.scrollWidth,
       clientWidth: document.documentElement.clientWidth,
     }));
-    expect(accountOverflow.scrollWidth, 'settings account tab must not overflow horizontally in RTL').toBeLessThanOrEqual(
-      accountOverflow.clientWidth + 1
-    );
+    expect(
+      accountOverflow.scrollWidth,
+      'settings account tab must not overflow horizontally in RTL',
+    ).toBeLessThanOrEqual(accountOverflow.clientWidth + 1);
 
     await captureScreenshot(page, 'settings-account-rtl-fa.png');
 

@@ -25,7 +25,16 @@
  *
  * Usage:
  *   const { createApp, seed, api, cleanup, assert, assertEqual } = require('./helpers/test-setup');
+ *
+ * ASSERTION CONTRACT: `assert`/`assertEqual`/`assertIncludes`/`assertGreaterThan`
+ * only print and count; a suite that never reads getResults() would exit 0 with
+ * failing assertions. The `*OrThrow` variants report the same line and counters
+ * and then throw, so a suite that uses them cannot pass while red. Prefer them
+ * in new suites; the counting variants stay for the suites that aggregate
+ * failures through getResults().
  */
+
+process.env.NODE_ENV = 'test';
 
 const express = require('express');
 const bcrypt = require('bcryptjs');
@@ -59,7 +68,9 @@ function assertEqual(actual: any, expected: any, message: string) {
     console.log(`  ✓ ${message}`);
   } else {
     failed++;
-    console.error(`  ✗ ${message} — expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`);
+    console.error(
+      `  ✗ ${message} — expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`,
+    );
   }
 }
 
@@ -85,6 +96,30 @@ function assertGreaterThan(actual: number, expected: number, message: string) {
   }
 }
 
+function assertOrThrow(condition: boolean, message: string) {
+  assert(condition, message);
+  if (!condition) throw new Error(message);
+}
+
+function assertEqualOrThrow(actual: any, expected: any, message: string) {
+  assertEqual(actual, expected, message);
+  if (actual !== expected)
+    throw new Error(
+      `${message} - expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`,
+    );
+}
+
+function assertIncludesOrThrow(haystack: string, needle: string, message: string) {
+  assertIncludes(haystack, needle, message);
+  if (!haystack || !haystack.includes(needle))
+    throw new Error(`${message} - "${haystack}" does not contain "${needle}"`);
+}
+
+function assertGreaterThanOrThrow(actual: number, expected: number, message: string) {
+  assertGreaterThan(actual, expected, message);
+  if (!(actual > expected)) throw new Error(`${message} - expected > ${expected}, got ${actual}`);
+}
+
 function getResults() {
   return { passed, failed, total };
 }
@@ -106,6 +141,26 @@ function isNativeAbiMismatch(error: any): boolean {
 
 // ── Database Init ────────────────────────────────────────────────────────────
 
+// Production installs no longer seed a default country/currency/timezone
+// (docs/reference/product-invariants.md, "Regional settings come from signup, never
+// from a fallback") — the signup wizard is the only source now. Most tests
+// call initTestDb() and seedOwnerUser() directly, bypassing that wizard, and
+// are not testing regional resolution at all; they just need a deterministic,
+// already-configured store. This is that one seeding choke point, not a
+// production default: tests that DO exercise /setup/initialize or the
+// regional resolver call it with their own explicit settings, which override
+// these via INSERT OR IGNORE (a no-op once a real value exists).
+function seedTestRegionalDefaults(db: any): void {
+  const insert = (key: string, value: string) =>
+    db
+      .prepare('INSERT OR IGNORE INTO settings (key, value, updated_at) VALUES (?, ?, ?)')
+      .run(key, value, now());
+  insert('country', 'IN');
+  insert('currency', 'INR');
+  insert('currency_symbol', '₹');
+  insert('timezone', 'Asia/Kolkata');
+}
+
 function initTestDb() {
   try {
     initDatabase();
@@ -116,14 +171,19 @@ function initTestDb() {
     }
     throw error;
   }
-  return getDatabase();
+  const db = getDatabase();
+  seedTestRegionalDefaults(db);
+  return db;
 }
 
 // ── Express App Factory ──────────────────────────────────────────────────────
 
-function createApp(routeModules: Record<string, any>, options?: { authRole?: string }) {
+function createApp(
+  routeModules: Record<string, any>,
+  options?: { authRole?: string; jsonLimit?: string },
+) {
   const app = express();
-  app.use(express.json());
+  app.use(express.json({ limit: options?.jsonLimit || '10mb' }));
 
   // Set JWT_SECRET for tests
   if (!process.env.JWT_SECRET) {
@@ -134,9 +194,18 @@ function createApp(routeModules: Record<string, any>, options?: { authRole?: str
 
   // Auth middleware — matches production behavior
   app.use((req: any, res: any, next: any) => {
-    if (!req.path.startsWith('/api')) { next(); return; }
-    if (req.path === '/api/health') { next(); return; }
-    if (req.path.startsWith('/api/auth') && !req.path.includes('/api/auth/me')) { next(); return; }
+    if (!req.path.startsWith('/api')) {
+      next();
+      return;
+    }
+    if (req.path === '/api/health') {
+      next();
+      return;
+    }
+    if (req.path.startsWith('/api/auth') && !req.path.includes('/api/auth/me')) {
+      next();
+      return;
+    }
 
     const authHeader = req.headers.authorization;
     if (!authHeader?.startsWith('Bearer ')) {
@@ -175,26 +244,32 @@ async function startServer(app: any): Promise<{ baseUrl: string; server: any }> 
 
 // ── Seed Data Helpers ────────────────────────────────────────────────────────
 
-function seedOwnerUser(db: any): { userId: string; token: string; authHeader: Record<string, string> } {
+function seedOwnerUser(db: any): {
+  userId: string;
+  token: string;
+  authHeader: Record<string, string>;
+} {
   const { getJWTSecret } = require('../../main/routes/auth');
   const userId = 'owner-test-001';
   const passwordHash = bcrypt.hashSync('testpass123', 10);
 
   db.prepare(
     `INSERT OR IGNORE INTO users (id, name, email, password, role, is_active, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(userId, 'Test Owner', 'owner@test.local', passwordHash, 'owner', 1, now(), now());
 
-  const token = jwt.sign(
-    { userId, email: 'owner@test.local', role: 'owner' },
-    getJWTSecret(),
-    { expiresIn: '1h' }
-  );
+  const token = jwt.sign({ userId, email: 'owner@test.local', role: 'owner' }, getJWTSecret(), {
+    expiresIn: '1h',
+  });
 
   return { userId, token, authHeader: { Authorization: `Bearer ${token}` } };
 }
 
-function seedManagerUser(db: any): { userId: string; token: string; authHeader: Record<string, string> } {
+function seedManagerUser(db: any): {
+  userId: string;
+  token: string;
+  authHeader: Record<string, string>;
+} {
   const { getJWTSecret } = require('../../main/routes/auth');
   const userId = 'mgr-test-001';
   const passwordHash = bcrypt.hashSync('testpass123', 10);
@@ -202,14 +277,22 @@ function seedManagerUser(db: any): { userId: string; token: string; authHeader: 
 
   db.prepare(
     `INSERT OR IGNORE INTO users (id, name, email, password, role, pin_hash, is_active, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
-  ).run(userId, 'Test Manager', 'manager@test.local', passwordHash, 'manager', pinHash, 1, now(), now());
-
-  const token = jwt.sign(
-    { userId, email: 'manager@test.local', role: 'manager' },
-    getJWTSecret(),
-    { expiresIn: '1h' }
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    userId,
+    'Test Manager',
+    'manager@test.local',
+    passwordHash,
+    'manager',
+    pinHash,
+    1,
+    now(),
+    now(),
   );
+
+  const token = jwt.sign({ userId, email: 'manager@test.local', role: 'manager' }, getJWTSecret(), {
+    expiresIn: '1h',
+  });
 
   return { userId, token, authHeader: { Authorization: `Bearer ${token}` } };
 }
@@ -217,35 +300,49 @@ function seedManagerUser(db: any): { userId: string; token: string; authHeader: 
 function seedCategory(db: any, id: string, name: string) {
   db.prepare(
     `INSERT OR IGNORE INTO categories (id, name, sort_order, is_active, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?)`
+     VALUES (?, ?, ?, ?, ?, ?)`,
   ).run(id, name, 1, 1, now(), now());
 }
 
-function seedProduct(db: any, id: string, categoryId: string, name: string, price: number, options?: {
-  tax_type?: string;
-  tax_category_id?: string | null;
-  tax_behavior?: string;
-  cb_percent?: number | null;
-  track_inventory?: boolean;
-  stock_quantity?: number;
-  sale_unit?: 'each' | 'kg' | 'g' | 'lb';
-  allow_fractional_quantity?: boolean;
-  weight_precision?: number;
-}) {
+function seedProduct(
+  db: any,
+  id: string,
+  categoryId: string,
+  name: string,
+  price: number,
+  options?: {
+    tax_type?: string;
+    tax_category_id?: string | null;
+    tax_behavior?: string;
+    cb_percent?: number | null;
+    track_inventory?: boolean;
+    stock_quantity?: number;
+    sale_unit?: 'each' | 'kg' | 'g' | 'lb' | 'ml' | 'cl' | 'l' | 'fl oz' | 'oz';
+    allow_fractional_quantity?: boolean;
+    weight_precision?: number;
+    inventory_product_id?: string | null;
+    inventory_deduction_quantity?: number;
+  },
+) {
   // Most integration fixtures represent taxable menu products. Assign the
   // Fresh stores use the generic no-tax pack, so test products are
   // uncategorized unless a country-tax scenario opts in explicitly.
-  const taxCategoryId = options && Object.prototype.hasOwnProperty.call(options, 'tax_category_id')
-    ? options.tax_category_id
-    : null;
+  const taxCategoryId =
+    options && Object.prototype.hasOwnProperty.call(options, 'tax_category_id')
+      ? options.tax_category_id
+      : null;
   db.prepare(
     `INSERT OR IGNORE INTO products (
        id, category_id, name, price, tax_type, tax_category_id, tax_behavior,
        cb_percent, track_inventory, stock_quantity, sale_unit, allow_fractional_quantity,
-       weight_precision, is_active, sort_order, created_at, updated_at
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+       weight_precision, inventory_product_id, inventory_deduction_quantity,
+       is_active, sort_order, created_at, updated_at
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
-    id, categoryId, name, price,
+    id,
+    categoryId,
+    name,
+    price,
     options?.tax_type || 'none',
     taxCategoryId,
     options?.tax_behavior || 'country_default',
@@ -255,28 +352,33 @@ function seedProduct(db: any, id: string, categoryId: string, name: string, pric
     options?.sale_unit || 'each',
     options?.allow_fractional_quantity ? 1 : 0,
     options?.weight_precision ?? 3,
-    1, 1, now(), now()
+    options?.inventory_product_id || null,
+    options?.inventory_product_id ? (options?.inventory_deduction_quantity ?? 1) : null,
+    1,
+    1,
+    now(),
+    now(),
   );
 }
 
 function seedCustomer(db: any, id: string, name: string, phone?: string) {
   db.prepare(
     `INSERT OR IGNORE INTO customers (id, name, phone, is_active, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?)`
+     VALUES (?, ?, ?, ?, ?, ?)`,
   ).run(id, name, phone || null, 1, now(), now());
 }
 
 function seedTable(db: any, id: string, number: number, capacity?: number) {
   db.prepare(
     `INSERT OR IGNORE INTO tables (id, number, capacity, status, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?)`
+     VALUES (?, ?, ?, ?, ?, ?)`,
   ).run(id, number, capacity || 4, 'available', now(), now());
 }
 
 function seedWalletCredit(db: any, customerId: string, amount: number, billId?: number) {
   db.prepare(
     `INSERT INTO loyalty_ledger (customer_id, bill_id, type, amount, description, created_at, updated_at)
-     VALUES (?, ?, 'credit', ?, ?, ?, ?)`
+     VALUES (?, ?, 'credit', ?, ?, ?, ?)`,
   ).run(customerId, billId || null, amount, 'Test wallet credit', now(), now());
 }
 
@@ -299,8 +401,13 @@ function installAndActivateTestTaxPack(db: any, pack: any) {
         status = 'active',
         updated_at = excluded.updated_at
     `).run(
-      pack.id, pack.publisher, pack.country, pack.jurisdiction,
-      versionId, installedAt, installedAt,
+      pack.id,
+      pack.publisher,
+      pack.country,
+      pack.jurisdiction,
+      versionId,
+      installedAt,
+      installedAt,
     );
     db.prepare(`
       INSERT OR REPLACE INTO country_pack_versions (
@@ -385,6 +492,28 @@ function installAndActivateTestTaxPack(db: any, pack: any) {
 
 // ── API Request Helper ───────────────────────────────────────────────────────
 
+function isLocalTestServer(baseUrl: string): boolean {
+  try {
+    const { hostname } = new URL(baseUrl);
+    return hostname === '127.0.0.1' || hostname === 'localhost' || hostname === '[::1]';
+  } catch {
+    return false;
+  }
+}
+
+function isTransientConnReset(error: any): boolean {
+  let current = error;
+  while (current && typeof current === 'object') {
+    if (current.code === 'ECONNRESET' || String(current.message || '').includes('ECONNRESET')) {
+      return true;
+    }
+    current = current.cause;
+  }
+  return false;
+}
+
+const SAFE_RETRY_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
+
 async function api(
   baseUrl: string,
   urlPath: string,
@@ -392,15 +521,34 @@ async function api(
     method?: string;
     body?: any;
     headers?: Record<string, string>;
-  } = {}
+    retryOnReset?: boolean;
+  } = {},
 ): Promise<{ status: number; data: any }> {
   const fetchOptions: any = {
-    headers: { 'Content-Type': 'application/json', ...(options.headers || {}) },
+    headers: {
+      'Content-Type': 'application/json',
+      Connection: 'close',
+      ...(options.headers || {}),
+    },
   };
   if (options.method) fetchOptions.method = options.method;
-  if (options.body !== undefined) fetchOptions.body = typeof options.body === 'string' ? options.body : JSON.stringify(options.body);
+  if (options.body !== undefined)
+    fetchOptions.body =
+      typeof options.body === 'string' ? options.body : JSON.stringify(options.body);
 
-  const response = await (globalThis as any).fetch(baseUrl + urlPath, fetchOptions);
+  const method = (options.method || 'GET').toUpperCase();
+  const canRetryReset =
+    isLocalTestServer(baseUrl) && (options.retryOnReset ?? SAFE_RETRY_METHODS.has(method));
+  let response: any;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      response = await (globalThis as any).fetch(baseUrl + urlPath, fetchOptions);
+      break;
+    } catch (error) {
+      if (attempt === 0 && canRetryReset && isTransientConnReset(error)) continue;
+      throw error;
+    }
+  }
   const data = await response.json();
   return { status: response.status, data };
 }
@@ -413,6 +561,10 @@ module.exports = {
   assertEqual,
   assertIncludes,
   assertGreaterThan,
+  assertOrThrow,
+  assertEqualOrThrow,
+  assertIncludesOrThrow,
+  assertGreaterThanOrThrow,
   getResults,
   resetCounters,
 

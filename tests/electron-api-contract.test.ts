@@ -75,40 +75,107 @@ async function run(): Promise<void> {
     String(documentNonce),
     /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
   );
-  assert.deepEqual(Object.keys(exposedApi!).sort(), [
-    'backupDatabase', 'checkForUpdates', 'dbApplySafeFixes', 'dbHealthCheck',
-    'dbInitialize', 'getAppInfo', 'getBetaChannel', 'getDailySummary', 'getKdsInfo',
-    'emailErrorLog', 'getLogTail', 'getMasterPinStatus', 'getPrinters', 'getSettings', 'getStatus', 'getUpdateStatus',
-    'getWindowState', 'onMenuAction', 'onUpdateStatus', 'onWindowStateChanged', 'openKdsWindow', 'openWhatsAppShare', 'platform', 'reportRendererError', 'restartAndInstall',
-    'rasterizeKotDocument', 'rasterizePrintDocument', 'restoreBackup', 'savePrinter', 'setBetaChannel', 'setSetting', 'setThemeEffective',
-    'windowAction', 'windowReady',
-  ].sort());
+  assert.deepEqual(
+    Object.keys(exposedApi!).sort(),
+    [
+      'backupDatabase',
+      'checkForUpdates',
+      'dbApplySafeFixes',
+      'dbHealthCheck',
+      'dbInitialize',
+      'downloadUpdate',
+      'emailErrorLog',
+      'getAppInfo',
+      'getApplicationMenu',
+      'getAutoUpdateCheck',
+      'getBetaChannel',
+      'getKdsInfo',
+      'getLogTail',
+      'getMasterPinStatus',
+      'getPostHogBootstrap',
+      'getPrinters',
+      'getSettings',
+      'getStatus',
+      'getUpdateStatus',
+      'getWindowState',
+      'onMenuAction',
+      'onUpdateStatus',
+      'onWindowStateChanged',
+      'openApplicationMenu',
+      'openKdsWindow',
+      'openWhatsAppShare',
+      'pickRestoreFile',
+      'platform',
+      'reportRendererError',
+      'restartAndInstall',
+      'rasterizeKotDocument',
+      'rasterizePrintDocument',
+      'restoreBackup',
+      'saveHtmlAsPdf',
+      'setAutoUpdateCheck',
+      'setBetaChannel',
+      'setSetting',
+      'setThemeEffective',
+      'windowAction',
+      'windowReady',
+    ].sort(),
+  );
+
+  // The printer and daily-summary bridges are removed, not merely unwired:
+  // both are reachable only through permission-gated HTTP routes now, and an
+  // origin-checked IPC channel is the wrong place for either one.
+  for (const removed of ['savePrinter', 'getDailySummary']) {
+    assert.equal(
+      Object.prototype.hasOwnProperty.call(exposedApi, removed),
+      false,
+      `preload no longer exposes ${removed}`,
+    );
+  }
 
   assert.equal(typeof exposedApi!.setThemeEffective, 'function');
 
   const call = (name: string, ...args: unknown[]) =>
     (exposedApi![name] as (...callArgs: unknown[]) => Promise<unknown>)(...args);
   await call('getSettings');
-  await call('setSetting', 'business_name', 'Flo Cafe');
+  await call('getPostHogBootstrap');
+  await call('setSetting', 'theme_mode', 'dark');
   await call('getKdsInfo');
   await call('openKdsWindow');
   await call('getPrinters');
-  await call('savePrinter', { name: 'Kitchen Printer', connection_type: 'network' });
-  await call('rasterizePrintDocument', { document: {}, template: 'classic', profileId: 'profile', options: {} });
+  await call('rasterizePrintDocument', {
+    document: {},
+    template: 'classic',
+    profileId: 'profile',
+    options: {},
+  });
   await call('rasterizeKotDocument', { document: kotDocument, profileId: 'profile', options: {} });
-  await call('getDailySummary');
+  await call('saveHtmlAsPdf', {
+    html: '<html></html>',
+    defaultFileName: 'menu.pdf',
+    pageSize: 'A4',
+  });
   await call('getBetaChannel');
   await call('setBetaChannel', true);
+  await call('downloadUpdate');
+  await call('getAutoUpdateCheck');
+  await call('setAutoUpdateCheck', false);
   await call('windowReady', { epoch: 1 });
   await call('windowAction', 'minimize');
   await call('getWindowState');
   await call('openWhatsAppShare', 'https://wa.me/15555550100?text=test');
-  await call('reportRendererError', { message: 'boom', stack: 'stack', digest: 'd1', route: '/dashboard' });
+  await call('reportRendererError', {
+    message: 'boom',
+    stack: 'stack',
+    digest: 'd1',
+    route: '/dashboard',
+  });
+  await call('getApplicationMenu');
+  await call('openApplicationMenu', '0', 12, 0);
 
   const receivedStatuses: unknown[] = [];
-  const unsubscribe = (exposedApi!['onUpdateStatus'] as (callback: (status: unknown) => void) => () => void)(
-    (status) => receivedStatuses.push(status),
-  );
+  const unsubscribe = (
+    exposedApi!['onUpdateStatus'] as (callback: (status: unknown) => void) => () => void
+  )((status) => receivedStatuses.push(status));
   const structuredReleaseNotes = {
     status: 'available',
     releaseNotes: [{ version: '3.4.0', note: 'Improved update delivery' }],
@@ -119,9 +186,9 @@ async function run(): Promise<void> {
   assert.equal(eventHandlers.has('update-status'), false);
 
   const receivedWindowStates: unknown[] = [];
-  const unsubscribeWindowState = (exposedApi!['onWindowStateChanged'] as (callback: (state: unknown) => void) => () => void)(
-    (state) => receivedWindowStates.push(state),
-  );
+  const unsubscribeWindowState = (
+    exposedApi!['onWindowStateChanged'] as (callback: (state: unknown) => void) => () => void
+  )((state) => receivedWindowStates.push(state));
   const windowStatePayload = { isMaximized: true, isFullScreen: false };
   eventHandlers.get('window-state-changed')?.({}, windowStatePayload);
   assert.deepEqual(receivedWindowStates, [windowStatePayload]);
@@ -130,22 +197,47 @@ async function run(): Promise<void> {
 
   assert.deepEqual(calls, [
     { channel: 'get-settings', args: [] },
-    { channel: 'set-setting', args: ['business_name', 'Flo Cafe'] },
+    { channel: 'get-posthog-bootstrap', args: [] },
+    { channel: 'set-setting', args: ['theme_mode', 'dark'] },
     { channel: 'get-kds-info', args: [] },
     { channel: 'open-kds-window', args: [] },
     { channel: 'get-printers', args: [] },
-    { channel: 'save-printer', args: [{ name: 'Kitchen Printer', connection_type: 'network' }] },
-    { channel: 'rasterize-print-document', args: [{ document: {}, template: 'classic', profileId: 'profile', options: {} }] },
-    { channel: 'rasterize-kot-document', args: [{ document: kotDocument, profileId: 'profile', options: {} }] },
-    { channel: 'get-daily-summary', args: [] },
+    {
+      channel: 'rasterize-print-document',
+      args: [{ document: {}, template: 'classic', profileId: 'profile', options: {} }],
+    },
+    {
+      channel: 'rasterize-kot-document',
+      args: [{ document: kotDocument, profileId: 'profile', options: {} }],
+    },
+    {
+      channel: 'save-html-as-pdf',
+      args: [{ html: '<html></html>', defaultFileName: 'menu.pdf', pageSize: 'A4' }],
+    },
     { channel: 'updates:get-beta-channel', args: [] },
     { channel: 'updates:set-beta-channel', args: [true] },
+    { channel: 'download-update', args: [] },
+    { channel: 'updates:get-auto-check', args: [] },
+    { channel: 'updates:set-auto-check', args: [false] },
     { channel: 'window-ready', args: [{ epoch: 1, documentNonce }] },
     { channel: 'window-action', args: ['minimize'] },
     { channel: 'get-window-state', args: [] },
     { channel: 'whatsapp-open-share', args: ['https://wa.me/15555550100?text=test'] },
-    { channel: 'report-renderer-error', args: [{ message: 'boom', stack: 'stack', digest: 'd1', route: '/dashboard' }] },
+    {
+      channel: 'report-renderer-error',
+      args: [{ message: 'boom', stack: 'stack', digest: 'd1', route: '/dashboard' }],
+    },
+    { channel: 'get-application-menu', args: [] },
+    { channel: 'open-application-menu', args: ['0', 12, 0] },
   ]);
+
+  for (const removedChannel of ['save-printer', 'get-daily-summary']) {
+    assert.equal(
+      calls.some(({ channel }) => channel === removedChannel),
+      false,
+      `no renderer call reaches the ${removedChannel} channel`,
+    );
+  }
 
   console.log('Electron preload methods expose the expected narrow IPC channels.');
 }

@@ -4,24 +4,31 @@ import type { Order } from '@/lib/types';
 import { createTranslator } from 'use-intl/core';
 import { getCachedMessages } from '@/lib/i18n/loader';
 import { LANGUAGES, getLanguageDirection, type Language } from '@/lib/i18n/languages';
+import { awaitPrintPolicyBootstrap } from '@/lib/print-policy-bootstrap';
 import { defaultPrintLanguagePolicy, resolveKotLanguage } from '@print/policy';
 import { directionalText, isKotItemPending, type DirectionalText } from '@print/document';
 import { containsRtlScript } from '@print/direction';
+import { normalizePrinterTextSize, type PrinterTextSize } from '@print/text-size';
 import type { TextDirection } from '@print/types';
 import { usePosSettingsStore } from '@/store/pos-settings';
 import { useAuthStore } from '@/store/auth';
 import { formatTime } from './format-date';
 import { escapeHtml } from './web-print';
+import { formatItemHeading } from './item-heading';
 
 export interface KotWebPrintOptions {
   /** 58 mm or 80mm paper. Controls font sizing. Default: 58 */
   paperWidth?: 58 | 80;
+  /** Per-printer text size ('normal' | 'large' | 'extra_large'). Default: 'normal'. */
+  textSize?: PrinterTextSize;
   /** UI/receipt language (defaults to the client KOT language policy). */
   language?: Language;
   /** Kitchen station name to print on the ticket. */
   stationName?: string;
   /** Store timezone used for business-local time formatting. */
   timezone?: string;
+  /** Print the Order Number in a large bold callout banner on KOT. Default: true */
+  showLargeOrderNumber?: boolean;
 }
 
 /** Resolve the KOT ticket language: fixed policy language or the UI language. */
@@ -30,12 +37,22 @@ export function resolveKotTicketLanguage(language?: Language): Language {
   try {
     const store = usePosSettingsStore.getState();
     const uiLanguage = store.language;
-    return resolveKotLanguage(store.kotLanguagePolicy ?? defaultPrintLanguagePolicy(), uiLanguage) as Language;
+    return resolveKotLanguage(
+      store.kotLanguagePolicy ?? defaultPrintLanguagePolicy(),
+      uiLanguage,
+    ) as Language;
   } catch {
     return 'en';
   }
 }
-function translatorFor(lang: Language): ((key: string) => string) {
+
+/** Waits for any in-flight auth print-policy bootstrap before resolving the KOT ticket language. */
+export async function resolveReadyKotTicketLanguage(language?: Language): Promise<Language> {
+  if (language) return language;
+  await awaitPrintPolicyBootstrap();
+  return resolveKotTicketLanguage();
+}
+function translatorFor(lang: Language): (key: string) => string {
   const locale = LANGUAGES[lang]?.locale ?? 'en';
   const messages = getCachedMessages(lang) ?? getCachedMessages('en') ?? {};
   return createTranslator({ locale, messages }) as unknown as (key: string) => string;
@@ -60,14 +77,25 @@ function detectTicketDirection(lang: Language): TextDirection {
 
 /** Strip the `{name}` placeholder (and its separator) from an interpolated label. */
 function labelWithoutPlaceholder(label: string): string {
-  return label.replace('{name}', '').replace(/[:：]\s*$/, '').trim();
+  return label
+    .replace('{name}', '')
+    .replace(/[:：]\s*$/, '')
+    .trim();
 }
 
-function formatOrderNumberLabel(label: string, orderNumber: DirectionalText, base: TextDirection): string {
+function formatOrderNumberLabel(
+  label: string,
+  orderNumber: DirectionalText,
+  base: TextDirection,
+): string {
   const placeholder = '{number}';
   const position = label.indexOf(placeholder);
   if (position === -1) return escapeHtml(label + ': ') + directionalValue(orderNumber, base);
-  return escapeHtml(label.slice(0, position)) + directionalValue(orderNumber, base) + escapeHtml(label.slice(position + placeholder.length));
+  return (
+    escapeHtml(label.slice(0, position)) +
+    directionalValue(orderNumber, base) +
+    escapeHtml(label.slice(position + placeholder.length))
+  );
 }
 
 function resolveKotTimezone(timezone?: string): string | undefined {
@@ -92,21 +120,74 @@ function resolveOrderType(type: unknown, language: Language, tr: (key: string) =
   return tr(key);
 }
 
+/** Monospace tail every script stack ends in, so a missing family still prints. */
+const KOT_MONOSPACE_TAIL = "'Courier New', monospace";
+
+/**
+ * KOT font stacks keyed by the CLDR script of a registered locale's maximized
+ * tag, so a newly registered locale resolves a declared family without editing
+ * this file. The per-script family lists are the ones the raster renderer
+ * (`main/printers/raster-renderer.ts`) already declares for the same script.
+ */
+const KOT_FONT_STACKS_BY_SCRIPT: Record<string, string> = {
+  Arab: `'Noto Naskh Arabic', -apple-system, 'Segoe UI', Tahoma, ${KOT_MONOSPACE_TAIL}`,
+  Beng: `'Noto Sans Bengali', 'Nirmala UI', 'Vrinda', 'Bangla Sangam MN', ${KOT_MONOSPACE_TAIL}`,
+  Cyrl: `'Noto Sans', ${KOT_MONOSPACE_TAIL}`,
+  Deva: `'Noto Sans Devanagari', 'Nirmala UI', 'Kohinoor Devanagari', 'Devanagari Sangam MN', ${KOT_MONOSPACE_TAIL}`,
+  Guru: `'Noto Sans Gurmukhi', 'Nirmala UI', 'Raavi', 'Kohinoor Gurmukhi', 'Gurmukhi Sangam MN', ${KOT_MONOSPACE_TAIL}`,
+  Hans: `'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', 'Noto Sans', ${KOT_MONOSPACE_TAIL}`,
+  Hant: `'PingFang TC', 'Microsoft JhengHei', 'Noto Sans CJK TC', 'Noto Sans TC', monospace`,
+  Jpan: `'Yu Gothic', Meiryo, 'Hiragino Sans', 'Noto Sans CJK JP', 'Noto Sans JP', ${KOT_MONOSPACE_TAIL}`,
+  Kore: `'Noto Sans', ${KOT_MONOSPACE_TAIL}`,
+  Latn: `'Courier New',monospace`,
+  Taml: `'Noto Sans Tamil', 'Nirmala UI', 'Latha', 'Tamil Sangam MN', ${KOT_MONOSPACE_TAIL}`,
+  Telu: `'Noto Sans Telugu', 'Nirmala UI', 'Kohinoor Telugu', 'Telugu Sangam MN', ${KOT_MONOSPACE_TAIL}`,
+  Thai: `'Noto Sans Thai', 'Leelawadee UI', Thonburi, ${KOT_MONOSPACE_TAIL}`,
+};
+
+/** Script-keyed KOT font stack for a language, falling back to the Latin stack. */
+export function kotFontStackForLanguage(lang: Language): string {
+  const script = new Intl.Locale(LANGUAGES[lang]?.locale ?? 'en').maximize().script;
+  return KOT_FONT_STACKS_BY_SCRIPT[script ?? ''] ?? KOT_FONT_STACKS_BY_SCRIPT.Latn;
+}
+
 /** Generate the semantic KOT HTML fragment (without opening a print dialog). */
-export function generateKotHtml(
-  order: Order,
-  opts: KotWebPrintOptions = {}
-): string {
+export function generateKotHtml(order: Order, opts: KotWebPrintOptions = {}): string {
   const paperWidth = opts.paperWidth ?? 58;
+  const textSize = normalizePrinterTextSize(opts.textSize);
   const lang = resolveKotTicketLanguage(opts.language);
   const tr = translatorFor(lang);
   const base = detectTicketDirection(lang);
   const timezone = resolveKotTimezone(opts.timezone);
 
-  const fontSize = paperWidth === 58 ? '10px' : '12px';
+  const fontSize =
+    paperWidth === 58
+      ? textSize === 'extra_large'
+        ? '16px'
+        : textSize === 'large'
+          ? '14px'
+          : '12px'
+      : textSize === 'extra_large'
+        ? '17px'
+        : textSize === 'large'
+          ? '15px'
+          : '13px';
+  const headingFontSize =
+    paperWidth === 58
+      ? textSize === 'extra_large'
+        ? '19px'
+        : textSize === 'large'
+          ? '17px'
+          : '15px'
+      : textSize === 'extra_large'
+        ? '20px'
+        : textSize === 'large'
+          ? '18px'
+          : '16px';
   const padding = paperWidth === 58 ? '4px' : '6px';
   const paperWidthCss = paperWidth === 58 ? '58mm' : '80mm';
   const locale = LANGUAGES[lang]?.locale ?? 'en-US';
+  const fontFamily = kotFontStackForLanguage(lang);
 
   // Header facts annotated by the direction kernel.
   const orderNumber = directionalText(String(order.order_number ?? ''), base);
@@ -115,10 +196,25 @@ export function generateKotHtml(
 
   const orderType = resolveOrderType(order.type, lang, tr);
 
+  const orderShape = order as Order & {
+    order_notes?: unknown;
+    orderNotes?: unknown;
+    notes?: unknown;
+  };
+  const showLargeOrderNumber = opts.showLargeOrderNumber !== false;
+  const cleanOrderNumber = orderNumber.text.trim().replace(/^#/, '');
+  const orderNotes =
+    [order.special_instructions, orderShape.order_notes, orderShape.orderNotes, orderShape.notes]
+      .find((val): val is string => typeof val === 'string' && val.trim().length > 0)
+      ?.trim() ?? '';
+
   const items = (order.items ?? [])
     .filter((item) => isKotItemPending(item.status))
     .map((item) => ({
-      name: directionalText(String(item.product_name ?? ''), base),
+      name: directionalText(
+        formatItemHeading(String(item.product_name ?? ''), item.variant_selection),
+        base,
+      ),
       quantity: Number(item.quantity) || 0,
       addons: (Array.isArray(item.addons) ? item.addons : []).filter((addon) => addon?.name),
       specialInstructions: item.special_instructions
@@ -126,29 +222,39 @@ export function generateKotHtml(
         : null,
     }));
 
-  const itemRows = items.length > 0
-    ? items.map((item) => `
+  const itemRows =
+    items.length > 0
+      ? items
+          .map(
+            (item) => `
         <div style="margin:${padding} 0;">
-          <div style="font-weight:bold;">${escapeHtml(item.quantity)}x ${directionalValue(item.name, base)}</div>
-          ${item.addons.map((addon) => {
-            const qty = ('quantity' in addon && typeof addon.quantity === 'number' && addon.quantity) || 1;
-            const suffix = qty > 1 ? ` x${qty}` : '';
-            return `<div style="padding-inline-start:1em;">+ ${escapeHtml(addon.name)}${escapeHtml(suffix)}</div>`;
-          }).join('')}
-          ${item.specialInstructions ? `<div style="padding-inline-start:1em;font-style:italic;">&gt;&gt; ${directionalValue(item.specialInstructions, base)}</div>` : ''}
+          <div style="font-weight:bold;line-height:1.4;">${escapeHtml(item.quantity)}x ${directionalValue(item.name, base)}</div>
+          ${item.addons
+            .map((addon) => {
+              const qty =
+                ('quantity' in addon && typeof addon.quantity === 'number' && addon.quantity) || 1;
+              const suffix = qty > 1 ? ` x${qty}` : '';
+              return `<div style="padding-inline-start:1em;margin-top:2px;line-height:1.4;">+ ${escapeHtml(addon.name)}${escapeHtml(suffix)}</div>`;
+            })
+            .join('')}
+          ${item.specialInstructions ? `<div style="padding-inline-start:1em;margin-top:2px;line-height:1.4;font-style:italic;">&gt;&gt; ${directionalValue(item.specialInstructions, base)}</div>` : ''}
         </div>
-      `).join('')
-    : `<div style="margin:${padding} 0;">${escapeHtml(tr('print.kot.noPendingItems'))}</div>`;
+      `,
+          )
+          .join('')
+      : `<div style="margin:${padding} 0;">${escapeHtml(tr('print.kot.noPendingItems'))}</div>`;
 
   return `
-    <div class="kot-container" dir="${base}" style="width:100%;max-width:${paperWidthCss};min-width:0;box-sizing:border-box;overflow-wrap:anywhere;word-break:break-word;text-align:start;padding:${padding};font-family:'Courier New',monospace;font-size:${fontSize};">
-      <h2 style="margin:0 0 ${padding} 0;font-size:${paperWidth === 58 ? '14px' : '16px'};text-align:center;">${escapeHtml(tr('print.kot.banner'))}</h2>
+    <div class="kot-container" lang="${escapeHtml(locale)}" dir="${base}" style="width:100%;max-width:${paperWidthCss};min-width:0;box-sizing:border-box;overflow-wrap:anywhere;word-break:break-word;text-align:start;padding:${padding};font-family:${fontFamily};font-size:${fontSize};line-height:1.4;color:#000;font-weight:600;">
+      <h2 style="margin:0 0 ${padding} 0;font-size:${headingFontSize};text-align:center;color:#000;font-weight:700;">${escapeHtml(tr('print.kot.banner'))}</h2>
+      ${showLargeOrderNumber && cleanOrderNumber.length > 0 ? `<div class="kot-order-banner" dir="ltr" style="direction:ltr;unicode-bidi:isolate;font-size:1.5em;font-weight:800;text-align:center;border:2px solid #000;padding:4px 8px;margin:4px 0;">#${escapeHtml(cleanOrderNumber)}</div>` : ''}
       ${stationName ? `<p style="margin:2px 0;">${escapeHtml(tr('print.kot.station'))}: ${directionalValue(directionalText(stationName, base), base)}</p>` : ''}
       <p style="margin:2px 0;font-weight:bold;">${formatOrderNumberLabel(tr('pos.orderNumber'), orderNumber, base)}</p>
       ${order.table?.name ? `<p style="margin:2px 0;">${escapeHtml(labelWithoutPlaceholder(tr('pos.tableLabel')))}: ${directionalValue(directionalText(String(order.table.name), base), base)}</p>` : ''}
       ${orderType ? `<p style="margin:2px 0;">${escapeHtml(tr('print.kot.type'))}: ${escapeHtml(orderType)}</p>` : ''}
       ${order.customer?.name ? `<p style="margin:2px 0;">${escapeHtml(tr('pos.customer'))}: ${directionalValue(directionalText(String(order.customer.name), base), base)}</p>` : ''}
       <p style="margin:2px 0;">${escapeHtml(`${tr('print.time')}: ${formatTime(createdAt, locale, timezone ? { timeZone: timezone } : undefined)}`)}</p>
+      ${orderNotes ? `<p style="margin:${padding} 0 2px 0;font-weight:bold;">!! ${escapeHtml(tr('print.note'))}: ${directionalValue(directionalText(orderNotes, base), base)}</p>` : ''}
       <hr style="border:1px dashed #000;margin:${padding} 0;">
       ${itemRows}
       <hr style="border:1px dashed #000;margin:${padding} 0;">

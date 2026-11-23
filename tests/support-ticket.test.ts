@@ -20,10 +20,29 @@ Module._load = function (request: string, parent: unknown, isMain: boolean) {
 };
 
 const {
-  initTestDb, createApp, startServer, seedOwnerUser, api, assert, assertEqual, getResults, closeDatabase,
+  initTestDb,
+  createApp,
+  startServer,
+  seedOwnerUser,
+  api,
+  assert,
+  assertEqual,
+  getResults,
+  closeDatabase,
 } = require('./helpers/test-setup');
 const { registerRoutes } = require('../main/routes/index');
 const { cloudSync } = require('../main/services/cloud-sync');
+const { sanitizeLogTail } = require('../main/lib/log-sanitizer');
+const {
+  SUPPORT_LOG_TAIL_MAX_CHARS,
+  buildPosSupportTicketRequestBody,
+  buildPrinterOperationFailureSupportPayload,
+  extractQuotedItemName,
+  isSupportErrorContextCurrent,
+  readBoundedSupportLogTail,
+  resolvePosFailureSupportMetadata,
+  resolvePosValidationAction,
+} = require('../frontend/src/lib/operation-failure');
 
 async function main() {
   console.log('Support Ticket Outbox Integration Tests');
@@ -52,26 +71,187 @@ async function main() {
     });
     assertEqual(createRes.status, 202, 'a well-formed ticket is accepted and queued');
     assertEqual(createRes.data.status, 'queued', 'response reports queued status');
-    assertEqual(createRes.data.client_ticket_id, clientTicketId, 'response echoes the client ticket id');
+    assertEqual(
+      createRes.data.client_ticket_id,
+      clientTicketId,
+      'response echoes the client ticket id',
+    );
 
-    const outboxRow = db.prepare(
-      `SELECT client_ticket_id, status, payload FROM support_ticket_outbox WHERE client_ticket_id = ?`
-    ).get(clientTicketId) as { client_ticket_id: string; status: string; payload: string };
+    const outboxRow = db
+      .prepare(
+        `SELECT client_ticket_id, status, payload FROM support_ticket_outbox WHERE client_ticket_id = ?`,
+      )
+      .get(clientTicketId) as { client_ticket_id: string; status: string; payload: string };
     assert(!!outboxRow, 'a row was written to support_ticket_outbox');
-    assertEqual(outboxRow.status, 'pending', 'the outbox row starts pending (not yet sent to the cloud)');
+    assertEqual(
+      outboxRow.status,
+      'pending',
+      'the outbox row starts pending (not yet sent to the cloud)',
+    );
     const payload = JSON.parse(outboxRow.payload);
-    assertEqual(payload.subject, 'Printer not responding', 'the outbox payload carries the submitted subject');
-    assertEqual(payload.event_code, 'support.printer', 'event_code defaults from category when not supplied');
+    assertEqual(
+      payload.subject,
+      'Printer not responding',
+      'the outbox payload carries the submitted subject',
+    );
+    assertEqual(
+      payload.event_code,
+      'support.printer',
+      'event_code defaults from category when not supplied',
+    );
     assertEqual(payload.diagnostics.category, 'printer', 'diagnostics embed the resolved category');
-    assert(typeof payload.diagnostics.app_version === 'string' && payload.diagnostics.app_version.length > 0,
-      'diagnostics embed the app version');
+    assert(
+      typeof payload.diagnostics.app_version === 'string' &&
+        payload.diagnostics.app_version.length > 0,
+      'diagnostics embed the app version',
+    );
+
+    console.log('\n2. A known operation failure is linked through a validated support context');
+    const operationId = require('crypto').randomUUID();
+    const linkedTicketId = '44444444-5555-6666-7777-888888888888';
+    const linkedTicket = await api(baseUrl, '/api/support-ticket', {
+      method: 'POST',
+      headers: owner.authHeader,
+      body: {
+        client_ticket_id: linkedTicketId,
+        subject: 'Payment was rejected',
+        message: 'Please help me understand this payment result.',
+        correlation_id: operationId,
+        operation_failure: {
+          capture_point: 'fc.backend.payment.create.validation',
+          operation_id: operationId,
+          outcome: 'not_applied',
+          facts: { display_code: 'customer_mismatch' },
+        },
+        diagnostics: { manual_context: 'cashier supplied technical detail' },
+      },
+    });
+    assertEqual(linkedTicket.status, 202, 'a registry-valid support context is accepted');
+    const linkedPayload = JSON.parse(
+      (
+        db
+          .prepare('SELECT payload FROM support_ticket_outbox WHERE client_ticket_id = ?')
+          .get(linkedTicketId) as { payload: string }
+      ).payload,
+    );
+    assertEqual(
+      linkedPayload.correlation_id,
+      operationId,
+      'the support ticket uses the operation UUID as correlation_id',
+    );
+    assertEqual(
+      linkedTicket.data.client_ticket_id,
+      linkedTicketId,
+      'the client ticket ID remains a separate replay key',
+    );
+    assertEqual(
+      linkedPayload.diagnostics.operation_failure.reason_code,
+      'payment.invalid',
+      'the server derives the failure reason from its registry',
+    );
+    assertEqual(
+      linkedPayload.diagnostics.operation_failure.operation,
+      'payment.create',
+      'the server derives the operation from its registry',
+    );
+    assertEqual(
+      linkedPayload.diagnostics.operation_failure.facts.display_code,
+      'customer_mismatch',
+      'the allowlisted payment fact is retained',
+    );
+    assertEqual(
+      linkedPayload.diagnostics.manual_context,
+      'cashier supplied technical detail',
+      'manual diagnostics remain available alongside structured context',
+    );
+
+    const linkedReplayId = require('crypto').randomUUID();
+    const linkedReplay = await api(baseUrl, '/api/support-ticket', {
+      method: 'POST',
+      headers: owner.authHeader,
+      body: {
+        client_ticket_id: linkedTicketId,
+        subject: 'Changed retry text',
+        message: 'This should not replace the first ticket.',
+        correlation_id: linkedReplayId,
+        operation_failure: {
+          capture_point: 'fc.backend.payment.create.validation',
+          operation_id: linkedReplayId,
+          outcome: 'not_applied',
+          facts: { display_code: 'wallet_insufficient' },
+        },
+      },
+    });
+    assertEqual(linkedReplay.status, 202, 'retrying a linked ticket remains accepted');
+    const preservedLinkedPayload = JSON.parse(
+      (
+        db
+          .prepare('SELECT payload FROM support_ticket_outbox WHERE client_ticket_id = ?')
+          .get(linkedTicketId) as { payload: string }
+      ).payload,
+    );
+    assertEqual(
+      preservedLinkedPayload.correlation_id,
+      operationId,
+      'a ticket retry cannot replace its original operation correlation',
+    );
+    assertEqual(
+      preservedLinkedPayload.diagnostics.operation_failure.facts.display_code,
+      'customer_mismatch',
+      'a ticket retry cannot replace the original structured failure',
+    );
+
+    for (const capturePoint of [
+      'fc.backend.order.create.persistence',
+      'fc.backend.bill.generate.failure',
+    ]) {
+      const persistenceOpId = require('crypto').randomUUID();
+      const persistenceTicketId = require('crypto').randomUUID();
+      const persistenceTicketRes = await api(baseUrl, '/api/support-ticket', {
+        method: 'POST',
+        headers: owner.authHeader,
+        body: {
+          client_ticket_id: persistenceTicketId,
+          correlation_id: persistenceOpId,
+          subject: 'Persistence failure help',
+          message: 'Database busy during checkout',
+          operation_failure: {
+            capture_point: capturePoint,
+            operation_id: persistenceOpId,
+            outcome: 'not_applied',
+            facts: { failure_class: 'busy_or_locked' },
+          },
+        },
+      });
+      assertEqual(
+        persistenceTicketRes.status,
+        202,
+        `${capturePoint} support ticket context with allowlisted failure_class is accepted`,
+      );
+      const persistenceTicketRow = db
+        .prepare('SELECT payload FROM support_ticket_outbox WHERE client_ticket_id = ?')
+        .get(persistenceTicketId) as { payload: string };
+      assertEqual(
+        JSON.parse(persistenceTicketRow.payload).diagnostics.operation_failure.facts.failure_class,
+        'busy_or_locked',
+        `${capturePoint} support ticket retains allowlisted failure_class fact`,
+      );
+    }
 
     console.log('\n2. GET status reflects the outbox row');
-    const statusRes = await api(baseUrl, `/api/support-ticket/${clientTicketId}/status`, { headers: owner.authHeader });
+    const statusRes = await api(baseUrl, `/api/support-ticket/${clientTicketId}/status`, {
+      headers: owner.authHeader,
+    });
     assertEqual(statusRes.status, 200, 'status lookup succeeds for a known ticket');
-    assertEqual(statusRes.data.status, 'pending', 'status lookup reports the outbox row\'s real status');
+    assertEqual(
+      statusRes.data.status,
+      'pending',
+      "status lookup reports the outbox row's real status",
+    );
 
-    console.log('\n3. Resubmitting the same client_ticket_id is idempotent (no duplicate outbox row)');
+    console.log(
+      '\n3. Resubmitting the same client_ticket_id is idempotent (no duplicate outbox row)',
+    );
     const resubmitRes = await api(baseUrl, '/api/support-ticket', {
       method: 'POST',
       headers: owner.authHeader,
@@ -81,27 +261,40 @@ async function main() {
         message: 'Retried after a network blip.',
       },
     });
-    assertEqual(resubmitRes.status, 202, 'a resubmission with the same client_ticket_id is still accepted');
-    const outboxCount = db.prepare(
-      `SELECT COUNT(*) AS c FROM support_ticket_outbox WHERE client_ticket_id = ?`
-    ).get(clientTicketId) as { c: number };
-    assertEqual(outboxCount.c, 1, 'INSERT OR IGNORE means a client retry never creates a second outbox row');
-    const unchangedRow = db.prepare(
-      `SELECT payload FROM support_ticket_outbox WHERE client_ticket_id = ?`
-    ).get(clientTicketId) as { payload: string };
     assertEqual(
-      JSON.parse(unchangedRow.payload).subject, 'Printer not responding',
+      resubmitRes.status,
+      202,
+      'a resubmission with the same client_ticket_id is still accepted',
+    );
+    const outboxCount = db
+      .prepare(`SELECT COUNT(*) AS c FROM support_ticket_outbox WHERE client_ticket_id = ?`)
+      .get(clientTicketId) as { c: number };
+    assertEqual(
+      outboxCount.c,
+      1,
+      'INSERT OR IGNORE means a client retry never creates a second outbox row',
+    );
+    const unchangedRow = db
+      .prepare(`SELECT payload FROM support_ticket_outbox WHERE client_ticket_id = ?`)
+      .get(clientTicketId) as { payload: string };
+    assertEqual(
+      JSON.parse(unchangedRow.payload).subject,
+      'Printer not responding',
       'the original payload is preserved — a retry does not overwrite the first submission',
     );
 
     console.log('\n4. Validation rejects malformed submissions before anything is queued');
     const missingSubject = await api(baseUrl, '/api/support-ticket', {
-      method: 'POST', headers: owner.authHeader, body: { message: 'no subject here' },
+      method: 'POST',
+      headers: owner.authHeader,
+      body: { message: 'no subject here' },
     });
     assertEqual(missingSubject.status, 400, 'a ticket without a subject is rejected');
 
     const missingMessage = await api(baseUrl, '/api/support-ticket', {
-      method: 'POST', headers: owner.authHeader, body: { subject: 'no message here' },
+      method: 'POST',
+      headers: owner.authHeader,
+      body: { subject: 'no message here' },
     });
     assertEqual(missingMessage.status, 400, 'a ticket without a message is rejected');
 
@@ -112,42 +305,802 @@ async function main() {
     });
     assertEqual(badEmail.status, 400, 'an invalid contact_email is rejected');
 
-    console.log('\n5. An unrecognized category silently falls back to "general" rather than failing');
+    const invalidOperationId = require('crypto').randomUUID();
+    const malformedOperationFailures = [
+      {
+        correlation_id: invalidOperationId,
+        operation_failure: {
+          capture_point: 'fc.backend.payment.create.validation',
+          operation_id: 'bad-id',
+          outcome: 'not_applied',
+        },
+      },
+      {
+        correlation_id: require('crypto').randomUUID(),
+        operation_failure: {
+          capture_point: 'fc.backend.payment.create.validation',
+          operation_id: invalidOperationId,
+          outcome: 'not_applied',
+        },
+      },
+      {
+        correlation_id: invalidOperationId,
+        operation_failure: {
+          capture_point: 'fc.backend.not_registered',
+          operation_id: invalidOperationId,
+          outcome: 'not_applied',
+        },
+      },
+      {
+        correlation_id: invalidOperationId,
+        operation_failure: {
+          capture_point: 'fc.backend.payment.create.validation',
+          operation_id: invalidOperationId,
+          outcome: 'applied',
+        },
+      },
+      {
+        correlation_id: invalidOperationId,
+        operation_failure: {
+          capture_point: 'fc.backend.payment.create.validation',
+          operation_id: invalidOperationId,
+          outcome: 'not_applied',
+          facts: { display_code: 'raw error text' },
+        },
+      },
+      {
+        correlation_id: invalidOperationId,
+        operation_failure: {
+          capture_point: 'fc.backend.order.create.persistence',
+          operation_id: invalidOperationId,
+          outcome: 'not_applied',
+          facts: { failure_class: 'SQLITE_BUSY: /Users/pos/flo.db' },
+        },
+      },
+      {
+        correlation_id: invalidOperationId,
+        operation_failure: {
+          capture_point: 'fc.backend.payment.create.validation',
+          operation_id: invalidOperationId,
+          outcome: 'not_applied',
+          extra: true,
+        },
+      },
+    ];
+    const beforeInvalidContext = (
+      db.prepare('SELECT COUNT(*) AS count FROM support_ticket_outbox').get() as { count: number }
+    ).count;
+    for (const malformed of malformedOperationFailures) {
+      const invalidContext = await api(baseUrl, '/api/support-ticket', {
+        method: 'POST',
+        headers: owner.authHeader,
+        body: { subject: 'invalid context', message: 'this ticket must not queue', ...malformed },
+      });
+      assertEqual(
+        invalidContext.status,
+        400,
+        'malformed or unregistered operation context is rejected',
+      );
+    }
+    assertEqual(
+      (db.prepare('SELECT COUNT(*) AS count FROM support_ticket_outbox').get() as { count: number })
+        .count,
+      beforeInvalidContext,
+      'invalid operation contexts never create queued support tickets',
+    );
+
+    console.log(
+      '\n5. An unrecognized category silently falls back to "general" rather than failing',
+    );
     const unknownCategoryRes = await api(baseUrl, '/api/support-ticket', {
       method: 'POST',
       headers: owner.authHeader,
-      body: { client_ticket_id: '22222222-3333-4444-5555-666666666666', subject: 'x', message: 'y', category: 'not-a-real-category' },
+      body: {
+        client_ticket_id: '22222222-3333-4444-5555-666666666666',
+        subject: 'x',
+        message: 'y',
+        category: 'not-a-real-category',
+      },
     });
-    assertEqual(unknownCategoryRes.status, 202, 'an unrecognized category does not block submission');
-    const fallbackRow = db.prepare(
-      `SELECT payload FROM support_ticket_outbox WHERE client_ticket_id = '22222222-3333-4444-5555-666666666666'`
-    ).get() as { payload: string };
-    assertEqual(JSON.parse(fallbackRow.payload).diagnostics.category, 'general', 'category falls back to "general"');
+    assertEqual(
+      unknownCategoryRes.status,
+      202,
+      'an unrecognized category does not block submission',
+    );
+    const fallbackRow = db
+      .prepare(
+        `SELECT payload FROM support_ticket_outbox WHERE client_ticket_id = '22222222-3333-4444-5555-666666666666'`,
+      )
+      .get() as { payload: string };
+    assertEqual(
+      JSON.parse(fallbackRow.payload).diagnostics.category,
+      'general',
+      'category falls back to "general"',
+    );
 
     console.log('\n6. Status lookup rejects a malformed id and 404s a genuinely unknown one');
-    const badIdRes = await api(baseUrl, '/api/support-ticket/not-a-uuid/status', { headers: owner.authHeader });
-    assertEqual(badIdRes.status, 400, 'a malformed client_ticket_id is rejected before querying the database');
+    const badIdRes = await api(baseUrl, '/api/support-ticket/not-a-uuid/status', {
+      headers: owner.authHeader,
+    });
+    assertEqual(
+      badIdRes.status,
+      400,
+      'a malformed client_ticket_id is rejected before querying the database',
+    );
 
-    const unknownIdRes = await api(baseUrl, '/api/support-ticket/99999999-8888-7777-6666-555555555555/status', { headers: owner.authHeader });
+    const unknownIdRes = await api(
+      baseUrl,
+      '/api/support-ticket/99999999-8888-7777-6666-555555555555/status',
+      { headers: owner.authHeader },
+    );
     assertEqual(unknownIdRes.status, 404, 'a well-formed but unknown client_ticket_id 404s');
 
-    console.log('\n7. Submissions are blocked (not queued) while a cloud account deletion is in progress');
+    console.log(
+      '\n7. Submissions are blocked (not queued) while a cloud account deletion is in progress',
+    );
     (cloudSync as any).cloudDeletionInProgress = true;
     try {
       const duringDeletionRes = await api(baseUrl, '/api/support-ticket', {
         method: 'POST',
         headers: owner.authHeader,
-        body: { client_ticket_id: '33333333-4444-5555-6666-777777777777', subject: 'x', message: 'y' },
+        body: {
+          client_ticket_id: '33333333-4444-5555-6666-777777777777',
+          subject: 'x',
+          message: 'y',
+        },
       });
-      assertEqual(duringDeletionRes.status, 503, 'submission is refused while cloud deletion is in progress');
-      assertEqual(duringDeletionRes.data.status, 'unavailable', 'response reports the unavailable status');
-      const blockedRow = db.prepare(
-        `SELECT COUNT(*) AS c FROM support_ticket_outbox WHERE client_ticket_id = '33333333-4444-5555-6666-777777777777'`
-      ).get() as { c: number };
-      assertEqual(blockedRow.c, 0, 'nothing is written to the outbox while deletion is in progress');
+      assertEqual(
+        duringDeletionRes.status,
+        503,
+        'submission is refused while cloud deletion is in progress',
+      );
+      assertEqual(
+        duringDeletionRes.data.status,
+        'unavailable',
+        'response reports the unavailable status',
+      );
+      const blockedRow = db
+        .prepare(
+          `SELECT COUNT(*) AS c FROM support_ticket_outbox WHERE client_ticket_id = '33333333-4444-5555-6666-777777777777'`,
+        )
+        .get() as { c: number };
+      assertEqual(
+        blockedRow.c,
+        0,
+        'nothing is written to the outbox while deletion is in progress',
+      );
     } finally {
       (cloudSync as any).cloudDeletionInProgress = false;
     }
+
+    console.log(
+      '\n8. Shared credential redaction scrubs tokens and secrets from log_tail while preserving diagnostics',
+    );
+    const rawLogTail = [
+      '[2026-11-07 10:15:30.123] [error] [Auth] Token verification failed code=ECONNRESET',
+      'Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VySWQiOiJvd25lci0xIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c',
+      '{"x-master-pin":"987654","master_pin":"654321","password":"SuperSecret!1","pin":"1234"}',
+      'cloud_api_key=floc_live_secret_key_12345 cloud_device_secret=dev_sec_98765 jwt_secret="jwt_top_secret"',
+      'x-api-key=header_api_key_secret api_key="snake_api_key_secret" apiKey=camelApiKeySecret',
+      'oauth access_token="ya29.a0AfH6SMBxSecretToken" refresh_token=1//0gSecretRefreshTokenValue12345',
+      '    at verifyRequest (/app/main/server.ts:112:15)',
+    ].join('\n');
+
+    const directSanitized = sanitizeLogTail(rawLogTail);
+    assert(
+      !directSanitized.includes('eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9'),
+      'JWT is redacted by sanitizeLogTail',
+    );
+    assert(
+      directSanitized.includes('Authorization: Bearer [REDACTED]') &&
+        !directSanitized.includes('Authorization: Bearer [REDACTED]]'),
+      'Authorization: Bearer <jwt> sanitizes to Authorization: Bearer [REDACTED] with no extra ]',
+    );
+    assertEqual(
+      sanitizeLogTail(directSanitized),
+      directSanitized,
+      'sanitizeLogTail is idempotent across repeated passes',
+    );
+    assert(
+      !directSanitized.includes('header_api_key_secret') &&
+        !directSanitized.includes('snake_api_key_secret') &&
+        !directSanitized.includes('camelApiKeySecret'),
+      'x-api-key, api_key, and apiKey are redacted',
+    );
+    assert(
+      !directSanitized.includes('987654') && !directSanitized.includes('654321'),
+      'master PINs are redacted',
+    );
+    assert(
+      !directSanitized.includes('SuperSecret!1') && !directSanitized.includes('1234'),
+      'password and PIN are redacted',
+    );
+    assert(
+      !directSanitized.includes('floc_live_secret_key_12345') &&
+        !directSanitized.includes('dev_sec_98765') &&
+        !directSanitized.includes('jwt_top_secret'),
+      'cloud keys and jwt_secret are redacted',
+    );
+    assert(
+      !directSanitized.includes('ya29.a0AfH6SMBxSecretToken') &&
+        !directSanitized.includes('1//0gSecretRefreshTokenValue12345'),
+      'OAuth tokens are redacted',
+    );
+    assert(
+      directSanitized.includes(
+        '[2026-11-07 10:15:30.123] [error] [Auth] Token verification failed code=ECONNRESET',
+      ) && directSanitized.includes('at verifyRequest (/app/main/server.ts:112:15)'),
+      'timestamps, error codes, and stack traces are preserved',
+    );
+
+    const redactedTicketId = '55555555-6666-7777-8888-999999999999';
+    const redactedTicketRes = await api(baseUrl, '/api/support-ticket', {
+      method: 'POST',
+      headers: owner.authHeader,
+      body: {
+        client_ticket_id: redactedTicketId,
+        subject: 'Log redaction check',
+        message: 'Checking attached log redaction.',
+        log_tail: rawLogTail,
+      },
+    });
+    assertEqual(redactedTicketRes.status, 202, 'ticket with log_tail is accepted');
+    const redactedOutboxRow = db
+      .prepare('SELECT payload FROM support_ticket_outbox WHERE client_ticket_id = ?')
+      .get(redactedTicketId) as { payload: string };
+    const storedLogTail = JSON.parse(redactedOutboxRow.payload).log_tail as string;
+    assert(
+      typeof storedLogTail === 'string' && storedLogTail.length > 0,
+      'sanitized log_tail is stored',
+    );
+    assert(!storedLogTail.includes('SuperSecret!1'), 'stored log_tail redacts password');
+    assert(!storedLogTail.includes('987654'), 'stored log_tail redacts x-master-pin');
+    assert(
+      !storedLogTail.includes('eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9'),
+      'stored log_tail redacts bearer JWT',
+    );
+    assert(
+      storedLogTail.includes('at verifyRequest (/app/main/server.ts:112:15)'),
+      'stored log_tail preserves stack trace',
+    );
+
+    const boundarySecret = 'BoundaryCrossingTopSecretValue999';
+    const boundaryCrossingTail = `password=${boundarySecret}\n` + 'x'.repeat(200_000 - 15);
+    const boundaryTicketId = '66666666-7777-8888-9999-000000000000';
+    const boundaryTicketRes = await api(baseUrl, '/api/support-ticket', {
+      method: 'POST',
+      headers: owner.authHeader,
+      body: {
+        client_ticket_id: boundaryTicketId,
+        subject: 'Boundary log redaction check',
+        message: 'Checking credential crossing 200KB boundary.',
+        log_tail: boundaryCrossingTail,
+      },
+    });
+    assertEqual(boundaryTicketRes.status, 202, 'ticket with boundary-crossing log_tail accepted');
+    const boundaryOutboxRow = db
+      .prepare('SELECT payload FROM support_ticket_outbox WHERE client_ticket_id = ?')
+      .get(boundaryTicketId) as { payload: string };
+    const storedBoundaryTail = JSON.parse(boundaryOutboxRow.payload).log_tail as string;
+    assert(
+      !storedBoundaryTail.includes(boundarySecret),
+      'credential crossing 200KB truncation boundary is redacted before slicing',
+    );
+
+    console.log(
+      '\n9. POS one-click Get Help attaches bounded log_tail when opted in and guards tenant/session context (#1463)',
+    );
+    const oversizedLog =
+      'HEADER_SHOULD_BE_DROPPED\n' + 'L'.repeat(SUPPORT_LOG_TAIL_MAX_CHARS + 512);
+    const boundedLog = await readBoundedSupportLogTail(true, async () => ({
+      text: oversizedLog,
+      truncated: true,
+    }));
+    assertEqual(
+      boundedLog?.length,
+      SUPPORT_LOG_TAIL_MAX_CHARS,
+      'readBoundedSupportLogTail bounds log tail to 16KB',
+    );
+    assert(
+      !boundedLog?.includes('HEADER_SHOULD_BE_DROPPED'),
+      'readBoundedSupportLogTail keeps the most recent tail characters',
+    );
+    assertEqual(
+      await readBoundedSupportLogTail(false, async () => ({ text: 'should not be read' })),
+      undefined,
+      'readBoundedSupportLogTail skips IPC when attachLog is unchecked',
+    );
+    assertEqual(
+      await readBoundedSupportLogTail(true, undefined),
+      undefined,
+      'readBoundedSupportLogTail returns undefined when Electron API is unavailable',
+    );
+    assertEqual(
+      await readBoundedSupportLogTail(true, async () => {
+        throw new Error('IPC channel closed');
+      }),
+      undefined,
+      'readBoundedSupportLogTail swallows IPC errors so ticket queueing still succeeds',
+    );
+
+    const originContext = {
+      storeId: 'tenant-a',
+      userId: 'user-1',
+      token: 'tok-tenant-a',
+      sessionEpoch: 3,
+    };
+    assert(
+      isSupportErrorContextCurrent(originContext, {
+        storeId: 'tenant-a',
+        initialStoreId: 'tenant-a',
+        userId: 'user-1',
+        token: 'tok-tenant-a',
+        sessionEpoch: 3,
+      }),
+      'matching tenant, user, token, and sessionEpoch is current',
+    );
+    assert(
+      !isSupportErrorContextCurrent(originContext, {
+        storeId: 'tenant-b',
+        initialStoreId: 'tenant-a',
+        userId: 'user-1',
+        token: 'tok-tenant-b',
+        sessionEpoch: 3,
+      }),
+      'tenant switch invalidates the captured supportError context',
+    );
+    assert(
+      !isSupportErrorContextCurrent(originContext, {
+        storeId: 'tenant-a',
+        initialStoreId: 'tenant-a',
+        userId: 'user-1',
+        token: 'tok-tenant-b',
+        sessionEpoch: 3,
+      }),
+      'token rotation invalidates the captured supportError context even before epoch/store refs update',
+    );
+    assert(
+      !isSupportErrorContextCurrent(originContext, {
+        storeId: 'tenant-a',
+        initialStoreId: 'tenant-a',
+        userId: 'user-2',
+        token: 'tok-tenant-a',
+        sessionEpoch: 3,
+      }),
+      'user switch invalidates the captured supportError context',
+    );
+    assert(
+      isSupportErrorContextCurrent(
+        { storeId: 'default', userId: 'user-1', token: 'tok-tenant-a', sessionEpoch: 1 },
+        {
+          storeId: 'tenant-a',
+          initialStoreId: 'tenant-a',
+          userId: 'user-1',
+          token: 'tok-tenant-a',
+          sessionEpoch: 1,
+        },
+      ),
+      'initial default store hydration to the active tenant preserves context',
+    );
+
+    const posHelpTicketId = require('crypto').randomUUID();
+    const posHelpCorrelationId = require('crypto').randomUUID();
+    const posHelpBodyWithLog = buildPosSupportTicketRequestBody({
+      payload: {
+        event_code: 'order.create.failed',
+        message: 'Database busy while creating order',
+        category: 'bug',
+      },
+      subject: 'FactorPOS order problem',
+      ticketCorrelationId: posHelpCorrelationId,
+      clientTicketId: posHelpTicketId,
+      attachLog: true,
+      logTail: '[2026-11-09 12:00:00] [error] SQLITE_BUSY in orders.ts',
+    });
+    const posHelpRes = await api(baseUrl, '/api/support-ticket', {
+      method: 'POST',
+      headers: owner.authHeader,
+      body: posHelpBodyWithLog,
+    });
+    assertEqual(posHelpRes.status, 202, 'POS one-click help ticket with log_tail is queued');
+    const posHelpStored = JSON.parse(
+      (
+        db
+          .prepare('SELECT payload FROM support_ticket_outbox WHERE client_ticket_id = ?')
+          .get(posHelpTicketId) as { payload: string }
+      ).payload,
+    );
+    assert(
+      typeof posHelpStored.log_tail === 'string' &&
+        posHelpStored.log_tail.includes('SQLITE_BUSY in orders.ts'),
+      'POS one-click help ticket stores attached log_tail in outbox',
+    );
+
+    const posHelpNoLogTicketId = require('crypto').randomUUID();
+    const posHelpBodyWithoutLog = buildPosSupportTicketRequestBody({
+      payload: {
+        event_code: 'order.create.failed',
+        message: 'Database busy while creating order',
+        category: 'bug',
+      },
+      subject: 'FactorPOS order problem',
+      ticketCorrelationId: require('crypto').randomUUID(),
+      clientTicketId: posHelpNoLogTicketId,
+      attachLog: false,
+      logTail: '[2026-11-09 12:00:00] [error] should be omitted when opted out',
+    });
+    assertEqual(
+      'log_tail' in posHelpBodyWithoutLog,
+      false,
+      'buildPosSupportTicketRequestBody omits log_tail when attachLog is false',
+    );
+
+    console.log(
+      '\n10. POS print Get Help preserves backend failure_class, connection_type, and sanitized detail (#1465)',
+    );
+    const receiptCorrelationId = require('crypto').randomUUID();
+    const receiptPrintFailure = buildPrinterOperationFailureSupportPayload(
+      {
+        response: {
+          status: 502,
+          data: {
+            error: 'Print failed',
+            detail:
+              'Command failed: powershell -NoProfile -EncodedCommand SQBuAHYAbwBrAGUA\nPrinter is set to Use Printer Offline in Windows at C:\\Users\\Cashier\\AppData\\Local\\Temp\\flo_print_77.bin',
+            failure_class: 'offline',
+            connection_type: 'usb',
+            code: 'print.receipt.failed',
+            stage: 'dispatch',
+            correlation_id: receiptCorrelationId,
+          },
+        },
+      },
+      {
+        kind: 'receipt',
+        fallbackDetail: 'Receipt printing failed after payment was completed',
+      },
+    );
+    assert(
+      !receiptPrintFailure.detail.includes('EncodedCommand') &&
+        !receiptPrintFailure.detail.includes('C:\\Users\\Cashier'),
+      'printer failure detail strips PowerShell command flags and redacts paths',
+    );
+    const printerTicketId = require('crypto').randomUUID();
+    const printerTicketRes = await api(baseUrl, '/api/support-ticket', {
+      method: 'POST',
+      headers: owner.authHeader,
+      body: {
+        client_ticket_id: printerTicketId,
+        subject: 'FactorPOS printer problem',
+        message: receiptPrintFailure.detail,
+        category: 'printer',
+        event_code: receiptPrintFailure.code,
+        correlation_id: receiptPrintFailure.correlation_id,
+        diagnostics: {
+          operation: 'printer.print',
+          stage: receiptPrintFailure.stage,
+          outcome: receiptPrintFailure.outcome,
+          failure_class: receiptPrintFailure.failure_class,
+          connection_type: receiptPrintFailure.connection_type,
+        },
+        operation_failure: receiptPrintFailure.operation_failure,
+      },
+    });
+    assertEqual(
+      printerTicketRes.status,
+      202,
+      'printer Get Help payload with operation_failure is accepted by /api/support-ticket',
+    );
+    const storedPrinterPayload = JSON.parse(
+      (
+        db
+          .prepare('SELECT payload FROM support_ticket_outbox WHERE client_ticket_id = ?')
+          .get(printerTicketId) as { payload: string }
+      ).payload,
+    );
+    assertEqual(
+      storedPrinterPayload.diagnostics.operation_failure.capture_point,
+      'fc.backend.printer.receipt.queue',
+      'receipt queue failure uses registered fc.backend.printer.receipt.queue capture point',
+    );
+    assertEqual(
+      storedPrinterPayload.diagnostics.operation_failure.facts.failure_class,
+      'offline',
+      'printer operation_failure preserves allowlisted failure_class',
+    );
+    assertEqual(
+      storedPrinterPayload.diagnostics.operation_failure.facts.connection_type,
+      'usb',
+      'printer operation_failure preserves allowlisted connection_type',
+    );
+
+    const clientFallbackPrintFailure = buildPrinterOperationFailureSupportPayload(
+      new Error('Please allow popups to print'),
+      {
+        kind: 'kot',
+        connectionType: 'unknown',
+        fallbackDetail: 'Kitchen ticket printing failed after the order was created',
+      },
+    );
+    assertEqual(
+      clientFallbackPrintFailure.operation_failure,
+      undefined,
+      'client-side popup fallback omits fabricated backend operation_failure',
+    );
+    assertEqual(
+      clientFallbackPrintFailure.correlation_id,
+      null,
+      'client-side popup fallback omits fabricated backend correlation_id',
+    );
+    const fallbackPrinterTicketId = require('crypto').randomUUID();
+    const fallbackPrinterTicketRes = await api(baseUrl, '/api/support-ticket', {
+      method: 'POST',
+      headers: owner.authHeader,
+      body: {
+        client_ticket_id: fallbackPrinterTicketId,
+        subject: 'FactorPOS printer problem',
+        message: clientFallbackPrintFailure.detail,
+        category: 'printer',
+        event_code: clientFallbackPrintFailure.code,
+        correlation_id: require('crypto').randomUUID(),
+        diagnostics: {
+          operation: 'printer.print',
+          stage: clientFallbackPrintFailure.stage,
+          outcome: clientFallbackPrintFailure.outcome,
+          failure_class: clientFallbackPrintFailure.failure_class,
+          connection_type: clientFallbackPrintFailure.connection_type,
+        },
+      },
+    });
+    assertEqual(
+      fallbackPrinterTicketRes.status,
+      202,
+      'client-side printer fallback ticket queues cleanly without operation_failure',
+    );
+    const storedFallbackPrinterPayload = JSON.parse(
+      (
+        db
+          .prepare('SELECT payload FROM support_ticket_outbox WHERE client_ticket_id = ?')
+          .get(fallbackPrinterTicketId) as { payload: string }
+      ).payload,
+    );
+    assertEqual(
+      storedFallbackPrinterPayload.diagnostics.failure_class,
+      'unsupported',
+      'client-side printer fallback ticket preserves failure_class in diagnostics',
+    );
+    assertEqual(
+      storedFallbackPrinterPayload.diagnostics.operation_failure,
+      undefined,
+      'client-side printer fallback ticket stores no synthetic operation_failure',
+    );
+
+    console.log(
+      '\n11. Expected order rejections use validation presentation and non-bug support metadata (#1466)',
+    );
+    const stockMetadata = resolvePosFailureSupportMetadata({
+      operation: 'order.create',
+      classification: 'expected_rejection',
+      outcome: 'not_applied',
+      reasonCode: 'order.stock_insufficient',
+      code: 'order.stock_insufficient',
+      message: 'Insufficient stock for "Double Cheeseburger"',
+      detail: 'Insufficient stock for "Double Cheeseburger"',
+    });
+    assertEqual(stockMetadata.variant, 'validation', 'stock rejection uses validation variant');
+    assertEqual(stockMetadata.category, 'general', 'stock rejection uses non-bug category');
+    assertEqual(
+      stockMetadata.subject,
+      'FactorPOS inventory or stock validation help',
+      'stock rejection uses inventory validation subject',
+    );
+    assertEqual(
+      stockMetadata.affectedItem,
+      'Double Cheeseburger',
+      'stock rejection extracts quoted affected item name',
+    );
+    const catalogAction = resolvePosValidationAction('stock_insufficient', {
+      canManageCatalog: true,
+      canViewInventory: true,
+    });
+    assertEqual(
+      catalogAction?.kind === 'link' ? catalogAction.href : null,
+      '/products',
+      'stock rejection links to /products when catalog.manage is granted',
+    );
+    const inventoryOnlyAction = resolvePosValidationAction('stock_insufficient', {
+      canManageCatalog: false,
+      canViewInventory: true,
+    });
+    assertEqual(
+      inventoryOnlyAction,
+      null,
+      'stock rejection returns null when catalog.manage is not granted even if inventory.view is granted',
+    );
+    assertEqual(
+      resolvePosValidationAction('stock_insufficient', {
+        canManageCatalog: false,
+        canViewInventory: false,
+      }),
+      null,
+      'stock rejection hides navigation link for roles without catalog or inventory access',
+    );
+
+    const appendStockMetadata = resolvePosFailureSupportMetadata({
+      operation: 'order.append',
+      classification: 'expected_rejection',
+      outcome: 'not_applied',
+      reasonCode: 'validation.rejected',
+      code: 'validation.rejected',
+      message: 'Insufficient stock for "1/2 Roasted Chicken"',
+      detail: 'Insufficient stock for "1/2 Roasted Chicken"',
+    });
+    assertEqual(
+      appendStockMetadata.rejectionKind,
+      'stock_insufficient',
+      'order.append stock rejection resolves as stock_insufficient',
+    );
+    assertEqual(
+      appendStockMetadata.affectedItem,
+      '1/2 Roasted Chicken',
+      'order.append stock rejection extracts fractional/slashed menu item name',
+    );
+    assertEqual(
+      appendStockMetadata.subject,
+      'FactorPOS inventory or stock validation help',
+      'order.append stock rejection uses inventory validation subject',
+    );
+
+    const addonOutOfStockMetadata = resolvePosFailureSupportMetadata({
+      operation: 'order.create',
+      classification: 'expected_rejection',
+      outcome: 'not_applied',
+      reasonCode: 'order.addon_unavailable',
+      code: 'order.addon_unavailable',
+      message: 'Add-on "Chef\'s Select Burger Sauce" is out of stock (requested 2, available 0)',
+      detail: 'Add-on "Chef\'s Select Burger Sauce" is out of stock (requested 2, available 0)',
+    });
+    assertEqual(
+      addonOutOfStockMetadata.rejectionKind,
+      'stock_insufficient',
+      'add-on out-of-stock rejection resolves as stock_insufficient',
+    );
+    assertEqual(
+      addonOutOfStockMetadata.affectedItem,
+      "Chef's Select Burger Sauce",
+      'add-on out-of-stock rejection preserves item names containing SQL-like English words',
+    );
+    assertEqual(
+      extractQuotedItemName('Insufficient stock for "Chicken/Beef Wrap"'),
+      'Chicken/Beef Wrap',
+      'extractQuotedItemName accepts slashed menu item names',
+    );
+    assertEqual(
+      extractQuotedItemName('Error reading "/etc/passwd"'),
+      null,
+      'extractQuotedItemName rejects filesystem paths',
+    );
+    assertEqual(
+      extractQuotedItemName('Failed "SELECT * FROM products"'),
+      null,
+      'extractQuotedItemName rejects SQL statements',
+    );
+
+    const closedBooksMetadata = resolvePosFailureSupportMetadata({
+      operation: 'order.create',
+      classification: 'expected_rejection',
+      outcome: 'not_applied',
+      reasonCode: 'validation.rejected',
+      code: 'validation.rejected',
+      message: 'Books are closed for 2026-11-09.',
+      detail: 'Books are closed for 2026-11-09.',
+    });
+    assertEqual(
+      closedBooksMetadata.variant,
+      'validation',
+      'closed-books rejection uses validation variant',
+    );
+    assertEqual(
+      closedBooksMetadata.category,
+      'general',
+      'closed-books rejection uses non-bug category',
+    );
+    assertEqual(
+      closedBooksMetadata.rejectionKind,
+      'closed_books',
+      'closed-books rejection resolves as immutable closed_books',
+    );
+    assertEqual(
+      resolvePosValidationAction('closed_books', {
+        canManageCatalog: true,
+        canViewInventory: true,
+        canUseShift: true,
+      }),
+      null,
+      'closed-books rejection never links to /dashboard or offers reopening',
+    );
+
+    const shiftRequiredMetadata = resolvePosFailureSupportMetadata({
+      operation: 'payment.create',
+      classification: 'expected_rejection',
+      outcome: 'not_applied',
+      reasonCode: 'payment.invalid',
+      displayCode: 'cash_session_required',
+      code: 'payment.invalid',
+      message: 'No open shift: open a shift before taking cash',
+      detail: 'No open shift: open a shift before taking cash',
+    });
+    assertEqual(
+      shiftRequiredMetadata.rejectionKind,
+      'shift_required',
+      'cash_session_required resolves as shift_required',
+    );
+    const shiftRequiredAction = resolvePosValidationAction('shift_required', { canUseShift: true });
+    assertEqual(
+      shiftRequiredAction?.kind ?? null,
+      'open_shift',
+      'shift_required offers inline open_shift modal action when canUseShift is true',
+    );
+    assertEqual(
+      resolvePosValidationAction('shift_required', { canUseShift: false }),
+      null,
+      'shift_required hides open_shift action when canUseShift is false',
+    );
+
+    const unexpectedMetadata = resolvePosFailureSupportMetadata({
+      operation: 'order.create',
+      classification: 'unexpected_failure',
+      outcome: 'unknown',
+      reasonCode: 'persistence.failed',
+      code: 'persistence.failed',
+      message: 'Order outcome could not be confirmed.',
+      detail: 'Order persistence failed',
+    });
+    assertEqual(unexpectedMetadata.variant, 'error', 'unexpected failure keeps red error variant');
+    assertEqual(unexpectedMetadata.category, 'bug', 'unexpected failure keeps bug category');
+    assertEqual(
+      unexpectedMetadata.subject,
+      'FactorPOS order problem',
+      'unexpected failure keeps FactorPOS order problem subject',
+    );
+
+    const validationTicketId = require('crypto').randomUUID();
+    const validationOpId = require('crypto').randomUUID();
+    const validationTicketRes = await api(baseUrl, '/api/support-ticket', {
+      method: 'POST',
+      headers: owner.authHeader,
+      body: {
+        client_ticket_id: validationTicketId,
+        subject: stockMetadata.subject,
+        message: 'Insufficient stock for "Double Cheeseburger"',
+        category: stockMetadata.category,
+        event_code: 'order.stock_insufficient',
+        correlation_id: validationOpId,
+        operation_failure: {
+          capture_point: 'fc.backend.order.create.stock_validation',
+          operation_id: validationOpId,
+          outcome: 'not_applied',
+        },
+      },
+    });
+    assertEqual(validationTicketRes.status, 202, 'validation help ticket is accepted');
+    const storedValidationTicket = JSON.parse(
+      (
+        db
+          .prepare('SELECT payload FROM support_ticket_outbox WHERE client_ticket_id = ?')
+          .get(validationTicketId) as { payload: string }
+      ).payload,
+    );
+    assertEqual(
+      storedValidationTicket.diagnostics.category,
+      'general',
+      'validation help ticket is stored with non-bug category',
+    );
+    assertEqual(
+      storedValidationTicket.subject,
+      'FactorPOS inventory or stock validation help',
+      'validation help ticket preserves inventory validation subject',
+    );
   } finally {
     server.close();
     closeDatabase();

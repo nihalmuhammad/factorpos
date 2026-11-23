@@ -2,19 +2,39 @@
 
 export interface ElectronAPI {
   // Menu
-  onMenuAction: (callback: (action: string) => void) => (() => void);
+  onMenuAction: (callback: (action: string) => void) => () => void;
+  // Windows/Linux title-bar menu row; macOS keeps its native menu bar and the
+  // main process answers with an empty entry list there.
+  getApplicationMenu: () => Promise<{ entries: ApplicationMenuEntry[] } | ElectronIpcError>;
+  openApplicationMenu: (
+    key: string,
+    x: number,
+    y: number,
+  ) => Promise<ElectronActionResult | ElectronIpcError>;
 
   // Window controls
   windowAction: (action: WindowControlAction) => Promise<ElectronActionResult | ElectronIpcError>;
   getWindowState?: () => Promise<{ isMaximized: boolean; isFullScreen: boolean }>;
-  onWindowStateChanged?: (callback: (state: { isMaximized: boolean; isFullScreen: boolean }) => void) => () => void;
+  onWindowStateChanged?: (
+    callback: (state: { isMaximized: boolean; isFullScreen: boolean }) => void,
+  ) => () => void;
 
   // Database
   backupDatabase: (pin?: string) => Promise<{ success: boolean; path?: string; error?: string }>;
-  restoreBackup: (pin?: string, backupPath?: string) => Promise<{ success: boolean; error?: string }>;
+  restoreBackup: (
+    pin?: string,
+    backupPath?: string,
+  ) => Promise<{ success: boolean; error?: string }>;
+  pickRestoreFile: () => Promise<{ canceled: boolean; path?: string; token?: string }>;
   dbHealthCheck: () => Promise<HealthCheckReport | { error: string }>;
-  dbApplySafeFixes: (findingIds?: string[]) => Promise<ElectronDbSafeFixesResult | ElectronIpcError>;
-  dbInitialize: (pin: string, confirmationPhrase: string) => Promise<{ success: boolean; backupPath?: string; error?: string }>;
+  dbApplySafeFixes: (
+    pin: string,
+    findingIds?: string[],
+  ) => Promise<ElectronDbSafeFixesResult | ElectronIpcError>;
+  dbInitialize: (
+    pin: string,
+    confirmationPhrase: string,
+  ) => Promise<{ success: boolean; backupPath?: string; error?: string }>;
   getMasterPinStatus: () => Promise<ElectronMasterPinStatus | ElectronIpcError>;
 
   // Settings
@@ -36,11 +56,41 @@ export interface ElectronAPI {
   emailErrorLog: () => Promise<ElectronActionResult | ElectronIpcError>;
 
   // Reports caught renderer errors to anonymous telemetry via main process.
-  reportRendererError?: (report: { message?: string; stack?: string; digest?: string; route?: string }) => Promise<ElectronActionResult>;
+  reportRendererError?: (report: {
+    message?: string;
+    stack?: string;
+    digest?: string;
+    route?: string;
+  }) => Promise<ElectronActionResult>;
 
-  // Printers
+  getPostHogBootstrap?: () => Promise<
+    | { enabled: false }
+    | {
+        enabled: true;
+        distinctId: string;
+        identified: boolean;
+        token: string;
+        host: string;
+        telemetryEnabled: boolean;
+        accountLinked: boolean;
+        diagnosticsEnabled: boolean;
+        superProperties: Record<string, string>;
+      }
+  >;
+
+  // Printers. Writing one goes through the permission-gated HTTP route.
   getPrinters: () => Promise<ElectronPrinter[] | ElectronIpcError>;
-  savePrinter: (printer: ElectronPrinterInput) => Promise<ElectronActionResult | ElectronIpcError>;
+  /** Renders print HTML to a PDF file the user picks in a native save dialog. */
+  saveHtmlAsPdf?: (request: {
+    html: string;
+    defaultFileName?: string;
+    pageSize?: 'A4' | 'Letter';
+  }) => Promise<{
+    success: boolean;
+    path?: string;
+    canceled?: boolean;
+    error?: string;
+  }>;
   rasterizePrintDocument: (request: unknown) => Promise<{
     ok: boolean;
     data?: Uint8Array;
@@ -58,9 +108,6 @@ export interface ElectronAPI {
     error?: string;
   }>;
 
-  // Reports
-  getDailySummary: () => Promise<DailySummary | ElectronIpcError>;
-
   // Status
   getStatus: () => Promise<ElectronStatus>;
   openWhatsAppShare: (url: string) => Promise<ElectronActionResult | ElectronIpcError>;
@@ -68,13 +115,25 @@ export interface ElectronAPI {
   windowReady: (payload: { epoch: number }) => Promise<ElectronActionResult | ElectronIpcError>;
 
   // Updates
-  onUpdateStatus: (callback: (status: UpdateStatus) => void) => (() => void);
-  getUpdateStatus: () => Promise<{ status: UpdateStatus['status']; version?: string; percent?: number; reason?: UpdateFailureReason; error?: string; info: { version: string } }>;
+  onUpdateStatus: (callback: (status: UpdateStatus) => void) => () => void;
+  getUpdateStatus: () => Promise<{
+    status: UpdateStatus['status'];
+    version?: string;
+    percent?: number;
+    reason?: UpdateFailureReason;
+    error?: string;
+    info: { version: string };
+  }>;
   /** Persisted beta opt-in (#463); returns true if subscribed to the beta feed. */
   getBetaChannel: () => Promise<boolean>;
   /** Change the beta channel opt-in; refused while an update is staged or in flight. */
   setBetaChannel: (enabled: boolean) => Promise<ElectronActionResult>;
   checkForUpdates: () => Promise<void>;
+  /** Start downloading an available update; refused unless one is waiting. */
+  downloadUpdate: () => Promise<ElectronActionResult>;
+  /** Persisted preference for the automatic startup update check (default on). */
+  getAutoUpdateCheck: () => Promise<boolean>;
+  setAutoUpdateCheck: (enabled: boolean) => Promise<ElectronActionResult>;
   // #463: the main process authorizes the manager/owner PIN before quitting
   // to install; a denied request resolves with success:false instead of restarting.
   restartAndInstall: (pin?: string) => Promise<ElectronActionResult>;
@@ -90,6 +149,12 @@ export interface ElectronIpcError {
 export interface ElectronActionResult {
   success: boolean;
   error?: string;
+}
+
+/** A top-level application-menu label rendered in the Windows/Linux title bar. */
+export interface ApplicationMenuEntry {
+  key: string;
+  label: string;
 }
 
 export interface ElectronDbSafeFixesResult {
@@ -150,26 +215,10 @@ export interface ElectronPrinter {
   port: number | null;
   is_default: number;
   paper_width: string | null;
+  profile_id?: string | null;
+  configured_profile_id?: string | null;
   created_at: string;
   updated_at: string;
-}
-
-/** Input accepted by main/ipc.ts save-printer. */
-export interface ElectronPrinterInput {
-  id?: string;
-  name: string;
-  connection_type: PrinterConnectionType;
-  ip_address?: string | null;
-  port?: number | null;
-  is_default?: boolean | number;
-}
-
-export interface DailySummary {
-  date: string;
-  revenue: number;
-  bill_count: number;
-  covers: number;
-  pending_orders: number;
 }
 
 export type HealthFindingRisk = 'safe' | 'manual_review';

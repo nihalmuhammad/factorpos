@@ -1,19 +1,42 @@
 const { contextBridge, ipcRenderer } = require('electron');
-const { randomUUID } = require('node:crypto');
 
-const documentNonce = randomUUID();
+const documentNonce = globalThis.crypto.randomUUID();
 ipcRenderer.sendSync('window-document', documentNonce);
+
+function readRendererAuthToken(): string | undefined {
+  try {
+    const win = (
+      globalThis as {
+        window?: { localStorage?: { getItem?: (key: string) => string | null } };
+      }
+    ).window;
+    if (!win) return undefined;
+    const token = win.localStorage?.getItem?.('token');
+    return typeof token === 'string' && token.length > 0 ? token : undefined;
+  } catch {
+    return undefined;
+  }
+}
 
 contextBridge.exposeInMainWorld('electronAPI', {
   backupDatabase: (pin?: string) => ipcRenderer.invoke('backup-database', pin),
-  restoreBackup: (pin?: string, backupPath?: string) => ipcRenderer.invoke('restore-backup', pin, backupPath),
+  restoreBackup: (pin?: string, backupPath?: string) =>
+    ipcRenderer.invoke('restore-backup', pin, backupPath),
+  pickRestoreFile: () => ipcRenderer.invoke('pick-restore-file'),
   dbHealthCheck: () => ipcRenderer.invoke('db-health-check'),
-  dbApplySafeFixes: (findingIds?: string[]) => ipcRenderer.invoke('db-apply-safe-fixes', findingIds),
-  dbInitialize: (pin: string, confirmationPhrase: string) => ipcRenderer.invoke('db-initialize', { pin, confirmationPhrase }),
+  dbApplySafeFixes: (pin: string, findingIds?: string[]) =>
+    ipcRenderer.invoke('db-apply-safe-fixes', pin, findingIds),
+  dbInitialize: (pin: string, confirmationPhrase: string) =>
+    ipcRenderer.invoke('db-initialize', { pin, confirmationPhrase }),
   getMasterPinStatus: () => ipcRenderer.invoke('master-pin-status'),
 
   getSettings: () => ipcRenderer.invoke('get-settings'),
-  setSetting: (key: string, value: string) => ipcRenderer.invoke('set-setting', key, value),
+  setSetting: (key: string, value: string) => {
+    const token = readRendererAuthToken();
+    return token !== undefined
+      ? ipcRenderer.invoke('set-setting', key, value, token)
+      : ipcRenderer.invoke('set-setting', key, value);
+  },
 
   // Pushes resolved dark mode state to main for native title bar updates.
   setThemeEffective: (isDark: boolean) => ipcRenderer.invoke('set-theme-effective', isDark),
@@ -26,50 +49,103 @@ contextBridge.exposeInMainWorld('electronAPI', {
 
   // Fire-and-forget: reports a caught renderer render exception (see the
   // dashboard error boundary) to anonymous telemetry via main.
-  reportRendererError: (report: { message?: string; stack?: string; digest?: string; route?: string }) =>
-    ipcRenderer.invoke('report-renderer-error', report),
+  reportRendererError: (report: {
+    message?: string;
+    stack?: string;
+    digest?: string;
+    route?: string;
+  }) => ipcRenderer.invoke('report-renderer-error', report),
+
+  getPostHogBootstrap: () => ipcRenderer.invoke('get-posthog-bootstrap'),
 
   getStatus: () => ipcRenderer.invoke('get-status'),
   openWhatsAppShare: (url: string) => ipcRenderer.invoke('whatsapp-open-share', url),
 
-  windowReady: (payload: { epoch: number }) => ipcRenderer.invoke('window-ready', { ...payload, documentNonce }),
+  windowReady: (payload: { epoch: number }) =>
+    ipcRenderer.invoke('window-ready', { ...payload, documentNonce }),
 
   // Narrow window-control surface for the renderer title bar's HTML fallback
   // controls and the POS topbar's native window-state toggle.
   windowAction: (action: string) => ipcRenderer.invoke('window-action', action),
 
   getWindowState: () => ipcRenderer.invoke('get-window-state'),
-  onWindowStateChanged: (callback: (state: { isMaximized: boolean; isFullScreen: boolean }) => void) => {
-    const handler = (_event: unknown, state: { isMaximized: boolean; isFullScreen: boolean }) => callback(state);
+  onWindowStateChanged: (
+    callback: (state: { isMaximized: boolean; isFullScreen: boolean }) => void,
+  ) => {
+    const handler = (_event: unknown, state: { isMaximized: boolean; isFullScreen: boolean }) =>
+      callback(state);
     ipcRenderer.on('window-state-changed', handler);
-    return () => { ipcRenderer.removeListener('window-state-changed', handler); };
+    return () => {
+      ipcRenderer.removeListener('window-state-changed', handler);
+    };
   },
 
   getPrinters: () => ipcRenderer.invoke('get-printers'),
-  savePrinter: (printer: unknown) => ipcRenderer.invoke('save-printer', printer),
-  rasterizePrintDocument: (request: unknown) => ipcRenderer.invoke('rasterize-print-document', request),
+  rasterizePrintDocument: (request: unknown) =>
+    ipcRenderer.invoke('rasterize-print-document', request),
   rasterizeKotDocument: (request: unknown) => ipcRenderer.invoke('rasterize-kot-document', request),
-
-  getDailySummary: () => ipcRenderer.invoke('get-daily-summary'),
+  saveHtmlAsPdf: (request: unknown) => ipcRenderer.invoke('save-html-as-pdf', request),
 
   getUpdateStatus: () => ipcRenderer.invoke('get-update-status'),
   getBetaChannel: () => ipcRenderer.invoke('updates:get-beta-channel'),
-  setBetaChannel: (enabled: boolean) => ipcRenderer.invoke('updates:set-beta-channel', enabled),
+  setBetaChannel: (enabled: boolean) => {
+    const token = readRendererAuthToken();
+    return token !== undefined
+      ? ipcRenderer.invoke('updates:set-beta-channel', enabled, token)
+      : ipcRenderer.invoke('updates:set-beta-channel', enabled);
+  },
   checkForUpdates: () => ipcRenderer.invoke('check-for-updates'),
+  downloadUpdate: () => ipcRenderer.invoke('download-update'),
+  getAutoUpdateCheck: () => ipcRenderer.invoke('updates:get-auto-check'),
+  setAutoUpdateCheck: (enabled: boolean) => {
+    const token = readRendererAuthToken();
+    return token !== undefined
+      ? ipcRenderer.invoke('updates:set-auto-check', enabled, token)
+      : ipcRenderer.invoke('updates:set-auto-check', enabled);
+  },
   restartAndInstall: (pin?: string) => ipcRenderer.invoke('restart-and-install', pin),
   emailErrorLog: () => ipcRenderer.invoke('email-error-log'),
   onUpdateStatus: (callback: (status: unknown) => void) => {
     const handler = (_event: unknown, status: unknown) => callback(status);
     ipcRenderer.on('update-status', handler);
-    return () => { ipcRenderer.removeListener('update-status', handler); };
+    return () => {
+      ipcRenderer.removeListener('update-status', handler);
+    };
   },
+
+  // Windows/Linux title-bar menu row. The labels come from the main-process
+  // application menu; each click pops that entry's real submenu.
+  getApplicationMenu: () => ipcRenderer.invoke('get-application-menu'),
+  openApplicationMenu: (key: string, x: number, y: number) =>
+    ipcRenderer.invoke('open-application-menu', key, x, y),
 
   onMenuAction: (callback: (channel: string) => void) => {
     const channels = [
-      'new-order', 'quick-search', 'backup-database', 'restore-backup',
-      'view-orders', 'report-daily', 'report-sales', 'report-x', 'report-z',
-      'settings-business', 'settings-tax', 'settings-printer', 'settings-kitchen',
-      'menu-db-health-check', 'menu-db-initialize', 'menu-master-pin',
+      'new-order',
+      'quick-search',
+      'backup-database',
+      'menu-restore-from-file',
+      'view-orders',
+      'report-daily',
+      'report-sales',
+      'report-x',
+      'report-z',
+      'go-pos',
+      'go-dashboard',
+      'go-orders',
+      'go-kds',
+      'go-tables',
+      'go-products',
+      'go-inventory',
+      'go-customers',
+      'go-staff',
+      'settings-business',
+      'settings-tax',
+      'settings-printer',
+      'settings-kitchen',
+      'menu-db-health-check',
+      'menu-db-initialize',
+      'menu-master-pin',
     ];
     const handlers: (() => void)[] = [];
     channels.forEach((channel) => {
@@ -77,7 +153,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
       ipcRenderer.on(channel, handler);
       handlers.push(() => ipcRenderer.removeListener(channel, handler));
     });
-    return () => { handlers.forEach((remove) => remove()); };
+    return () => {
+      handlers.forEach((remove) => remove());
+    };
   },
 
   platform: process.platform,

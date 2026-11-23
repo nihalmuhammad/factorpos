@@ -1,40 +1,88 @@
-import { createHash } from 'crypto';
+import { createHash, randomUUID } from 'crypto';
 import { Router, Request, Response } from 'express';
-import { getDatabase, now, withTxn } from '../db';
-import { requireRole } from '../middleware/security';
+import { getDatabase, verifyPinAsync, withTxn } from '../db';
+import { requirePermission } from '../services/authorization';
 import { ROLE_ACCESS } from '../../shared/role-permissions';
-import { checkPinRateLimit } from './orders';
-import { createRefund, getTenantCurrency, RefundRequest } from '../services/refund';
+import { checkPinRateLimit, isPinRateLimited, clearPinRateLimit } from './orders';
+import {
+  createRefund,
+  getTenantCurrency,
+  RefundRequest,
+  validateRefundPreconditions,
+  PreVerifiedRefundApprover,
+} from '../services/refund';
 import { getCurrencyFractionDigits, getCurrencyMinorUnitFactor } from '../countries';
+import { cloudSync } from '../services/cloud-sync';
+import { notifyKdsUpdate } from '../services/kds';
+import { isOperationReference, serializeOperationFailure } from '../lib/operation-failure';
 
 const router = Router();
 const MAX_IDEMPOTENCY_KEY_LENGTH = 128;
 const MAX_REASON_LENGTH = 500;
 
+const refundPinLocks = new Map<string, Promise<void>>();
+
+export async function withRefundPinLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
+  const previous = refundPinLocks.get(key) || Promise.resolve();
+  let resolveCurrent!: () => void;
+  const current = new Promise<void>((resolve) => {
+    resolveCurrent = resolve;
+  });
+  refundPinLocks.set(key, current);
+
+  try {
+    await previous.catch(() => {});
+    return await fn();
+  } finally {
+    resolveCurrent();
+    if (refundPinLocks.get(key) === current) {
+      refundPinLocks.delete(key);
+    }
+  }
+}
+
+export function resetRefundPinLocksForTests(): void {
+  refundPinLocks.clear();
+}
+
 function refundIdempotencyKey(req: Request): string | null {
   const supplied = req.get('Idempotency-Key')?.trim();
   if (!supplied) return null;
   if (supplied.length > MAX_IDEMPOTENCY_KEY_LENGTH || !/^[\x21-\x7e]+$/.test(supplied)) {
-    throw Object.assign(new Error('Idempotency-Key is invalid or too long'), { statusCode: 400 });
+    throw Object.assign(new Error('Idempotency-Key is invalid or too long'), {
+      statusCode: 400,
+      diagnosticCode: 'idempotency_key_invalid',
+    });
   }
   return supplied;
 }
 
-function refundRequestHash(billId: string, body: any, approverId: string): string {
-  return createHash('sha256').update(JSON.stringify({
-    billId,
-    order_item_id: body.order_item_id ?? null,
-    amount: body.amount ?? null,
-    method: body.method ?? null,
-    reason: body.reason ?? null,
-    shift_id: body.shift_id ?? null,
-    approver_id: approverId,
-  })).digest('hex');
+function refundRequestHash(
+  billId: string,
+  body: Record<string, unknown>,
+  approverId: string,
+): string {
+  return createHash('sha256')
+    .update(
+      JSON.stringify({
+        billId,
+        order_item_id: body.order_item_id ?? null,
+        amount: body.amount ?? null,
+        method: body.method ?? null,
+        reason: body.reason ?? null,
+        shift_id: body.shift_id ?? null,
+        approver_id: approverId,
+      }),
+    )
+    .digest('hex');
 }
 
 function refundAmountMinorUnits(value: unknown, currency: string): number {
   if (typeof value !== 'number' && typeof value !== 'string') {
-    throw Object.assign(new Error('Refund amount must be a finite number greater than zero'), { statusCode: 400 });
+    throw Object.assign(new Error('Refund amount must be a finite number greater than zero'), {
+      statusCode: 400,
+      diagnosticCode: 'amount_invalid',
+    });
   }
   const decimals = getCurrencyFractionDigits(currency);
   const factor = getCurrencyMinorUnitFactor(currency);
@@ -42,26 +90,89 @@ function refundAmountMinorUnits(value: unknown, currency: string): number {
   const pattern = decimals === 0 ? /^\d+$/ : new RegExp(`^\\d+(?:\\.\\d{1,${decimals}})?$`);
   if (!pattern.test(text)) {
     const decDesc = decimals === 0 ? 'without decimals' : `with at most ${decimals} decimal places`;
-    throw Object.assign(new Error(`Refund amount must be a finite number greater than zero ${decDesc}`), { statusCode: 400 });
+    throw Object.assign(
+      new Error(`Refund amount must be a finite number greater than zero ${decDesc}`),
+      { statusCode: 400, diagnosticCode: 'amount_invalid' },
+    );
   }
   const parsed = Number(text);
   const minorUnits = Math.round(parsed * factor);
   if (!Number.isFinite(parsed) || parsed <= 0 || !Number.isSafeInteger(minorUnits)) {
-    throw Object.assign(new Error('Refund amount must be a finite number greater than zero'), { statusCode: 400 });
+    throw Object.assign(new Error('Refund amount must be a finite number greater than zero'), {
+      statusCode: 400,
+      diagnosticCode: 'amount_invalid',
+    });
   }
   return minorUnits;
 }
 
-router.post('/', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res: Response) => {
+function structuredRefundFailure(
+  req: Request,
+  error: string,
+  capturePoint: string,
+  displayCode?: string,
+  outcome: 'not_applied' | 'applied' | 'unknown' = 'not_applied',
+): Record<string, unknown> {
+  const header = req.get('x-operation-id');
+  const correlationId = isOperationReference(header) ? header : randomUUID();
+  const failure = serializeOperationFailure({
+    capture_point: capturePoint,
+    outcome,
+    correlation_id: correlationId,
+    ...(displayCode ? { facts: { display_code: displayCode } } : {}),
+  });
+  if (!failure) return { error };
+  (req as Request & { diagnosticsCaptured?: boolean }).diagnosticsCaptured = true;
+  try {
+    cloudSync.captureOperationFailure(failure);
+  } catch {
+    /* Diagnostics must not affect refunds. */
+  }
+  return {
+    error,
+    reason_code: failure.reason_code,
+    operation: failure.operation,
+    stage: failure.stage,
+    classification: failure.classification,
+    outcome: failure.outcome,
+    correlation_id: failure.correlation_id,
+    ...(failure.facts.display_code ? { display_code: failure.facts.display_code } : {}),
+  };
+}
+
+router.post('/', requirePermission('refunds.initiate'), async (req: Request, res: Response) => {
+  let operationCommitted = false;
+  let transactionBodyCompleted = false;
   try {
     const body = req.body || {};
     const billId = body.bill_id;
     if (billId === undefined || billId === null || billId === '') {
-      return res.status(400).json({ error: 'bill_id is required' });
+      return res
+        .status(400)
+        .json(
+          structuredRefundFailure(
+            req,
+            'bill_id is required',
+            'fc.backend.payment.refund.validation',
+            'bill_id_required',
+          ),
+        );
     }
-    const orderItemId = body.order_item_id !== undefined && body.order_item_id !== null ? Number(body.order_item_id) : null;
+    const orderItemId =
+      body.order_item_id !== undefined && body.order_item_id !== null
+        ? Number(body.order_item_id)
+        : null;
     if (orderItemId !== null && !Number.isSafeInteger(orderItemId)) {
-      return res.status(400).json({ error: 'order_item_id must be an integer' });
+      return res
+        .status(400)
+        .json(
+          structuredRefundFailure(
+            req,
+            'order_item_id must be an integer',
+            'fc.backend.payment.refund.validation',
+            'order_item_id_invalid',
+          ),
+        );
     }
     const db = getDatabase();
     const currency = getTenantCurrency(db);
@@ -69,30 +180,179 @@ router.post('/', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res: R
     if (body.amount !== undefined && body.amount !== null) {
       amountCents = refundAmountMinorUnits(body.amount, currency);
     } else if (orderItemId === null) {
-      return res.status(400).json({ error: 'amount is required unless order_item_id is given' });
+      return res
+        .status(400)
+        .json(
+          structuredRefundFailure(
+            req,
+            'amount is required unless order_item_id is given',
+            'fc.backend.payment.refund.validation',
+            'amount_required',
+          ),
+        );
     }
     if (typeof body.reason === 'string' && body.reason.length > MAX_REASON_LENGTH) {
-      return res.status(400).json({ error: 'reason is too long' });
+      return res
+        .status(400)
+        .json(
+          structuredRefundFailure(
+            req,
+            'reason is too long',
+            'fc.backend.payment.refund.validation',
+            'reason_too_long',
+          ),
+        );
     }
 
-    const approverId = body.approver_id !== undefined && body.approver_id !== null
-      ? String(body.approver_id).trim()
-      : '';
-    const managerId = body.manager_id !== undefined && body.manager_id !== null
-      ? String(body.manager_id).trim()
-      : '';
+    const approverId =
+      body.approver_id !== undefined && body.approver_id !== null
+        ? String(body.approver_id).trim()
+        : '';
+    const managerId =
+      body.manager_id !== undefined && body.manager_id !== null
+        ? String(body.manager_id).trim()
+        : '';
     if (!approverId && !managerId) {
-      return res.status(400).json({ error: 'approver_id is required', code: 'APPROVER_REQUIRED' });
+      return res.status(400).json({
+        ...structuredRefundFailure(
+          req,
+          'approver_id is required',
+          'fc.backend.payment.refund.validation',
+          'approver_required',
+        ),
+        code: 'APPROVER_REQUIRED',
+      });
     }
     if (approverId && managerId && approverId !== managerId) {
-      return res.status(400).json({ error: 'approver_id and manager_id must identify the same approver', code: 'APPROVER_CONFLICT' });
+      return res.status(400).json({
+        ...structuredRefundFailure(
+          req,
+          'approver_id and manager_id must identify the same approver',
+          'fc.backend.payment.refund.validation',
+          'approver_conflict',
+        ),
+        code: 'APPROVER_CONFLICT',
+      });
     }
     const selectedApproverId = approverId || managerId;
     const idempotencyKey = refundIdempotencyKey(req);
-    const requestHash = idempotencyKey ? refundRequestHash(String(billId), body, selectedApproverId) : undefined;
+    const requestHash = idempotencyKey
+      ? refundRequestHash(String(billId), body, selectedApproverId)
+      : undefined;
 
     const userId = String((req as any).user.userId);
     const clientIp = req.ip || req.socket.remoteAddress || 'unknown';
+
+    const checkIdempotencyReplay = (): Record<string, unknown> | null => {
+      if (!idempotencyKey) return null;
+      const prior = db
+        .prepare(`
+        SELECT bill_id, request_hash, response_json
+        FROM refund_idempotency
+        WHERE user_id = ? AND idempotency_key = ?
+      `)
+        .get(userId, idempotencyKey) as
+        | { bill_id: string | number; request_hash: string; response_json: string }
+        | undefined;
+      if (!prior) return null;
+      if (String(prior.bill_id) !== String(billId) || prior.request_hash !== requestHash) {
+        throw Object.assign(
+          new Error('Idempotency-Key was already used for a different refund request'),
+          { statusCode: 409, diagnosticCode: 'idempotency_conflict' },
+        );
+      }
+      try {
+        return JSON.parse(prior.response_json);
+      } catch {
+        throw Object.assign(new Error('Stored refund response is invalid'), {
+          statusCode: 500,
+        });
+      }
+    };
+
+    // 1. Check idempotency replay outside withTxn
+    const initialReplay = checkIdempotencyReplay();
+    if (initialReplay) {
+      return res.status(201).json(initialReplay);
+    }
+
+    // 2. Pre-validate preconditions (business-day window, order item, amounts, session, etc.) before checking PIN
+    const { lateRefund } = validateRefundPreconditions(db, {
+      billId,
+      method: body.method,
+      amountCents,
+      orderItemId,
+      createdByUserId: userId,
+    });
+
+    const overridePin = body.override_pin;
+
+    // 3. Rate-limited async PIN verification outside withTxn
+    const rateLimitKey = `pin:${clientIp}:refund`;
+    let preVerifiedApprover: PreVerifiedRefundApprover | null = null;
+    let idempotencyReplay: Record<string, unknown> | null = null;
+
+    await withRefundPinLock(rateLimitKey, async () => {
+      idempotencyReplay = checkIdempotencyReplay();
+      if (idempotencyReplay) {
+        return;
+      }
+
+      if (!overridePin) {
+        throw Object.assign(
+          new Error(
+            lateRefund
+              ? 'Owner PIN required to process a refund on a completed order'
+              : 'Manager PIN required to process a refund',
+          ),
+          { statusCode: 400, diagnosticCode: 'approver_pin_required' },
+        );
+      }
+
+      if (isPinRateLimited(rateLimitKey)) {
+        throw Object.assign(new Error('Too many PIN attempts. Try again in 15 minutes.'), {
+          statusCode: 429,
+          diagnosticCode: 'pin_rate_limited',
+        });
+      }
+
+      const allowedRoles = lateRefund ? ROLE_ACCESS.owner : ROLE_ACCESS.ownerManager;
+      const placeholders = allowedRoles.map(() => '?').join(', ');
+      const candidate = db
+        .prepare(
+          `SELECT id, pin_hash, role, is_active FROM users WHERE id = ? AND pin_hash IS NOT NULL AND role IN (${placeholders}) AND is_active = 1`,
+        )
+        .get(selectedApproverId, ...allowedRoles) as
+        | { id: string; pin_hash: string; role: string; is_active: number }
+        | undefined;
+
+      let pinMatches = false;
+      if (candidate) {
+        pinMatches = await verifyPinAsync(candidate.pin_hash, overridePin);
+      }
+
+      if (!candidate || !pinMatches) {
+        idempotencyReplay = checkIdempotencyReplay();
+        if (idempotencyReplay) {
+          return;
+        }
+        checkPinRateLimit(rateLimitKey);
+        throw Object.assign(new Error(lateRefund ? 'Invalid owner PIN' : 'Invalid manager PIN'), {
+          statusCode: 403,
+          diagnosticCode: 'approver_pin_invalid',
+        });
+      }
+
+      preVerifiedApprover = {
+        id: candidate.id,
+        verifiedPinHash: candidate.pin_hash,
+        lateRefund,
+      };
+    });
+
+    if (idempotencyReplay) {
+      return res.status(201).json(idempotencyReplay);
+    }
 
     const refundRequest: RefundRequest = {
       billId,
@@ -106,18 +366,78 @@ router.post('/', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res: R
       createdByUserId: userId,
       clientIp,
       checkPinRateLimit,
+      isPinRateLimited,
+      clearPinRateLimit,
       idempotencyKey,
       requestHash,
+      preVerifiedApprover,
     };
 
-    const result = withTxn(() => createRefund(db, refundRequest));
+    let changedOrderEvent: { orderId: string; eventType: string } | null = null;
+    const result = withTxn(() => {
+      const wasReplay = Boolean(checkIdempotencyReplay());
+      let beforeOrderStatus: string | null = null;
+      if (!wasReplay && orderItemId !== null) {
+        const beforeRow = db
+          .prepare('SELECT o.status FROM orders o JOIN bills b ON b.order_id = o.id WHERE b.id = ?')
+          .get(billId) as { status: string } | undefined;
+        beforeOrderStatus = beforeRow?.status ?? null;
+      }
+      const refundResult = createRefund(db, refundRequest);
+      if (!wasReplay && orderItemId !== null && refundResult.bill?.order_id != null) {
+        const orderId = String(refundResult.bill.order_id);
+        const afterRow = db.prepare('SELECT status FROM orders WHERE id = ?').get(orderId) as
+          | { status: string }
+          | undefined;
+        const afterOrderStatus = afterRow?.status ?? null;
+        const eventType =
+          afterOrderStatus && afterOrderStatus !== beforeOrderStatus
+            ? `order.${afterOrderStatus}`
+            : 'order.item_refunded';
+        changedOrderEvent = { orderId, eventType };
+      }
+      transactionBodyCompleted = true;
+      return refundResult;
+    });
+    clearPinRateLimit(rateLimitKey);
+    operationCommitted = true;
+    if (changedOrderEvent) {
+      const { orderId, eventType } = changedOrderEvent as { orderId: string; eventType: string };
+      try {
+        cloudSync.recordOrderChanged(orderId, eventType);
+      } catch {}
+      notifyKdsUpdate();
+    }
     res.status(201).json(result);
   } catch (error: any) {
-    res.status(error.statusCode || 500).json({ error: error.message || 'Unable to process refund' });
+    res.locals.postHogError = error;
+    const status = error.statusCode || 500;
+    const outcome = operationCommitted
+      ? 'applied'
+      : transactionBodyCompleted
+        ? 'unknown'
+        : 'not_applied';
+    const capturePoint = operationCommitted
+      ? 'fc.backend.payment.refund.completion'
+      : status >= 500
+        ? 'fc.backend.payment.refund.persistence'
+        : 'fc.backend.payment.refund.validation';
+    const displayCode = status < 500 ? error.diagnosticCode : undefined;
+    const payload =
+      status >= 500 || displayCode
+        ? structuredRefundFailure(
+            req,
+            error.message || 'Unable to process refund',
+            capturePoint,
+            displayCode,
+            outcome,
+          )
+        : { error: error.message || 'Unable to process refund' };
+    res.status(status).json(payload);
   }
 });
 
-router.get('/', requireRole(...ROLE_ACCESS.ownerManagerCashier), (req: Request, res: Response) => {
+router.get('/', requirePermission('refunds.view'), (req: Request, res: Response) => {
   try {
     const db = getDatabase();
     let query = 'SELECT * FROM refunds WHERE 1=1';
@@ -157,6 +477,7 @@ router.get('/', requireRole(...ROLE_ACCESS.ownerManagerCashier), (req: Request, 
       },
     });
   } catch (error: any) {
+    res.locals.postHogError = error;
     res.status(error.statusCode || 500).json({ error: error.message || 'Unable to list refunds' });
   }
 });

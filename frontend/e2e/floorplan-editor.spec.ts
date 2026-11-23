@@ -38,7 +38,10 @@ test.beforeEach(async ({ request }) => {
     .filter((t: { number: string }) => ['T1', 'T2', 'T3'].includes(t.number))
     .map((t: { id: string }) => ({ id: t.id, position_x: null, position_y: null }));
   if (ids.length > 0) {
-    await request.patch(`${BASE}/api/tables/positions`, { headers: auth, data: { positions: ids } });
+    await request.patch(`${BASE}/api/tables/positions`, {
+      headers: auth,
+      data: { positions: ids },
+    });
   }
 });
 
@@ -47,11 +50,25 @@ async function login(page: import('@playwright/test').Page) {
   await page.getByLabel('Email').fill(EMAIL);
   await page.getByLabel('Password').fill(PASSWORD);
   await page.getByRole('button', { name: 'Sign In' }).click();
+  await page.waitForURL((url) => !url.pathname.startsWith('/auth/login'), { timeout: 20000 });
+  await page.waitForFunction(() => !!localStorage.getItem('token'));
   await page.goto(`${BASE}/tables`);
   await expect(page.getByRole('heading', { name: 'Tables' })).toBeVisible();
   // List is the default view — switch to the floor plan second view first.
   await page.getByRole('button', { name: 'Floor plan' }).click();
 }
+
+test('floorplan service actions open from an unplaced table by keyboard', async ({ page }) => {
+  await login(page);
+
+  const trayChip = page.getByTestId('floorplan-tray-T1');
+  await trayChip.focus();
+  await page.keyboard.press('Enter');
+
+  const actionSheet = page.getByRole('dialog', { name: 'T1' });
+  await expect(actionSheet).toBeVisible();
+  await expect(actionSheet.getByRole('button', { name: 'Reserve Table' })).toBeVisible();
+});
 
 test('floorplan editor: drag table onto map, save, persist after reload', async ({ page }) => {
   await login(page);
@@ -75,11 +92,9 @@ test('floorplan editor: drag table onto map, save, persist after reload', async 
   if (!canvasBox || !chipBox) throw new Error('missing drag geometry');
   await page.mouse.move(chipBox.x + chipBox.width / 2, chipBox.y + chipBox.height / 2);
   await page.mouse.down();
-  await page.mouse.move(
-    canvasBox.x + canvasBox.width * 0.5,
-    canvasBox.y + canvasBox.height * 0.5,
-    { steps: 8 }
-  );
+  await page.mouse.move(canvasBox.x + canvasBox.width * 0.5, canvasBox.y + canvasBox.height * 0.5, {
+    steps: 8,
+  });
   await page.mouse.up();
 
   await expect(page.getByTestId('floorplan-chip-T1')).toBeVisible();
@@ -143,7 +158,9 @@ test('floorplan editor: drag table back to tray unplaces it', async ({ page, req
   if (!chipBox || !trayBox) throw new Error('missing drag geometry');
   await page.mouse.move(chipBox.x + chipBox.width / 2, chipBox.y + chipBox.height / 2);
   await page.mouse.down();
-  await page.mouse.move(trayBox.x + trayBox.width / 2, trayBox.y + trayBox.height / 2, { steps: 8 });
+  await page.mouse.move(trayBox.x + trayBox.width / 2, trayBox.y + trayBox.height / 2, {
+    steps: 8,
+  });
   await page.mouse.up();
 
   await expect(page.getByTestId('floorplan-tray-T1')).toBeVisible();
@@ -176,7 +193,9 @@ test('floorplan editor: discard reverts unsaved drags', async ({ page }) => {
   if (!canvasBox || !chipBox) throw new Error('missing drag geometry');
   await page.mouse.move(chipBox.x + chipBox.width / 2, chipBox.y + chipBox.height / 2);
   await page.mouse.down();
-  await page.mouse.move(canvasBox.x + canvasBox.width * 0.2, canvasBox.y + canvasBox.height * 0.2, { steps: 8 });
+  await page.mouse.move(canvasBox.x + canvasBox.width * 0.2, canvasBox.y + canvasBox.height * 0.2, {
+    steps: 8,
+  });
   await page.mouse.up();
 
   await expect(page.getByTestId('floorplan-chip-T2')).toBeVisible();
@@ -239,7 +258,9 @@ test('floorplan editor: quick-add suggests the next number and active floor', as
   await expect(page.getByTestId(`floorplan-chip-${name}`)).toBeVisible();
 });
 
-test('floorplan editor: add a named floor and see it in the all-floors overview', async ({ page }) => {
+test('floorplan editor: add a named floor and see it in the all-floors overview', async ({
+  page,
+}) => {
   await login(page);
 
   await page.getByRole('button', { name: 'Edit layout' }).click();
@@ -257,7 +278,10 @@ test('floorplan editor: add a named floor and see it in the all-floors overview'
   await expect(page.getByTestId(`floorplan-chip-${floorTable}`)).toBeVisible();
 
   // The all-floors overview shows every floor side by side
-  await page.getByTestId('floorplan-floor-tabs').getByRole('button', { name: 'All floors' }).click();
+  await page
+    .getByTestId('floorplan-floor-tabs')
+    .getByRole('button', { name: 'All floors' })
+    .click();
   await expect(page.getByTestId('floorplan-mini-Ground')).toBeVisible();
   await expect(page.getByTestId('floorplan-mini-First')).toBeVisible();
   await expect(page.getByTestId('floorplan-mini-Patio')).toBeVisible();
@@ -331,16 +355,23 @@ test('floorplan editor: live order status refreshes while editing', async ({ pag
   await page.getByRole('button', { name: 'Edit layout' }).click();
   await expect(page.getByTestId('floorplan-chip-T1')).toContainText(`#${order.order_number}`);
 
-  const waitForOrderStatus = (status: string) => page.waitForResponse(async (response) => {
-    if (response.request().method() !== 'GET' || !response.url().includes('/api/orders')) return false;
-    try {
-      const body = await response.json();
-      return body.orders?.some((candidate: { order_number: string; status: string }) =>
-        candidate.order_number === order.order_number && candidate.status === status);
-    } catch {
-      return false;
-    }
-  }, { timeout: 15_000 });
+  const waitForOrderStatus = (status: string) =>
+    page.waitForResponse(
+      async (response) => {
+        if (response.request().method() !== 'GET' || !response.url().includes('/api/orders'))
+          return false;
+        try {
+          const body = await response.json();
+          return body.orders?.some(
+            (candidate: { order_number: string; status: string }) =>
+              candidate.order_number === order.order_number && candidate.status === status,
+          );
+        } catch {
+          return false;
+        }
+      },
+      { timeout: 15_000 },
+    );
 
   await waitForOrderStatus('pending');
   await request.patch(`${BASE}/api/orders/${order.id}/status`, {
@@ -358,5 +389,5 @@ test('list view: Add Table keeps the selected floor', async ({ page }) => {
   await page.getByRole('button', { name: 'Add Table', exact: true }).click();
 
   const form = page.locator('form').filter({ hasText: 'Floor' });
-  await expect(form.locator('input').nth(2)).toHaveValue('First');
+  await expect(form.getByLabel('Floor')).toHaveValue('First');
 });

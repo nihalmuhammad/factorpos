@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { CreditCard, Plus, Save, Trash2, Merge } from 'lucide-react';
 import api from '@/lib/api';
 import toast from 'react-hot-toast';
@@ -18,7 +18,13 @@ interface MergeRecord {
   merged_at: string;
 }
 
-export function PaymentMethodsSettings({ isAdmin }: { isAdmin: boolean }) {
+export function PaymentMethodsSettings({
+  isAdmin,
+  canManagePaymentMethods = isAdmin,
+}: {
+  isAdmin: boolean;
+  canManagePaymentMethods?: boolean;
+}) {
   const t = useTranslations('settings');
   const tCommon = useTranslations('common');
   const tPos = useTranslations('pos');
@@ -35,26 +41,70 @@ export function PaymentMethodsSettings({ isAdmin }: { isAdmin: boolean }) {
   const [mergeTargets, setMergeTargets] = useState<Record<number, string>>({});
   const [merges, setMerges] = useState<MergeRecord[]>([]);
   const [splitChecksEnabled, setSplitChecksEnabled] = useState(false);
+  const [requireOpenShift, setRequireOpenShift] = useState(false);
+  const [oneShiftPerStaff, setOneShiftPerStaff] = useState(false);
+  const [cardTransactionIdRequired, setCardTransactionIdRequired] = useState(false);
+  const [cardTransactionSettingState, setCardTransactionSettingState] = useState<
+    'loading' | 'ready' | 'error'
+  >('loading');
+  const [isSavingCardTransactionIdRequired, setIsSavingCardTransactionIdRequired] = useState(false);
+  const cardTransactionSaveEpochRef = useRef(0);
+  const cardTransactionSaveInFlightRef = useRef(false);
+
+  const loadCardTransactionSetting = async () => {
+    if (cardTransactionSaveInFlightRef.current) return;
+    const epoch = cardTransactionSaveEpochRef.current;
+    setCardTransactionSettingState('loading');
+    try {
+      const cardTransactionRes = await api.get('/settings/card_transaction_id_required');
+      if (cardTransactionSaveInFlightRef.current || epoch !== cardTransactionSaveEpochRef.current) {
+        return;
+      }
+      setCardTransactionIdRequired(cardTransactionRes.data?.setting?.value === 'true');
+      setCardTransactionSettingState('ready');
+    } catch {
+      if (cardTransactionSaveInFlightRef.current || epoch !== cardTransactionSaveEpochRef.current) {
+        return;
+      }
+      setCardTransactionSettingState('error');
+    }
+  };
 
   const load = async () => {
-    const [methodsRes, historyRes, splitRes] = await Promise.all([
-      api.get('/payment-methods?include_inactive=true'),
-      api.get('/payment-methods/merge-history'),
-      api.get('/settings/split_checks_enabled').catch(() => ({ data: { setting: { value: 'false' } } })),
-    ]);
+    const [methodsRes, historyRes, splitRes, requireShiftRes, perStaffShiftRes] = await Promise.all(
+      [
+        api.get('/payment-methods?include_inactive=true'),
+        canManagePaymentMethods
+          ? api.get('/payment-methods/merge-history').catch(() => ({ data: { merges: [] } }))
+          : Promise.resolve({ data: { merges: [] } }),
+        api
+          .get('/settings/split_checks_enabled')
+          .catch(() => ({ data: { setting: { value: 'false' } } })),
+        api
+          .get('/settings/require_open_shift')
+          .catch(() => ({ data: { setting: { value: 'false' } } })),
+        api
+          .get('/settings/one_shift_per_staff')
+          .catch(() => ({ data: { setting: { value: 'false' } } })),
+        loadCardTransactionSetting(),
+      ],
+    );
     const rows = methodsRes.data.payment_methods || [];
     setMethods(rows);
     setNames(Object.fromEntries(rows.map((row: CustomPaymentMethod) => [row.id, row.name])));
     setMerges(historyRes.data.merges || []);
     setSplitChecksEnabled(splitRes.data?.setting?.value === 'true');
+    setRequireOpenShift(requireShiftRes.data?.setting?.value === 'true');
+    setOneShiftPerStaff(perStaffShiftRes.data?.setting?.value === 'true');
   };
 
   useEffect(() => {
-    // eslint-disable-next-line react-hooks/set-state-in-effect
+    // oxlint-disable-next-line react-hooks/set-state-in-effect
     void load().catch(() => toast.error(t('loadFailed')));
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  }, []); // oxlint-disable-line react-hooks/exhaustive-deps
 
   const add = async () => {
+    if (!canManagePaymentMethods) return;
     if (!newName.trim()) return;
     try {
       await api.post('/payment-methods', { name: newName });
@@ -66,6 +116,7 @@ export function PaymentMethodsSettings({ isAdmin }: { isAdmin: boolean }) {
   };
 
   const update = async (method: CustomPaymentMethod, changes: Record<string, unknown>) => {
+    if (!canManagePaymentMethods) return;
     try {
       await api.put(`/payment-methods/${method.id}`, changes);
       await load();
@@ -75,6 +126,7 @@ export function PaymentMethodsSettings({ isAdmin }: { isAdmin: boolean }) {
   };
 
   const remove = async (method: CustomPaymentMethod) => {
+    if (!canManagePaymentMethods) return;
     if (!window.confirm(t('deletePaymentMethodConfirm'))) return;
     try {
       await api.delete(`/payment-methods/${method.id}`);
@@ -85,13 +137,17 @@ export function PaymentMethodsSettings({ isAdmin }: { isAdmin: boolean }) {
   };
 
   const merge = async (method: CustomPaymentMethod) => {
+    if (!canManagePaymentMethods) return;
     const target = mergeTargets[method.id];
     if (!target) return;
     if (!window.confirm(t('mergePaymentMethodConfirm'))) return;
     try {
-      await api.post(`/payment-methods/${method.id}/merge`, target === 'card'
-        ? { target_type: 'card' }
-        : { target_type: 'custom', target_id: Number(target) });
+      await api.post(
+        `/payment-methods/${method.id}/merge`,
+        target === 'card'
+          ? { target_type: 'card' }
+          : { target_type: 'custom', target_id: Number(target) },
+      );
       await load();
       toast.success(t('paymentMethodMerged'));
     } catch {
@@ -101,40 +157,291 @@ export function PaymentMethodsSettings({ isAdmin }: { isAdmin: boolean }) {
 
   return (
     <SettingsTabShell>
-      <div className="bg-card rounded-xl border border-border p-6">
-        <div className="flex items-center gap-2 mb-2"><CreditCard size={20} className="text-muted-foreground" /><h2 className="font-semibold text-foreground">{t('paymentMethods')}</h2></div>
+      <div
+        data-setting-section="payment-methods"
+        className="bg-card rounded-xl border border-border p-6"
+      >
+        <div className="flex items-center gap-2 mb-2">
+          <CreditCard size={20} className="text-muted-foreground" />
+          <h2 className="font-semibold text-foreground">{t('paymentMethods')}</h2>
+        </div>
         <p className="text-sm text-muted-foreground mb-5">{t('paymentMethodsHint')}</p>
         <div className="rounded-lg border border-border divide-y">
-          {builtInMethods.map((method) => <div key={method.key} className="px-3 py-2 flex justify-between text-sm"><span>{tPos(method.labelKey)}</span><span className="text-xs text-gray-400">{t('builtIn')}</span></div>)}
+          {builtInMethods.map((method) => (
+            <div key={method.key} className="px-3 py-2 flex justify-between text-sm">
+              <span>{tPos(method.labelKey)}</span>
+              <span className="text-xs text-gray-400">{t('builtIn')}</span>
+            </div>
+          ))}
         </div>
         <div className="mt-5 space-y-3">
           {methods.map((method) => (
             <div key={method.id} className="rounded-lg border border-border p-3 space-y-2">
               <div className="flex gap-2 items-center">
-                <input disabled={!isAdmin} value={names[method.id] ?? method.name} onChange={(e) => setNames((old) => ({ ...old, [method.id]: e.target.value }))} className="flex-1 px-3 py-2 text-sm border rounded-lg" />
-                <Button variant="outline" size="sm" disabled={!isAdmin || names[method.id] === method.name} onClick={() => update(method, { name: names[method.id] })}><Save size={14} /></Button>
-                <label className="flex items-center gap-1.5 text-xs text-muted-foreground"><input type="checkbox" disabled={!isAdmin} checked={method.is_active} onChange={(e) => update(method, { is_active: e.target.checked })} /> {t('active')}</label>
-                <Button variant="outline" size="sm" disabled={!isAdmin || Boolean(method.usage_count)} onClick={() => remove(method)}><Trash2 size={14} /></Button>
+                <input
+                  disabled={!canManagePaymentMethods}
+                  value={names[method.id] ?? method.name}
+                  onChange={(e) => {
+                    if (!canManagePaymentMethods) return;
+                    setNames((old) => ({ ...old, [method.id]: e.target.value }));
+                  }}
+                  className="flex-1 px-3 py-2 text-sm border rounded-lg disabled:bg-muted disabled:cursor-not-allowed"
+                />
+                <Button
+                  variant="outline"
+                  size="sm"
+                  disabled={!canManagePaymentMethods || names[method.id] === method.name}
+                  onClick={() => update(method, { name: names[method.id] })}
+                >
+                  <Save size={14} />
+                </Button>
+                <label className="flex items-center gap-1.5 text-xs text-muted-foreground">
+                  <input
+                    type="checkbox"
+                    disabled={!canManagePaymentMethods}
+                    checked={method.is_active}
+                    onChange={(e) => update(method, { is_active: e.target.checked })}
+                  />{' '}
+                  {t('active')}
+                </label>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  disabled={!canManagePaymentMethods || Boolean(method.usage_count)}
+                  onClick={() => remove(method)}
+                >
+                  <Trash2 size={14} />
+                </Button>
               </div>
-              {Boolean(method.usage_count) && isAdmin && <div className="flex gap-2 items-center">
-                <select value={mergeTargets[method.id] || ''} onChange={(e) => setMergeTargets((old) => ({ ...old, [method.id]: e.target.value }))} className="flex-1 px-2 py-1.5 text-xs border rounded-md bg-card">
-                  <option value="">{t('mergeInto')}…</option><option value="card">{tPos('methodCard')}</option>
-                  {methods.filter((target) => target.id !== method.id).map((target) => <option key={target.id} value={target.id}>{target.name}</option>)}
-                </select>
-                <Button variant="outline" size="sm" disabled={!mergeTargets[method.id]} onClick={() => merge(method)}><Merge size={14} className="me-1" />{t('merge')}</Button>
-              </div>}
+              {Boolean(method.usage_count) && canManagePaymentMethods && (
+                <div className="flex gap-2 items-center">
+                  <select
+                    value={mergeTargets[method.id] || ''}
+                    onChange={(e) =>
+                      setMergeTargets((old) => ({ ...old, [method.id]: e.target.value }))
+                    }
+                    className="flex-1 px-2 py-1.5 text-xs border rounded-md bg-card"
+                  >
+                    <option value="">{t('mergeInto')}…</option>
+                    <option value="card">{tPos('methodCard')}</option>
+                    {methods
+                      .filter((target) => target.id !== method.id)
+                      .map((target) => (
+                        <option key={target.id} value={target.id}>
+                          {target.name}
+                        </option>
+                      ))}
+                  </select>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    disabled={!mergeTargets[method.id]}
+                    onClick={() => merge(method)}
+                  >
+                    <Merge size={14} className="me-1" />
+                    {t('merge')}
+                  </Button>
+                </div>
+              )}
             </div>
           ))}
-          {isAdmin && <div className="flex gap-2"><input value={newName} onChange={(e) => setNewName(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter') void add(); }} placeholder={t('paymentMethodName')} className="flex-1 px-3 py-2 text-sm border rounded-lg" /><Button onClick={add} disabled={!newName.trim()}><Plus size={14} className="me-1" />{tCommon('add')}</Button></div>}
+          {canManagePaymentMethods && (
+            <div className="flex gap-2">
+              <input
+                value={newName}
+                onChange={(e) => setNewName(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') void add();
+                }}
+                placeholder={t('paymentMethodName')}
+                className="flex-1 px-3 py-2 text-sm border rounded-lg"
+              />
+              <Button onClick={add} disabled={!newName.trim()}>
+                <Plus size={14} className="me-1" />
+                {tCommon('add')}
+              </Button>
+            </div>
+          )}
         </div>
       </div>
 
-      <div className="bg-card rounded-xl border border-border p-6 flex items-center justify-between gap-4">
-        <div><h2 className="font-semibold text-foreground">{t('splitChecks')}</h2><p className="text-sm text-muted-foreground mt-1">{t('splitChecksHint')}</p></div>
-        <input type="checkbox" className="size-5" disabled={!isAdmin} checked={splitChecksEnabled} onChange={async (e) => { const value = e.target.checked; setSplitChecksEnabled(value); try { await api.put('/settings/split_checks_enabled', { value: String(value) }); } catch { setSplitChecksEnabled(!value); toast.error(t('saveFailed')); } }} />
+      <div
+        data-setting-section="split-checks"
+        className="bg-card rounded-xl border border-border p-6 flex items-center justify-between gap-4"
+      >
+        <div>
+          <h2 className="font-semibold text-foreground">{t('splitChecks')}</h2>
+          <p className="text-sm text-muted-foreground mt-1">{t('splitChecksHint')}</p>
+        </div>
+        <input
+          type="checkbox"
+          className="size-5 disabled:cursor-not-allowed"
+          disabled={!isAdmin}
+          checked={splitChecksEnabled}
+          onChange={async (e) => {
+            if (!isAdmin) return;
+            const value = e.target.checked;
+            setSplitChecksEnabled(value);
+            try {
+              await api.put('/settings/split_checks_enabled', { value: String(value) });
+            } catch {
+              setSplitChecksEnabled(!value);
+              toast.error(t('saveFailed'));
+            }
+          }}
+        />
       </div>
 
-      {merges.length > 0 && <div className="bg-card rounded-xl border border-border p-6"><h2 className="font-semibold text-foreground mb-3">{t('mergeHistory')}</h2><div className="space-y-2 text-sm text-muted-foreground">{merges.map((entry) => <p key={entry.id}>{entry.source_name} → {entry.target_name} · {entry.affected_payments} · {formatDate(entry.merged_at)}</p>)}</div></div>}
+      <div
+        data-setting-section="card-transaction-id"
+        className="bg-card rounded-xl border border-border p-6 flex items-center justify-between gap-4"
+      >
+        <div>
+          <h2 id="card-transaction-id-required-label" className="font-semibold text-foreground">
+            {t('cardTransactionIdRequired')}
+          </h2>
+          <p id="card-transaction-id-required-hint" className="text-sm text-muted-foreground mt-1">
+            {t('cardTransactionIdRequiredHint')}
+          </p>
+        </div>
+        {cardTransactionSettingState === 'error' ? (
+          <div className="flex items-center gap-2 shrink-0">
+            <span className="text-xs text-destructive">{t('loadFailed')}</span>
+            <Button variant="outline" size="sm" onClick={() => void loadCardTransactionSetting()}>
+              {t('retry')}
+            </Button>
+          </div>
+        ) : (
+          <input
+            id="card-transaction-id-required"
+            type="checkbox"
+            aria-labelledby="card-transaction-id-required-label"
+            aria-describedby="card-transaction-id-required-hint"
+            className="size-5 shrink-0 disabled:cursor-not-allowed"
+            disabled={
+              !isAdmin ||
+              cardTransactionSettingState !== 'ready' ||
+              isSavingCardTransactionIdRequired
+            }
+            checked={cardTransactionIdRequired}
+            onChange={async (e) => {
+              if (
+                !isAdmin ||
+                isSavingCardTransactionIdRequired ||
+                cardTransactionSaveInFlightRef.current
+              )
+                return;
+              const previousValue = cardTransactionIdRequired;
+              const value = e.target.checked;
+              cardTransactionSaveEpochRef.current += 1;
+              cardTransactionSaveInFlightRef.current = true;
+              setCardTransactionIdRequired(value);
+              setIsSavingCardTransactionIdRequired(true);
+              try {
+                await api.put('/settings/card_transaction_id_required', { value: String(value) });
+                setCardTransactionIdRequired(value);
+                setCardTransactionSettingState('ready');
+              } catch {
+                setCardTransactionIdRequired(previousValue);
+                toast.error(t('saveFailed'));
+              } finally {
+                cardTransactionSaveInFlightRef.current = false;
+                setIsSavingCardTransactionIdRequired(false);
+              }
+            }}
+          />
+        )}
+      </div>
+
+      <div
+        data-setting-section="require-open-shift"
+        className="bg-card rounded-xl border border-border p-6 flex items-center justify-between gap-4"
+      >
+        <div>
+          <h2 id="require-open-shift-label" className="font-semibold text-foreground">
+            {t('requireOpenShift')}
+          </h2>
+          <p id="require-open-shift-hint" className="text-sm text-muted-foreground mt-1">
+            {t('requireOpenShiftHint')}
+          </p>
+        </div>
+        <input
+          id="require-open-shift"
+          type="checkbox"
+          aria-labelledby="require-open-shift-label"
+          aria-describedby="require-open-shift-hint"
+          className="size-5 shrink-0 disabled:cursor-not-allowed"
+          disabled={!isAdmin}
+          checked={requireOpenShift}
+          onChange={async (e) => {
+            if (!isAdmin) return;
+            const value = e.target.checked;
+            setRequireOpenShift(value);
+            try {
+              await api.put('/settings/require_open_shift', { value: String(value) });
+            } catch {
+              setRequireOpenShift(!value);
+              toast.error(t('saveFailed'));
+            }
+          }}
+        />
+      </div>
+
+      <div
+        data-setting-section="one-shift-per-staff"
+        className="bg-card rounded-xl border border-border p-6 flex items-center justify-between gap-4"
+      >
+        <div>
+          <h2 id="one-shift-per-staff-label" className="font-semibold text-foreground">
+            {t('oneShiftPerStaff')}
+          </h2>
+          <p id="one-shift-per-staff-hint" className="text-sm text-muted-foreground mt-1">
+            {t('oneShiftPerStaffHint')}
+          </p>
+          <p className="text-xs text-amber-600 dark:text-amber-400 mt-2">
+            {t('oneShiftPerStaffSharedDrawerWarning')}
+          </p>
+        </div>
+        <input
+          id="one-shift-per-staff"
+          type="checkbox"
+          aria-labelledby="one-shift-per-staff-label"
+          aria-describedby="one-shift-per-staff-hint"
+          className="size-5 shrink-0 disabled:cursor-not-allowed"
+          disabled={!isAdmin}
+          checked={oneShiftPerStaff}
+          onChange={async (e) => {
+            if (!isAdmin) return;
+            const value = e.target.checked;
+            setOneShiftPerStaff(value);
+            try {
+              await api.put('/settings/one_shift_per_staff', { value: String(value) });
+            } catch (err: unknown) {
+              setOneShiftPerStaff(!value);
+              const status = (err as { response?: { status?: number } })?.response?.status;
+              if (status === 409) {
+                toast.error(t('oneShiftPerStaffDisableBlocked'));
+              } else {
+                toast.error(t('saveFailed'));
+              }
+            }
+          }}
+        />
+      </div>
+
+      {merges.length > 0 && (
+        <div className="bg-card rounded-xl border border-border p-6">
+          <h2 className="font-semibold text-foreground mb-3">{t('mergeHistory')}</h2>
+          <div className="space-y-2 text-sm text-muted-foreground">
+            {merges.map((entry) => (
+              <p key={entry.id}>
+                {entry.source_name} → {entry.target_name} · {entry.affected_payments} ·{' '}
+                {formatDate(entry.merged_at)}
+              </p>
+            ))}
+          </div>
+        </div>
+      )}
     </SettingsTabShell>
   );
 }

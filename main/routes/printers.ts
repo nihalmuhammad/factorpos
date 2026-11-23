@@ -1,20 +1,77 @@
 import { Router, Request, Response } from 'express';
-import { getDatabase, now, attachEffectiveAddons, isKotPrintingEnabled, isServerBillPrintingEnabled, parseItemJson } from '../db';
+import {
+  getDatabase,
+  now,
+  attachEffectiveAddons,
+  isKotPrintingEnabled,
+  isServerBillPrintingEnabled,
+  parseItemJson,
+} from '../db';
 import { getOrderWithItems } from './bills';
+import { loadProductRelationsBatch } from './products';
 import { randomUUID } from 'node:crypto';
-import { printViaNetwork, printViaUSB, buildTestPage, printReceiptDetailed, printKOTDetailed, detectConnectedPrinters, prepareReceipt, escPosToText } from '../printers/thermal';
-import { BILL_LANGUAGE_POLICY_KEY, KOT_LANGUAGE_POLICY_KEY, parseStoredLanguagePolicy } from '../lib/print-language-settings';
+import {
+  printViaNetwork,
+  printViaUSB,
+  renderTestPage,
+  printReceiptDetailed,
+  printKOTDetailed,
+  printDeliverySlipDetailed,
+  printPaymentTicketDetailed,
+  detectConnectedPrinters,
+  prepareReceipt,
+  escPosToText,
+  printMenuDocument,
+  validateNetworkPrinterTarget,
+} from '../printers/thermal';
+import {
+  discoverHandler,
+  invalidatePrinterDetectCache,
+  printerStatusHandler,
+  testPrintCause,
+  testPrintFailureClass,
+  isPhysicalFault,
+} from './printer-diagnostics';
+import {
+  buildDeliverySlipPrintData,
+  type DeliverySlipOrderRow,
+} from '../printers/document-delivery-slip';
+import { buildMenuDocument } from '../printers/document-menu';
+import { detectPrintLanguageDirection } from '../printers/document-classic';
+import type { DeliverySlipPaymentBill } from '../../shared/print';
+import { PRINTER_TEXT_SIZES, normalizePrinterTextSize } from '../../shared/print/text-size';
+import { isTerminalItemStatus } from '../../shared/order-item-status';
+import {
+  BILL_LANGUAGE_POLICY_KEY,
+  KOT_LANGUAGE_POLICY_KEY,
+  parseStoredLanguagePolicy,
+} from '../lib/print-language-settings';
 import {
   resolveKotLanguage,
   resolveReceiptLanguages,
+  shouldShowCustomerNumber,
   type KotLanguagePolicy,
   type ReceiptLanguagePolicy,
   isKotItemPending,
 } from '../../shared/print';
-import { getSupportedPrinterProfiles, resolvePrinterProfile, capabilitiesForPrinter } from '../printers/profiles';
-import { requireRole } from '../middleware/security';
-import { ROLE_ACCESS } from '../../shared/role-permissions';
-import { getCountryByCode, getCurrencySymbol, resolveTenantCurrency } from '../countries';
+import {
+  getSupportedPrinterProfiles,
+  resolvePrinterProfile,
+  capabilitiesForPrinter,
+  isValidPrinterProfileId,
+} from '../printers/profiles';
+import { findDbProfileById } from '../printers/capability-db';
+import { hasPermission, requirePermission, requireAnyPermission } from '../services/authorization';
+import { getOpenSession, listOpenSessions } from '../services/shift-session-gate';
+import {
+  formatCurrencyForTenant,
+  formatDateForTenant,
+  getCountryByCode,
+  getCurrencySymbol,
+  resolveRegionalSnapshot,
+  resolveTenantCurrency,
+  RegionalNotConfiguredError,
+} from '../countries';
 import { asyncHandler } from '../middleware/async-handler';
 import { getHttpRequestSignal } from '../shutdown';
 
@@ -23,14 +80,24 @@ const router = Router();
 // Allows standard OS printer queue characters while rejecting control characters.
 const PRINTER_NAME_REGEX = /^[^\x00-\x1f\x7f]{1,128}$/;
 const CONNECTION_TYPES = ['network', 'usb', 'webusb'] as const;
-const PRINTER_COLUMN_WIDTHS = ['cols-32', 'cols-36', 'cols-40', 'cols-42', 'cols-44', 'cols-48'] as const;
+const PRINTER_COLUMN_WIDTHS = [
+  'cols-32',
+  'cols-36',
+  'cols-40',
+  'cols-42',
+  'cols-44',
+  'cols-48',
+] as const;
 
 function isValidPort(port: unknown): port is number {
   return typeof port === 'number' && Number.isInteger(port) && port >= 1 && port <= 65535;
 }
 
 function validatePrinterFields(body: any, existing?: any): string | null {
-  if (body.name !== undefined && (typeof body.name !== 'string' || body.name.length === 0 || !PRINTER_NAME_REGEX.test(body.name))) {
+  if (
+    body.name !== undefined &&
+    (typeof body.name !== 'string' || body.name.length === 0 || !PRINTER_NAME_REGEX.test(body.name))
+  ) {
     return 'name must be 1-128 characters and cannot contain control characters.';
   }
   if (body.connection_type !== undefined && !CONNECTION_TYPES.includes(body.connection_type)) {
@@ -42,17 +109,50 @@ function validatePrinterFields(body: any, existing?: any): string | null {
   if (body.is_default !== undefined && typeof body.is_default !== 'boolean') {
     return 'is_default must be a boolean';
   }
-  if (body.cash_drawer_pulse_enabled !== undefined && typeof body.cash_drawer_pulse_enabled !== 'boolean') {
+  if (
+    body.cash_drawer_pulse_enabled !== undefined &&
+    typeof body.cash_drawer_pulse_enabled !== 'boolean'
+  ) {
     return 'cash_drawer_pulse_enabled must be a boolean';
   }
   if (body.paper_width !== undefined && !PRINTER_COLUMN_WIDTHS.includes(body.paper_width)) {
     return 'paper_width must be cols-32, cols-36, cols-40, cols-42, cols-44, or cols-48';
   }
+  if (body.text_size !== undefined && !PRINTER_TEXT_SIZES.includes(body.text_size)) {
+    return 'text_size must be normal, large, or extra_large';
+  }
+  if (
+    body.profile_id !== undefined &&
+    body.profile_id !== null &&
+    body.profile_id !== '' &&
+    !isValidPrinterProfileId(body.profile_id) &&
+    !(
+      existing?.profile_id &&
+      body.profile_id === existing.profile_id &&
+      Boolean(findDbProfileById(body.profile_id))
+    )
+  ) {
+    return 'profile_id must be a supported printer profile ID';
+  }
 
-  const connectionType = body.connection_type !== undefined ? body.connection_type : existing?.connection_type;
+  const connectionType =
+    body.connection_type !== undefined ? body.connection_type : existing?.connection_type;
   const ipAddress = body.ip_address !== undefined ? body.ip_address : existing?.ip_address;
-  if (connectionType === 'network' && (typeof ipAddress !== 'string' || ipAddress.trim().length === 0)) {
+  const effectivePort = body.port !== undefined ? body.port : (existing?.port ?? 9100);
+  if (
+    connectionType === 'network' &&
+    (typeof ipAddress !== 'string' || ipAddress.trim().length === 0)
+  ) {
     return 'ip_address is required for network printers';
+  }
+  if (
+    connectionType === 'network' &&
+    typeof ipAddress === 'string' &&
+    ipAddress.trim().length > 0 &&
+    isValidPort(effectivePort)
+  ) {
+    const targetError = validateNetworkPrinterTarget(ipAddress, effectivePort);
+    if (targetError) return targetError;
   }
   return null;
 }
@@ -60,15 +160,40 @@ function validatePrinterFields(body: any, existing?: any): string | null {
 function ensureDefaultPrinter(db: any): void {
   const defaultPrinter = db.prepare('SELECT id FROM printers WHERE is_default = 1 LIMIT 1').get();
   if (!defaultPrinter) {
-    const replacement = db.prepare('SELECT id FROM printers ORDER BY created_at, name LIMIT 1').get() as any;
-    if (replacement) db.prepare('UPDATE printers SET is_default = 1, updated_at = ? WHERE id = ?').run(now(), replacement.id);
+    const replacement = db
+      .prepare('SELECT id FROM printers ORDER BY created_at, name LIMIT 1')
+      .get() as any;
+    if (replacement)
+      db.prepare('UPDATE printers SET is_default = 1, updated_at = ? WHERE id = ?').run(
+        now(),
+        replacement.id,
+      );
   }
 }
 
-function printerShape(printer: any) {
+function getDeliverySlipBills(
+  db: ReturnType<typeof getDatabase>,
+  orderId: number,
+): DeliverySlipPaymentBill[] {
+  const latestBill = db
+    .prepare('SELECT * FROM bills WHERE order_id = ? ORDER BY id DESC LIMIT 1')
+    .get(orderId) as DeliverySlipPaymentBill | undefined;
+  if (!latestBill) return [];
+  return typeof latestBill.split_group_id === 'string' && latestBill.split_group_id.length > 0
+    ? (db
+        .prepare('SELECT * FROM bills WHERE order_id = ? AND split_group_id = ? ORDER BY id')
+        .all(orderId, latestBill.split_group_id) as DeliverySlipPaymentBill[])
+    : [latestBill];
+}
+
+export function printerShape(printer: any) {
   if (!printer) return printer;
   const profile = resolvePrinterProfile(printer);
-  const capabilities = capabilitiesForPrinter(profile, printer.paper_width || profile.defaultPaperWidth);
+  const textSize = normalizePrinterTextSize(printer.text_size);
+  const capabilities = {
+    ...capabilitiesForPrinter(profile, printer.paper_width || profile.defaultPaperWidth),
+    textSize,
+  };
   return {
     id: printer.id,
     name: printer.name,
@@ -78,80 +203,149 @@ function printerShape(printer: any) {
     is_default: printer.is_default,
     cash_drawer_pulse_enabled: printer.cash_drawer_pulse_enabled,
     paper_width: printer.paper_width,
+    text_size: textSize,
     created_at: printer.created_at,
     updated_at: printer.updated_at,
+    configured_profile_id: printer.profile_id ?? null,
     profile_id: profile.id,
     profile_name: `${profile.make} ${profile.model}`,
     capabilities,
   };
 }
 
+interface DefaultPrinter {
+  id: string;
+  name: string;
+  connection_type: (typeof CONNECTION_TYPES)[number];
+  ip_address: string | null;
+  port: number | null;
+  is_default: number;
+  paper_width: string | null;
+  text_size?: string | null;
+}
+
+function printerReadinessShape(printer: DefaultPrinter) {
+  return {
+    id: printer.id,
+    name: printer.name,
+    connection_type: printer.connection_type,
+    is_default: printer.is_default,
+    text_size: normalizePrinterTextSize(printer.text_size),
+    readiness_state: 'configured',
+  };
+}
+
+function getDefaultPrinter(db: ReturnType<typeof getDatabase>): DefaultPrinter | undefined {
+  return db.prepare('SELECT * FROM printers WHERE is_default = 1').get() as
+    | DefaultPrinter
+    | undefined;
+}
+
 // Hydrates order items with add-ons from normalized order_item_addons.
 export function getEffectiveOrderItems(db: any, orderId: string): any[] {
   return attachEffectiveAddons(
     db,
-    (db.prepare('SELECT * FROM order_items WHERE order_id = ?').all(orderId) as any[]).map(parseItemJson),
+    (db.prepare('SELECT * FROM order_items WHERE order_id = ?').all(orderId) as any[]).map(
+      parseItemJson,
+    ),
   );
 }
 
-// GET /api/printers — list all
-router.get('/', (_req: Request, res: Response) => {
-  try {
-    const db = getDatabase();
-    const printers = db.prepare('SELECT * FROM printers ORDER BY is_default DESC, name').all().map(printerShape);
-    res.json({ printers });
-  } catch (error: any) {
-    console.error("[API] Internal error:", error);
-    res.status(500).json({ error: "Internal server error" });
-  }
-});
+// GET /api/printers
+router.get(
+  '/',
+  requireAnyPermission('printers.manage', 'printing.execute'),
+  (req: Request, res: Response) => {
+    try {
+      const db = getDatabase();
+      const userId = String((req as Request & { user?: { userId?: string } }).user?.userId || '');
+      const canManagePrinters = hasPermission(userId, 'printers.manage');
+      if (canManagePrinters) {
+        const printers = db.prepare('SELECT * FROM printers ORDER BY is_default DESC, name').all();
+        res.json({ printers: printers.map(printerShape) });
+        return;
+      }
+
+      const defaultPrinter = getDefaultPrinter(db);
+      res.json({ printers: defaultPrinter ? [printerReadinessShape(defaultPrinter)] : [] });
+    } catch (error: any) {
+      res.locals.postHogError = error;
+      console.error('[API] Internal error:', error);
+      res.status(500).json({ error: 'Internal server error' });
+    }
+  },
+);
 
 // GET /api/printers/detect — detect connected USB/network printers
-router.get('/detect', asyncHandler(async (req: Request, res: Response) => {
-  try {
-    const printers = await detectConnectedPrinters(getHttpRequestSignal(req));
-    console.log('[Printer] Detected printers:', printers);
-    res.json({ printers });
-  } catch (error: any) {
-    if (getHttpRequestSignal(req)?.aborted) {
-      if (!res.headersSent) res.status(503).end();
-      else if (!res.writableEnded) res.destroy();
-      return;
+router.get(
+  '/detect',
+  requirePermission('printers.manage'),
+  asyncHandler(async (req: Request, res: Response) => {
+    try {
+      invalidatePrinterDetectCache();
+      const printers = await detectConnectedPrinters(getHttpRequestSignal(req));
+      console.log('[Printer] Detected printers:', printers);
+      res.json({ printers });
+    } catch (error: any) {
+      res.locals.postHogError = error;
+      if (getHttpRequestSignal(req)?.aborted) {
+        if (!res.headersSent) res.status(503).end();
+        else if (!res.writableEnded) res.destroy();
+        return;
+      }
+      console.error('[Printer] Detection error:', error);
+      console.error('[API] Internal error:', error);
+      res.status(500).json({ error: 'Internal server error' });
     }
-    console.error('[Printer] Detection error:', error);
-    console.error("[API] Internal error:", error);
-    res.status(500).json({ error: "Internal server error" });
-  }
-}));
+  }),
+);
 
 // GET /api/printers/supported — list known printer profiles
-router.get('/supported', (_req: Request, res: Response) => {
+router.get('/supported', requirePermission('printers.manage'), (_req: Request, res: Response) => {
   res.json({ printers: getSupportedPrinterProfiles() });
 });
 
+// GET /api/printers/discover — LAN scan; must stay above /:id
+router.get('/discover', requirePermission('printers.manage'), asyncHandler(discoverHandler));
+
+// GET /api/printers/:id/status
+router.get('/:id/status', requirePermission('printers.manage'), asyncHandler(printerStatusHandler));
+
 // GET /api/printers/:id
-router.get('/:id', (req: Request, res: Response) => {
+router.get('/:id', requirePermission('printers.manage'), (req: Request, res: Response) => {
   try {
     const db = getDatabase();
     const printer = db.prepare('SELECT * FROM printers WHERE id = ?').get(req.params.id) as any;
     if (!printer) return res.status(404).json({ error: 'Printer not found' });
     res.json({ printer: printerShape(printer) });
   } catch (error: any) {
-    console.error("[API] Internal error:", error);
-    res.status(500).json({ error: "Internal server error" });
+    res.locals.postHogError = error;
+    console.error('[API] Internal error:', error);
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
 // POST /api/printers — create
-router.post('/', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res: Response) => {
+router.post('/', requirePermission('printers.manage'), (req: Request, res: Response) => {
   try {
-    const { connection_type, ip_address, port, paper_width, is_default, cash_drawer_pulse_enabled } = req.body;
+    const {
+      connection_type,
+      ip_address,
+      port,
+      paper_width,
+      text_size,
+      profile_id,
+      is_default,
+      cash_drawer_pulse_enabled,
+    } = req.body;
     // Trim accidental whitespace so the name matches the OS print queue exactly.
     const name = typeof req.body.name === 'string' ? req.body.name.trim() : req.body.name;
 
     if (!name) return res.status(400).json({ error: 'name is required' });
     if (typeof name !== 'string' || !PRINTER_NAME_REGEX.test(name)) {
-      return res.status(400).json({ error: 'name must be 1-128 characters and cannot contain control characters.' });
+      return res
+        .status(400)
+        .json({ error: 'name must be 1-128 characters and cannot contain control characters.' });
     }
     if (!connection_type) return res.status(400).json({ error: 'connection_type is required' });
     if (!CONNECTION_TYPES.includes(connection_type)) {
@@ -168,6 +362,36 @@ router.post('/', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res: R
 
     const db = getDatabase();
     const id = randomUUID();
+    const model =
+      typeof req.body.model === 'string' && req.body.model.trim().length > 0
+        ? req.body.model.trim()
+        : undefined;
+    const normalizedProfileId =
+      typeof profile_id === 'string' && profile_id.trim().length > 0 ? profile_id.trim() : null;
+    const resolvedProfile = resolvePrinterProfile({
+      name,
+      model,
+      profile_id: normalizedProfileId,
+    });
+    let persistedProfileId = normalizedProfileId;
+    if (
+      !persistedProfileId &&
+      model &&
+      resolvedProfile.id !== 'generic-escpos-80' &&
+      resolvedProfile.id !== 'generic-escpos-58'
+    ) {
+      const nameOnlyProfile = resolvePrinterProfile({ name });
+      if (nameOnlyProfile.id !== resolvedProfile.id) {
+        persistedProfileId = resolvedProfile.id;
+      }
+    }
+    const resolvedPaperWidth = paper_width ?? resolvedProfile.defaultPaperWidth ?? 'cols-42';
+    const normalizedIp =
+      connection_type === 'network' &&
+      typeof ip_address === 'string' &&
+      ip_address.trim().length > 0
+        ? ip_address.trim()
+        : null;
 
     db.transaction(() => {
       const existingPrinters = db.prepare('SELECT COUNT(*) as count FROM printers').get() as any;
@@ -175,16 +399,21 @@ router.post('/', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res: R
       const shouldBeDefault = Boolean(is_default) || isFirstPrinter;
       if (shouldBeDefault) db.prepare('UPDATE printers SET is_default = 0').run();
       db.prepare(`
-        INSERT INTO printers (id, name, connection_type, ip_address, port, paper_width, is_default, cash_drawer_pulse_enabled, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO printers (id, name, connection_type, ip_address, port, paper_width, text_size, profile_id, is_default, cash_drawer_pulse_enabled, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
-        id, name, connection_type,
-        ip_address ?? null,
+        id,
+        name,
+        connection_type,
+        normalizedIp,
         port ?? 9100,
-        paper_width ?? 'cols-42',
+        resolvedPaperWidth,
+        text_size ?? 'normal',
+        persistedProfileId,
         shouldBeDefault ? 1 : 0,
         cash_drawer_pulse_enabled === true ? 1 : 0,
-        now(), now()
+        now(),
+        now(),
       );
       ensureDefaultPrinter(db);
     })();
@@ -192,48 +421,86 @@ router.post('/', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res: R
     const printer = db.prepare('SELECT * FROM printers WHERE id = ?').get(id);
     res.status(201).json({ printer: printerShape(printer) });
   } catch (error: any) {
-    console.error("[API] Internal error:", error);
-    res.status(500).json({ error: "Internal server error" });
+    res.locals.postHogError = error;
+    console.error('[API] Internal error:', error);
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
 // PUT /api/printers/:id — update
-router.put('/:id', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res: Response) => {
+router.put('/:id', requirePermission('printers.manage'), (req: Request, res: Response) => {
   try {
     const db = getDatabase();
     const existing = db.prepare('SELECT * FROM printers WHERE id = ?').get(req.params.id) as any;
     if (!existing) return res.status(404).json({ error: 'Printer not found' });
 
-    const { connection_type, ip_address, port, paper_width, is_default, cash_drawer_pulse_enabled } = req.body;
+    const {
+      connection_type,
+      ip_address,
+      port,
+      paper_width,
+      text_size,
+      profile_id,
+      is_default,
+      cash_drawer_pulse_enabled,
+    } = req.body;
     const name = typeof req.body.name === 'string' ? req.body.name.trim() : req.body.name;
 
     const fieldError = validatePrinterFields({ ...req.body, name }, existing);
     if (fieldError) return res.status(400).json({ error: fieldError });
 
     db.transaction(() => {
-      const updatedConnectionType = connection_type !== undefined ? connection_type : existing.connection_type;
-      const updatedIpAddress = ip_address !== undefined ? ip_address : existing.ip_address;
+      const updatedConnectionType =
+        connection_type !== undefined ? connection_type : existing.connection_type;
+      const rawUpdatedIp = ip_address !== undefined ? ip_address : existing.ip_address;
+      const trimmedUpdatedIp =
+        typeof rawUpdatedIp === 'string' && rawUpdatedIp.trim().length > 0
+          ? rawUpdatedIp.trim()
+          : null;
+      const updatedIpAddress = updatedConnectionType === 'network' ? trimmedUpdatedIp : null;
+      const updatedProfileId =
+        profile_id !== undefined
+          ? typeof profile_id === 'string' && profile_id.trim().length > 0
+            ? profile_id.trim()
+            : null
+          : (existing.profile_id ?? null);
       const becameDefault = is_default === true;
       db.prepare(`
         UPDATE printers SET
           name = ?, connection_type = ?, ip_address = ?, port = ?,
-          paper_width = ?, is_default = ?, cash_drawer_pulse_enabled = ?, updated_at = ?
+          paper_width = ?, text_size = ?, profile_id = ?, is_default = ?, cash_drawer_pulse_enabled = ?, updated_at = ?
         WHERE id = ?
       `).run(
         name !== undefined ? name : existing.name,
         updatedConnectionType,
-        updatedIpAddress === undefined ? null : updatedIpAddress,
+        updatedIpAddress,
         port !== undefined ? port : existing.port,
         paper_width !== undefined ? paper_width : existing.paper_width,
-        becameDefault ? 1 : (is_default === false ? 0 : existing.is_default),
-        cash_drawer_pulse_enabled !== undefined ? (cash_drawer_pulse_enabled ? 1 : 0) : existing.cash_drawer_pulse_enabled,
-        now(), req.params.id
+        text_size !== undefined ? text_size : existing.text_size,
+        updatedProfileId,
+        becameDefault ? 1 : is_default === false ? 0 : existing.is_default,
+        cash_drawer_pulse_enabled !== undefined
+          ? cash_drawer_pulse_enabled
+            ? 1
+            : 0
+          : existing.cash_drawer_pulse_enabled,
+        now(),
+        req.params.id,
       );
-      if (becameDefault) db.prepare('UPDATE printers SET is_default = 0 WHERE id != ?').run(req.params.id);
+      if (becameDefault)
+        db.prepare('UPDATE printers SET is_default = 0 WHERE id != ?').run(req.params.id);
       if (is_default === false && existing.is_default) {
-        const replacement = db.prepare('SELECT id FROM printers WHERE id != ? ORDER BY created_at, name LIMIT 1').get(req.params.id) as any;
-        if (!replacement) throw Object.assign(new Error('At least one printer must remain default'), { statusCode: 409 });
-        db.prepare('UPDATE printers SET is_default = 1, updated_at = ? WHERE id = ?').run(now(), replacement.id);
+        const replacement = db
+          .prepare('SELECT id FROM printers WHERE id != ? ORDER BY created_at, name LIMIT 1')
+          .get(req.params.id) as any;
+        if (!replacement)
+          throw Object.assign(new Error('At least one printer must remain default'), {
+            statusCode: 409,
+          });
+        db.prepare('UPDATE printers SET is_default = 1, updated_at = ? WHERE id = ?').run(
+          now(),
+          replacement.id,
+        );
       }
       ensureDefaultPrinter(db);
     })();
@@ -241,14 +508,15 @@ router.put('/:id', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res:
     const printer = db.prepare('SELECT * FROM printers WHERE id = ?').get(req.params.id);
     res.json({ printer: printerShape(printer) });
   } catch (error: any) {
-    console.error("[API] Internal error:", error);
+    res.locals.postHogError = error;
+    console.error('[API] Internal error:', error);
     if (error?.statusCode) return res.status(error.statusCode).json({ error: error.message });
-    res.status(500).json({ error: "Internal server error" });
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
 // DELETE /api/printers/:id
-router.delete('/:id', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res: Response) => {
+router.delete('/:id', requirePermission('printers.manage'), (req: Request, res: Response) => {
   try {
     const db = getDatabase();
     const printer = db.prepare('SELECT * FROM printers WHERE id = ?').get(req.params.id) as any;
@@ -257,326 +525,858 @@ router.delete('/:id', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, r
     db.transaction(() => {
       const count = (db.prepare('SELECT COUNT(*) as count FROM printers').get() as any).count;
       if (printer.is_default && count === 1) {
-        throw Object.assign(new Error('Cannot delete the only default printer'), { statusCode: 409 });
+        throw Object.assign(new Error('Cannot delete the only default printer'), {
+          statusCode: 409,
+        });
       }
       db.prepare('DELETE FROM printers WHERE id = ?').run(req.params.id);
       if (printer.is_default) {
-        const replacement = db.prepare('SELECT id FROM printers ORDER BY created_at, name LIMIT 1').get() as any;
-        if (replacement) db.prepare('UPDATE printers SET is_default = 1, updated_at = ? WHERE id = ?').run(now(), replacement.id);
+        const replacement = db
+          .prepare('SELECT id FROM printers ORDER BY created_at, name LIMIT 1')
+          .get() as any;
+        if (replacement)
+          db.prepare('UPDATE printers SET is_default = 1, updated_at = ? WHERE id = ?').run(
+            now(),
+            replacement.id,
+          );
       }
     })();
     res.json({ message: 'Printer deleted' });
   } catch (error: any) {
-    console.error("[API] Internal error:", error);
+    res.locals.postHogError = error;
+    console.error('[API] Internal error:', error);
     if (error?.statusCode) return res.status(error.statusCode).json({ error: error.message });
-    res.status(500).json({ error: "Internal server error" });
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
 // POST /api/printers/:id/set-default
-router.post('/:id/set-default', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res: Response) => {
-  try {
-    const db = getDatabase();
-    const printer = db.prepare('SELECT * FROM printers WHERE id = ?').get(req.params.id);
-    if (!printer) return res.status(404).json({ error: 'Printer not found' });
+router.post(
+  '/:id/set-default',
+  requirePermission('printers.manage'),
+  (req: Request, res: Response) => {
+    try {
+      const db = getDatabase();
+      const printer = db.prepare('SELECT * FROM printers WHERE id = ?').get(req.params.id);
+      if (!printer) return res.status(404).json({ error: 'Printer not found' });
 
-    db.transaction(() => {
-      db.prepare('UPDATE printers SET is_default = 0').run();
-      db.prepare('UPDATE printers SET is_default = 1, updated_at = ? WHERE id = ?').run(now(), req.params.id);
-    })();
+      db.transaction(() => {
+        db.prepare('UPDATE printers SET is_default = 0').run();
+        db.prepare('UPDATE printers SET is_default = 1, updated_at = ? WHERE id = ?').run(
+          now(),
+          req.params.id,
+        );
+      })();
 
-    res.json({ message: 'Default printer set' });
-  } catch (error: any) {
-    console.error("[API] Internal error:", error);
-    res.status(500).json({ error: "Internal server error" });
-  }
-});
+      res.json({ message: 'Default printer set' });
+    } catch (error: any) {
+      res.locals.postHogError = error;
+      console.error('[API] Internal error:', error);
+      res.status(500).json({ error: 'Internal server error' });
+    }
+  },
+);
 
 // POST /api/printers/:id/test — send a test print job
-router.post('/:id/test', requireRole(...ROLE_ACCESS.ownerManager), asyncHandler(async (req: Request, res: Response) => {
-  try {
-    const db = getDatabase();
-    const printer = db.prepare('SELECT * FROM printers WHERE id = ?').get(req.params.id) as any;
-    if (!printer) return res.status(404).json({ error: 'Printer not found' });
+router.post(
+  '/:id/test',
+  requirePermission('printers.manage'),
+  asyncHandler(async (req: Request, res: Response) => {
+    try {
+      const db = getDatabase();
+      const printer = db.prepare('SELECT * FROM printers WHERE id = ?').get(req.params.id) as any;
+      if (!printer) return res.status(404).json({ error: 'Printer not found' });
 
-    const profile = resolvePrinterProfile(printer);
-    const capabilities = capabilitiesForPrinter(profile, printer.paper_width || profile.defaultPaperWidth);
-    const testData = buildTestPage(
-      printer.paper_width || profile.defaultPaperWidth,
-      profile.cutMode,
-      tenantLanguage(db),
-      tenantSettingValue(db, 'timezone') || 'Asia/Kolkata',
-      req.body?.rasterProbe === true ? capabilities : undefined,
-    );
-    let result: { ok: boolean; detail?: string } = { ok: false };
+      // buildTestPage silently omits the timeZone option (server-local time)
+      // rather than throwing when timezone is missing — reject explicitly so
+      // the printed test page never shows the wrong instant.
+      const timezone = tenantSettingValue(db, 'timezone');
+      if (!timezone) return res.status(409).json({ error: 'regional_not_configured' });
 
-    switch (printer.connection_type) {
-      case 'network':
-        if (!printer.ip_address) return res.status(400).json({ error: 'No IP address configured' });
-        result = await printViaNetwork(printer.ip_address, printer.port || 9100, testData, getHttpRequestSignal(req));
-        break;
-      case 'usb':
-        result = await printViaUSB(testData, printer.name, getHttpRequestSignal(req));
-        break;
-      case 'webusb':
-        // WebUSB is handled entirely in the browser; return the bytes for the frontend to send
-        return res.json({ success: true, webusb: true, bytes: Array.from(testData) });
+      const profile = resolvePrinterProfile(printer);
+      const capabilities = capabilitiesForPrinter(
+        profile,
+        printer.paper_width || profile.defaultPaperWidth,
+      );
+      const testData = await renderTestPage(
+        printer.paper_width || profile.defaultPaperWidth,
+        profile.cutMode,
+        tenantLanguage(db),
+        timezone,
+        capabilities,
+        { rasterProbe: req.body?.rasterProbe === true },
+      );
+      let result: { ok: boolean; detail?: string; failureClass?: string } = { ok: false };
+
+      switch (printer.connection_type) {
+        case 'network':
+          if (!printer.ip_address)
+            return res.status(400).json({ error: 'No IP address configured' });
+          result = await printViaNetwork(
+            printer.ip_address,
+            printer.port || 9100,
+            testData,
+            getHttpRequestSignal(req),
+          );
+          break;
+        case 'usb':
+          result = await printViaUSB(testData, printer.name, getHttpRequestSignal(req));
+          invalidatePrinterDetectCache();
+          break;
+        case 'webusb':
+          // WebUSB is handled entirely in the browser; return the bytes for the frontend to send
+          return res.json({ success: true, webusb: true, bytes: Array.from(testData) });
+      }
+
+      // A network printer that answers with a fault that drops bytes did not print.
+      const cause = await testPrintCause(printer, getHttpRequestSignal(req));
+
+      if (result.ok && !isPhysicalFault(cause)) {
+        res.json({ success: true });
+      } else {
+        // Surface the specific printer failure reason rather than a generic message.
+        res.status(502).json({
+          error: result.detail || 'Printer did not respond or print failed',
+          detail: result.detail,
+          failure_class: testPrintFailureClass(result, cause),
+          cause,
+        });
+      }
+    } catch (error: any) {
+      res.locals.postHogError = error;
+      console.error('[API] Internal error:', error);
+      res.status(500).json({ error: 'Internal server error' });
     }
+  }),
+);
 
-    if (result.ok) {
-      res.json({ success: true });
-    } else {
-      // Surface the specific printer failure reason rather than a generic message.
-      res.status(502).json({ error: result.detail || 'Printer did not respond or print failed', detail: result.detail });
+// POST /api/printers/kick-drawer — send a cash drawer pulse to the default/active printer
+router.post(
+  '/kick-drawer',
+  requirePermission('cash.movements.manage'),
+  asyncHandler(async (req: Request, res: Response) => {
+    try {
+      const db = getDatabase();
+      const actorUser = (req as Request & { user?: { userId?: string; role?: string } }).user;
+      const actorUserId = String(actorUser?.userId || '');
+      const actorRole = String(actorUser?.role || '');
+      const hasOpenShift =
+        Boolean(getOpenSession(db, actorUserId)) ||
+        ((actorRole === 'owner' || actorRole === 'manager') && listOpenSessions(db).length > 0);
+      if (!hasOpenShift) {
+        return res.status(409).json({ error: 'open_cash_shift_required' });
+      }
+      const printer = getDefaultPrinter(db);
+
+      const drawerPulseBytes = Buffer.from([0x1b, 0x70, 0x00, 0x19, 0xfa]);
+
+      if (!printer) {
+        return res.status(404).json({ error: 'No printer configured for cash drawer kick' });
+      }
+
+      let result: { ok: boolean; detail?: string } = { ok: false };
+
+      switch (printer.connection_type) {
+        case 'network':
+          if (!printer.ip_address)
+            return res.status(400).json({ error: 'No IP address configured' });
+          result = await printViaNetwork(
+            printer.ip_address,
+            printer.port || 9100,
+            drawerPulseBytes,
+            getHttpRequestSignal(req),
+          );
+          break;
+        case 'usb':
+          result = await printViaUSB(drawerPulseBytes, printer.name, getHttpRequestSignal(req));
+          break;
+        case 'webusb':
+          return res.json({
+            success: true,
+            webusb: true,
+            bytes: Array.from(drawerPulseBytes),
+            printerName: printer.name,
+          });
+        default:
+          return res.status(400).json({ error: 'Unsupported printer connection type' });
+      }
+
+      if (result.ok) {
+        res.json({ success: true });
+      } else {
+        console.error(
+          '[Printer] Cash drawer kick failed:',
+          result.detail || 'Printer did not respond',
+        );
+        res.status(502).json({ error: 'Cash drawer kick failed' });
+      }
+    } catch (error: unknown) {
+      res.locals.postHogError = error;
+      console.error('[API] Internal error:', error);
+      res.status(500).json({ error: 'Internal server error' });
     }
-  } catch (error: any) {
-    console.error("[API] Internal error:", error);
-    res.status(500).json({ error: "Internal server error" });
-  }
-}));
+  }),
+);
+
+// POST /api/printers/test-active — send a test print job to the default/active printer
+router.post(
+  '/test-active',
+  requirePermission('printing.execute'),
+  asyncHandler(async (req: Request, res: Response) => {
+    try {
+      const db = getDatabase();
+      const printer = getDefaultPrinter(db);
+
+      if (!printer) return res.status(404).json({ error: 'No default printer configured' });
+
+      const timezone = tenantSettingValue(db, 'timezone');
+      if (!timezone) return res.status(409).json({ error: 'regional_not_configured' });
+
+      const profile = resolvePrinterProfile(printer);
+      const capabilities = capabilitiesForPrinter(
+        profile,
+        printer.paper_width || profile.defaultPaperWidth,
+      );
+      const testData = await renderTestPage(
+        printer.paper_width || profile.defaultPaperWidth,
+        profile.cutMode,
+        tenantLanguage(db),
+        timezone,
+        capabilities,
+      );
+      let result: { ok: boolean; detail?: string; failureClass?: string } = { ok: false };
+
+      switch (printer.connection_type) {
+        case 'network':
+          if (!printer.ip_address)
+            return res.status(400).json({ error: 'No IP address configured' });
+          result = await printViaNetwork(
+            printer.ip_address,
+            printer.port || 9100,
+            testData,
+            getHttpRequestSignal(req),
+          );
+          break;
+        case 'usb':
+          result = await printViaUSB(testData, printer.name, getHttpRequestSignal(req));
+          invalidatePrinterDetectCache();
+          break;
+        case 'webusb':
+          return res.json({
+            success: true,
+            webusb: true,
+            bytes: Array.from(testData),
+            printerName: printer.name,
+          });
+        default:
+          return res.status(400).json({ error: 'Unsupported printer connection type' });
+      }
+
+      const cause = await testPrintCause(printer, getHttpRequestSignal(req));
+
+      if (result.ok && !isPhysicalFault(cause)) {
+        res.json({ success: true });
+      } else {
+        console.error(
+          '[Printer] Active test print failed:',
+          result.detail || cause || 'Printer did not respond or print failed',
+        );
+        res.status(502).json({
+          error: 'Test print failed',
+          failure_class: testPrintFailureClass(result, cause),
+          cause,
+        });
+      }
+    } catch (error: unknown) {
+      res.locals.postHogError = error;
+      console.error('[API] Internal error:', error);
+      res.status(500).json({ error: 'Internal server error' });
+    }
+  }),
+);
+
+// POST /api/printers/print-menu — print a filtered catalog using the configured printer.
+router.post(
+  '/print-menu',
+  requirePermission('catalog.view'),
+  requirePermission('printing.execute'),
+  asyncHandler(async (req: Request, res: Response) => {
+    try {
+      if (!req.body || typeof req.body !== 'object' || Array.isArray(req.body)) {
+        return res.status(400).json({ error: 'Request body must be an object' });
+      }
+      const body = req.body;
+      for (const key of [
+        'includeInactive',
+        'includeOutOfStock',
+        'includeHidden',
+        'includeDescriptions',
+        'includeModifiers',
+      ] as const) {
+        if (body[key] !== undefined && typeof body[key] !== 'boolean') {
+          return res.status(400).json({ error: `${key} must be a boolean` });
+        }
+      }
+      if (body.paperWidth !== undefined && body.paperWidth !== 58 && body.paperWidth !== 80) {
+        return res.status(400).json({ error: 'paperWidth must be 58 or 80' });
+      }
+      if (body.printerId !== undefined && typeof body.printerId !== 'string') {
+        return res.status(400).json({ error: 'printerId must be a string' });
+      }
+
+      const db = getDatabase();
+      const categories = (
+        db
+          .prepare(`
+      SELECT id, name, parent_id, is_active, sort_order
+      FROM categories
+      WHERE deleted_at IS NULL
+      ORDER BY sort_order, name
+    `)
+          .all() as Array<{
+          id: string | number;
+          name: string | null;
+          parent_id: string | number | null;
+          is_active: number;
+          sort_order: number | null;
+        }>
+      ).map((category) => ({
+        id: String(category.id),
+        name: String(category.name ?? ''),
+        parentId:
+          category.parent_id !== null && category.parent_id !== undefined
+            ? String(category.parent_id)
+            : null,
+        isActive: category.is_active === 1,
+        sortOrder: Number(category.sort_order) || 0,
+      }));
+      const productRows = db
+        .prepare(`
+      SELECT p.id, p.description, p.category_id, p.name, p.price, p.is_active, p.track_inventory, p.stock_quantity, p.sort_order
+      FROM products p
+      WHERE p.deleted_at IS NULL
+      ORDER BY p.sort_order, p.name
+    `)
+        .all() as Array<{
+        id: string;
+        description: string | null;
+        category_id: string | number | null;
+        name: string | null;
+        price: number | null;
+        is_active: number;
+        track_inventory: number;
+        stock_quantity: number | null;
+        sort_order: number | null;
+      }>;
+      // Sale rows need active variants even when add-on modifiers are off, so the
+      // relation loader always runs.
+      const relations = loadProductRelationsBatch(db, productRows);
+      const products = productRows.flatMap((product) => {
+        const base = {
+          description: product.description,
+          modifiers: (relations.get(product.id)?.addon_groups || []).map(
+            (group: { name: string; addons: { name: string; price: number }[] }) => ({
+              name: group.name,
+              options: group.addons.map((addon) => ({ name: addon.name, price: addon.price })),
+            }),
+          ),
+          categoryId: typeof product.category_id === 'string' ? product.category_id : null,
+          name: String(product.name ?? ''),
+          price: Number(product.price),
+          isActive: product.is_active === 1,
+          trackInventory: product.track_inventory === 1,
+          stockQuantity: Number(product.stock_quantity) || 0,
+          sortOrder: Number(product.sort_order) || 0,
+        };
+        // The relation loader returns only active variants, so an empty list means
+        // the parent row is the only sellable form the backend offers.
+        const variants = (relations.get(product.id)?.variants || []) as Array<
+          Record<string, unknown>
+        >;
+        if (variants.length === 0) return [base];
+        return variants.map((variant, variantIndex) => ({
+          ...base,
+          name: `${base.name} (${String(variant.name ?? '')})`,
+          // The loader returns variants in catalog order; the minor key keeps that
+          // order inside the parent's slot in the document's flat, sorted row list.
+          sortOrder: base.sortOrder + (variantIndex + 1) / (variants.length + 1),
+          price: Number(variant.price),
+          isActive: base.isActive && variant.is_active === 1,
+          // Mirrors POS gating: a variant that links to a recipe ingredient never
+          // sells from its own pool, so that pool cannot advertise it as sold out.
+          trackInventory: variant.inventory_product_id ? false : variant.track_inventory === 1,
+          stockQuantity: Number(variant.stock_quantity) || 0,
+        }));
+      });
+      const settings = Object.fromEntries(
+        (
+          db.prepare('SELECT key, value FROM settings').all() as { key: string; value: string }[]
+        ).map((row) => [row.key, row.value]),
+      ) as Record<string, string>;
+      const regional = resolveRegionalSnapshot(settings);
+      const menu = buildMenuDocument(categories, products, {
+        includeInactive: body.includeInactive,
+        includeOutOfStock: body.includeOutOfStock,
+        includeHidden: body.includeHidden,
+        includeDescriptions: body.includeDescriptions,
+        includeModifiers: body.includeModifiers,
+        businessName: settings.business_name || 'Store',
+        printedAt: formatDateForTenant(
+          new Date(),
+          regional.country,
+          regional.timezone,
+          regional.preferences,
+          {
+            dateStyle: 'medium',
+            timeStyle: 'short',
+          },
+        ),
+        baseDirection: detectPrintLanguageDirection(settings.language || 'en'),
+        formatPrice: (price) =>
+          formatCurrencyForTenant(price, regional.country, regional.currency, regional.preferences),
+      });
+      if (menu.itemCount === 0) {
+        return res
+          .status(422)
+          .json({ error: 'No products match the selected criteria', code: 'no_products_to_print' });
+      }
+
+      // An explicit printerId comes from the print dialog's printer picker;
+      // without one the configured default keeps deciding.
+      let printer: { name?: string; paper_width?: string; connection_type?: string } | undefined;
+      if (body.printerId !== undefined) {
+        printer = db.prepare('SELECT * FROM printers WHERE id = ?').get(String(body.printerId)) as
+          | { name?: string; paper_width?: string; connection_type?: string }
+          | undefined;
+        if (!printer) {
+          return res.status(404).json({ error: 'Printer not found', code: 'printer_not_found' });
+        }
+      } else {
+        const defaultPrinter = db
+          .prepare(`
+        SELECT * FROM printers
+        WHERE is_default = 1
+        ORDER BY name
+        LIMIT 1
+      `)
+          .get() as { name?: string; paper_width?: string; connection_type?: string } | undefined;
+        printer = (defaultPrinter ||
+          db
+            .prepare(`
+        SELECT * FROM printers
+        WHERE connection_type != 'webusb'
+        ORDER BY name
+        LIMIT 1
+      `)
+            .get() ||
+          db
+            .prepare(`
+        SELECT * FROM printers
+        WHERE connection_type = 'webusb'
+        ORDER BY name
+        LIMIT 1
+      `)
+            .get()) as
+          | { name?: string; paper_width?: string; connection_type?: string }
+          | undefined;
+      }
+      if (!printer) {
+        return res
+          .status(400)
+          .json({ error: 'No default printer configured', code: 'printer_not_configured' });
+      }
+      const targetPrinter =
+        body.paperWidth === undefined
+          ? printer
+          : { ...printer, paper_width: body.paperWidth === 58 ? 'cols-32' : 'cols-42' };
+      const result = await printMenuDocument(
+        menu,
+        getHttpRequestSignal(req),
+        targetPrinter,
+        settings.language || 'en',
+      );
+      if (!result.ok) {
+        return res.status(502).json({
+          error: result.detail || 'Menu print failed',
+          detail: result.detail,
+          warnings: result.warnings,
+        });
+      }
+      if (result.connection_type === 'webusb') {
+        return res.json({
+          success: true,
+          webusb: true,
+          bytes: Array.from(result.bytes || []),
+          printerName: printer.name,
+          warnings: result.warnings || [],
+        });
+      }
+      return res.json({
+        success: true,
+        printerName: printer.name,
+        warnings: result.warnings || [],
+      });
+    } catch (error) {
+      res.locals.postHogError = error;
+      if (error instanceof RegionalNotConfiguredError) {
+        return res.status(409).json({ error: 'regional_not_configured' });
+      }
+      console.error('[Print Menu] Error:', error);
+      res.status(500).json({ error: 'Internal server error' });
+    }
+  }),
+);
 
 // POST /api/printers/print-bill — print bill via backend (desktop app).
 // `sales` gets the server role past this gate; the setting check below decides if it's actually allowed.
-router.post('/print-bill', requireRole(...ROLE_ACCESS.sales), asyncHandler(async (req: Request, res: Response) => {
-  const authUser = (req as any).user;
-  if (authUser?.role === 'server' && !isServerBillPrintingEnabled()) {
-    return res.status(403).json({ error: 'Bill printing is disabled for the server role. An owner or manager can enable it in Settings.' });
-  }
-  try {
-    const { billId, orderId, useUnicode = false, isReprint = false, preview = false } = req.body;
-    // Renderer's global "Arabic/Persian shaping" setting (#437). Only an
-    // explicit boolean overrides the printer profile's declared capability.
-    const arabicShapingOverride = typeof req.body?.arabicShaping === 'boolean' ? req.body.arabicShaping : undefined;
-    console.log('[Print Bill] Request received', { useUnicode, isReprint, preview });
-    
-    if (!billId && !orderId) {
-      console.log('[Print Bill] Rejected: missing bill or order reference');
-      return res.status(400).json({ error: 'billId or orderId is required' });
+router.post(
+  '/print-bill',
+  requirePermission('printing.execute'),
+  asyncHandler(async (req: Request, res: Response) => {
+    const authUser = (req as any).user;
+    if (authUser?.role === 'server' && !isServerBillPrintingEnabled()) {
+      return res.status(403).json({
+        error:
+          'Bill printing is disabled for the server role. An owner or manager can enable it in Settings.',
+        code: 'BILL_PRINTING_DISABLED',
+      });
     }
-    if (billId && orderId) {
-      console.log('[Print Bill] Rejected: conflicting bill and order references');
-      return res.status(400).json({ error: 'Provide either billId or orderId, not both' });
-    }
+    try {
+      const { billId, orderId, useUnicode = false, isReprint = false, preview = false } = req.body;
+      // Renderer's global "Arabic/Persian shaping" setting (#437). Only an
+      // explicit boolean overrides the printer profile's declared capability.
+      const arabicShapingOverride =
+        typeof req.body?.arabicShaping === 'boolean' ? req.body.arabicShaping : undefined;
+      console.log('[Print Bill] Request received', { useUnicode, isReprint, preview });
 
-    const db = getDatabase();
-    let printer = db.prepare(
-      `SELECT * FROM printers
+      if (!billId && !orderId) {
+        console.log('[Print Bill] Rejected: missing bill or order reference');
+        return res.status(400).json({ error: 'billId or orderId is required' });
+      }
+      if (billId && orderId) {
+        console.log('[Print Bill] Rejected: conflicting bill and order references');
+        return res.status(400).json({ error: 'Provide either billId or orderId, not both' });
+      }
+
+      const db = getDatabase();
+      let printer = db
+        .prepare(
+          `SELECT * FROM printers
        WHERE connection_type != 'webusb'
        ORDER BY is_default DESC, name
        LIMIT 1`,
-    ).get() as { id?: unknown; name?: unknown; paper_width?: unknown } | undefined;
-    console.log('[Print Bill] Resolved printer:', printer ? { id: printer.id, name: printer.name } : undefined);
-    
-    if (!printer && preview === true) {
-      printer = { id: 0, name: 'Default 80mm Preview', paper_width: '80mm' };
-    }
+        )
+        .get() as { id?: unknown; name?: unknown; paper_width?: unknown } | undefined;
+      console.log(
+        '[Print Bill] Resolved printer:',
+        printer ? { id: printer.id, name: printer.name } : undefined,
+      );
 
-    if (!printer) {
-      console.log('[Print Bill] Error: No default printer');
-      return res.status(400).json({ error: 'No default printer configured. Add a printer in Settings.' });
-    }
+      if (!printer && preview === true) {
+        printer = { id: 0, name: 'Default 80mm Preview', paper_width: '80mm' };
+      }
 
-    // If only orderId is given and no bill exists yet, synthesize an unpaid running bill from the order.
-    let bill: any;
-    if (billId) {
-      bill = db.prepare('SELECT * FROM bills WHERE id = ?').get(billId);
-      if (!bill) {
-        console.log('[Print Bill] Error: Bill not found');
-        return res.status(404).json({ error: 'Bill not found' });
+      if (!printer) {
+        console.log('[Print Bill] Error: No default printer');
+        return res
+          .status(400)
+          .json({ error: 'No default printer configured. Add a printer in Settings.' });
       }
-    } else {
-      bill = db.prepare('SELECT b.* FROM bills b WHERE b.order_id = ?').get(orderId);
-    }
 
-    let order: any;
-    if (bill) {
-      order = db.prepare('SELECT * FROM orders WHERE id = ?').get(bill.order_id);
-      if (!order) {
-        console.log('[Print Bill] Rejected: order not found');
-        return res.status(404).json({ error: 'Order not found' });
+      // If only orderId is given and no bill exists yet, synthesize an unpaid running bill from the order.
+      let bill: any;
+      if (billId) {
+        bill = db.prepare('SELECT * FROM bills WHERE id = ?').get(billId);
+        if (!bill) {
+          console.log('[Print Bill] Error: Bill not found');
+          return res.status(404).json({ error: 'Bill not found' });
+        }
+      } else {
+        bill = db.prepare('SELECT b.* FROM bills b WHERE b.order_id = ?').get(orderId);
       }
-      order.items = getOrderWithItems(db, Number(bill.order_id), Number(bill.id))?.items || [];
-    } else {
-      order = getOrderWithItems(db, Number(orderId));
-      if (!order) {
-        console.log('[Print Bill] Rejected: order not found');
-        return res.status(404).json({ error: 'Order not found' });
+
+      let order: any;
+      if (bill) {
+        order = db.prepare('SELECT * FROM orders WHERE id = ?').get(bill.order_id);
+        if (!order) {
+          console.log('[Print Bill] Rejected: order not found');
+          return res.status(404).json({ error: 'Order not found' });
+        }
+        order.items = getOrderWithItems(db, Number(bill.order_id), Number(bill.id))?.items || [];
+      } else {
+        order = getOrderWithItems(db, Number(orderId));
+        if (!order) {
+          console.log('[Print Bill] Rejected: order not found');
+          return res.status(404).json({ error: 'Order not found' });
+        }
+        bill = {
+          id: 0,
+          bill_number: order.order_number,
+          order_id: order.id,
+          customer_id: order.customer_id,
+          subtotal: order.subtotal,
+          tax_amount: order.tax_amount,
+          tax_breakdown: order.tax_breakdown,
+          tax_snapshot: order.tax_snapshot,
+          discount_amount: order.discount_amount || 0,
+          discount_type: order.discount_type || null,
+          discount_value: order.discount_value || null,
+          discount_reason: order.discount_reason || null,
+          service_charge: order.service_charge || 0,
+          delivery_charge: order.delivery_charge || 0,
+          packaging_charge: order.packaging_charge || 0,
+          round_off: order.round_off || 0,
+          total: order.total,
+          paid_amount: 0,
+          balance: order.total,
+          payment_status: 'unpaid',
+          payment_details: null,
+        };
       }
-      bill = {
-        id: 0,
-        bill_number: order.order_number,
-        order_id: order.id,
-        customer_id: order.customer_id,
-        subtotal: order.subtotal,
-        tax_amount: order.tax_amount,
-        tax_breakdown: order.tax_breakdown,
-        tax_snapshot: order.tax_snapshot,
-        discount_amount: order.discount_amount || 0,
-        discount_type: order.discount_type || null,
-        discount_value: order.discount_value || null,
-        discount_reason: order.discount_reason || null,
-        service_charge: order.service_charge || 0,
-        delivery_charge: order.delivery_charge || 0,
-        packaging_charge: order.packaging_charge || 0,
-        round_off: order.round_off || 0,
-        total: order.total,
-        paid_amount: 0,
-        balance: order.total,
-        payment_status: 'unpaid',
-        payment_details: null,
+
+      // Fetch table info
+      if (order.table_id && !order.table) {
+        const table: any = db.prepare('SELECT * FROM tables WHERE id = ?').get(order.table_id);
+        if (table) {
+          order.table = { name: table.number };
+        }
+      }
+
+      // Fetch business settings for bill template
+      const settingsRows = db.prepare('SELECT key, value FROM settings').all() as {
+        key: string;
+        value: string;
+      }[];
+      const settings: Record<string, string> = Object.fromEntries(
+        settingsRows.map((r) => [r.key, r.value]),
+      );
+
+      // Customer + loyalty context, only relevant when the bill is tied to a customer
+      let customer: any = null;
+      let pointsEarned = 0;
+      let pointsRedeemed = 0;
+      let pointsBalance: number | null = null;
+      if (bill.customer_id) {
+        customer = db
+          .prepare('SELECT name, phone, country_code FROM customers WHERE id = ?')
+          .get(bill.customer_id);
+
+        const earned = db
+          .prepare(
+            `SELECT COALESCE(SUM(amount), 0) as total FROM loyalty_ledger WHERE bill_id = ? AND type = 'credit'`,
+          )
+          .get(bill.id) as { total: number };
+        pointsEarned = earned.total;
+
+        const redeemed = db
+          .prepare(
+            `SELECT COALESCE(SUM(amount), 0) as total FROM loyalty_ledger WHERE bill_id = ? AND type = 'debit'`,
+          )
+          .get(bill.id) as { total: number };
+        pointsRedeemed = redeemed.total;
+
+        if (['true', '1'].includes(settings.loyalty_enabled || '')) {
+          const credits = db
+            .prepare(
+              `SELECT COALESCE(SUM(amount), 0) as total FROM loyalty_ledger WHERE customer_id = ? AND type = 'credit'`,
+            )
+            .get(bill.customer_id) as { total: number };
+          const debits = db
+            .prepare(
+              `SELECT COALESCE(SUM(amount), 0) as total FROM loyalty_ledger WHERE customer_id = ? AND type = 'debit'`,
+            )
+            .get(bill.customer_id) as { total: number };
+          pointsBalance = Math.max(0, credits.total - debits.total);
+        }
+      }
+
+      const country = settings.country || '';
+      const currency = resolveTenantCurrency(settings.currency, country);
+      const business = {
+        name: settings.business_name || '',
+        address: settings.business_address || '',
+        phone: settings.business_phone || '',
+        taxRegistrationNumber: settings.tax_registration_number || '',
+        currency,
+        // CLDR-derived only — a stored currency_symbol setting is not an input
+        // (docs/reference/product-invariants.md: no per-store override of a snapshot value).
+        currency_symbol: getCurrencySymbol(currency, getCountryByCode(country)?.locale) || currency,
+        country,
+        instagram_handle: settings.instagram_handle || '',
+        customer_name: customer?.name || '',
+        customer_phone: customer?.phone
+          ? customer.country_code && !customer.phone.startsWith(customer.country_code)
+            ? `${customer.country_code} ${customer.phone}`
+            : customer.phone
+          : '',
+        // One shared rule, so the receipt and the slip cannot disagree.
+        show_customer_phone: shouldShowCustomerNumber({
+          showOnReceipts: settings.bill_show_customer_phone !== 'false',
+          alwaysForDeliveryOrders: settings.bill_delivery_show_customer_phone_always !== 'false',
+          orderType: String(order?.type ?? ''),
+        }),
+        points_earned: pointsEarned,
+        points_redeemed: pointsRedeemed,
+        points_balance: pointsBalance,
+        trim_decimals: settings.printer_trim_decimals === 'true',
+        timezone: settings.timezone || '',
+        show_name: settings.bill_show_name !== 'false',
+        show_address: settings.bill_show_address !== 'false',
+        show_phone: settings.bill_show_phone !== 'false',
+        show_tax_id: settings.bill_show_tax_id === 'true',
+        show_tax_breakdown: settings.bill_show_tax_breakdown !== 'false',
+        show_customer_name: settings.bill_show_customer_name !== 'false',
+        show_table_number: settings.bill_show_table_number !== 'false',
+        show_large_order_number: settings.bill_show_large_order_number !== 'false',
+        show_logo: settings.bill_show_logo === 'true',
+        receipt_logo: settings.receipt_logo || '',
+        receipt_logo_raster: settings.receipt_logo_raster || '',
+        footer_note: settings.bill_footer_message || '',
       };
-    }
+      const billTemplate = settings.bill_template;
+      // Resolves primary and optional secondary receipt languages from tenant policy.
+      const receiptLanguages = resolveTenantReceiptLanguages(db);
+      console.log('[Print Bill] Preparing receipt', { template: billTemplate || 'classic' });
 
-    // Fetch table info
-    if (order.table_id && !order.table) {
-      const table: any = db.prepare('SELECT * FROM tables WHERE id = ?').get(order.table_id);
-      if (table) {
-        order.table = { name: table.number };
+      if (preview === true) {
+        // Previews and prints share the same document formatting pipeline.
+        const prepared = prepareReceipt(
+          order,
+          bill,
+          business,
+          billTemplate || 'classic',
+          useUnicode,
+          isReprint,
+          arabicShapingOverride,
+          receiptLanguages.primary,
+          receiptLanguages.additional,
+        );
+        return res.json({
+          success: true,
+          preview: true,
+          columns: prepared.columns,
+          printer: { id: prepared.printer.id, name: prepared.printer.name },
+          text: escPosToText(prepared.data),
+          escpos_base64: prepared.data.toString('base64'),
+          warnings: prepared.warnings,
+        });
       }
-    }
 
-    // Fetch business settings for bill template
-    const settingsRows = db.prepare('SELECT key, value FROM settings').all() as { key: string; value: string }[];
-    const settings: Record<string, string> = Object.fromEntries(settingsRows.map(r => [r.key, r.value]));
-
-    // Customer + loyalty context, only relevant when the bill is tied to a customer
-    let customer: any = null;
-    let pointsEarned = 0;
-    let pointsRedeemed = 0;
-    let pointsBalance: number | null = null;
-    if (bill.customer_id) {
-      customer = db.prepare('SELECT name, phone, country_code FROM customers WHERE id = ?').get(bill.customer_id);
-
-      const earned = db.prepare(
-        `SELECT COALESCE(SUM(amount), 0) as total FROM loyalty_ledger WHERE bill_id = ? AND type = 'credit'`
-      ).get(bill.id) as { total: number };
-      pointsEarned = earned.total;
-
-      const redeemed = db.prepare(
-        `SELECT COALESCE(SUM(amount), 0) as total FROM loyalty_ledger WHERE bill_id = ? AND type = 'debit'`
-      ).get(bill.id) as { total: number };
-      pointsRedeemed = redeemed.total;
-
-      if (['true', '1'].includes(settings.loyalty_enabled || '')) {
-        const credits = db.prepare(
-          `SELECT COALESCE(SUM(amount), 0) as total FROM loyalty_ledger WHERE customer_id = ? AND type = 'credit'`
-        ).get(bill.customer_id) as { total: number };
-        const debits = db.prepare(
-          `SELECT COALESCE(SUM(amount), 0) as total FROM loyalty_ledger WHERE customer_id = ? AND type = 'debit'`
-        ).get(bill.customer_id) as { total: number };
-        pointsBalance = Math.max(0, credits.total - debits.total);
-      }
-    }
-
-    const country = settings.country || 'IN';
-    const currency = resolveTenantCurrency(settings.currency, country);
-    const business = {
-      name: settings.business_name || '',
-      address: settings.business_address || '',
-      phone: settings.business_phone || '',
-      taxRegistrationNumber: settings.tax_registration_number || '',
-      currency,
-      // Derive from resolved currency before stored symbol to avoid stale currency symbols.
-      currency_symbol: getCurrencySymbol(currency, getCountryByCode(country)?.locale) || settings.currency_symbol || currency,
-      country,
-      instagram_handle: settings.instagram_handle || '',
-      customer_name: customer?.name || '',
-      customer_phone: customer?.phone
-        ? (customer.country_code && !customer.phone.startsWith(customer.country_code)
-           ? `${customer.country_code} ${customer.phone}`
-           : customer.phone)
-        : '',
-      points_earned: pointsEarned,
-      points_redeemed: pointsRedeemed,
-      points_balance: pointsBalance,
-      trim_decimals: settings.printer_trim_decimals === 'true',
-      timezone: settings.timezone || 'Asia/Kolkata',
-      show_name: settings.bill_show_name !== 'false',
-      show_address: settings.bill_show_address !== 'false',
-      show_phone: settings.bill_show_phone !== 'false',
-      show_tax_id: settings.bill_show_tax_id === 'true',
-      show_tax_breakdown: settings.bill_show_tax_breakdown !== 'false',
-      show_customer_name: settings.bill_show_customer_name !== 'false',
-      show_customer_phone: settings.bill_show_customer_phone !== 'false',
-      show_table_number: settings.bill_show_table_number !== 'false',
-      footer_note: settings.bill_footer_message || '',
-    };
-    const billTemplate = settings.bill_template;
-    // Resolves primary and optional secondary receipt languages from tenant policy.
-    const receiptLanguages = resolveTenantReceiptLanguages(db);
-    console.log('[Print Bill] Preparing receipt', { template: billTemplate || 'classic' });
-
-    if (preview === true) {
-      // Previews and prints share the same document formatting pipeline.
-      const prepared = prepareReceipt(order, bill, business, billTemplate || 'classic', useUnicode, isReprint, arabicShapingOverride, receiptLanguages.primary, receiptLanguages.additional);
-      return res.json({
-        success: true,
-        preview: true,
-        columns: prepared.columns,
-        printer: { id: prepared.printer.id, name: prepared.printer.name },
-        text: escPosToText(prepared.data),
-        escpos_base64: prepared.data.toString('base64'),
-        warnings: prepared.warnings,
+      // Use existing printReceipt function with template support
+      console.log('[Print Bill] Calling printReceipt...');
+      const result = await printReceiptDetailed(
+        order,
+        bill,
+        business,
+        billTemplate || 'classic',
+        useUnicode,
+        isReprint,
+        getHttpRequestSignal(req),
+        arabicShapingOverride,
+        receiptLanguages.primary,
+        receiptLanguages.additional,
+      );
+      console.log('[Print Bill] Print completed', {
+        ok: result.ok,
+        code: result.code,
+        correlation_id: result.correlationId,
+        stage: result.stage,
+        failure_class: result.failureClass,
+        warning_count: result.warnings?.length || 0,
       });
-    }
 
-    // Use existing printReceipt function with template support
-    console.log('[Print Bill] Calling printReceipt...');
-    const result = await printReceiptDetailed(order, bill, business, billTemplate || 'classic', useUnicode, isReprint, getHttpRequestSignal(req), arabicShapingOverride, receiptLanguages.primary, receiptLanguages.additional);
-    console.log('[Print Bill] Print completed', {
-      ok: result.ok,
-      code: result.code,
-      correlation_id: result.correlationId,
-      stage: result.stage,
-      failure_class: result.failureClass,
-      warning_count: result.warnings?.length || 0,
-    });
-
-    if (result.ok) {
-      res.json({ success: true, warnings: result.warnings || [] });
-    } else {
-      res.status(502).json({ error: result.detail || 'Print failed. Check printer connection and settings.', detail: result.detail, failure_class: result.failureClass, code: result.code, correlation_id: result.correlationId, stage: result.stage, warnings: result.warnings || [] });
+      if (result.ok) {
+        res.json({ success: true, warnings: result.warnings || [] });
+      } else {
+        const rawConnectionType = (printer as { connection_type?: unknown } | null | undefined)
+          ?.connection_type;
+        const connectionType =
+          rawConnectionType === 'network' ||
+          rawConnectionType === 'usb' ||
+          rawConnectionType === 'webusb'
+            ? rawConnectionType
+            : 'unknown';
+        res.status(502).json({
+          error: result.detail || 'Print failed. Check printer connection and settings.',
+          detail: result.detail,
+          failure_class: result.failureClass,
+          connection_type: connectionType,
+          code: result.code,
+          correlation_id: result.correlationId,
+          stage: result.stage,
+          warnings: result.warnings || [],
+        });
+      }
+    } catch (error: any) {
+      res.locals.postHogError = error;
+      console.error('[Print Bill] Error:', error);
+      console.error('[API] Internal error:', error);
+      res.status(500).json({ error: 'Internal server error' });
     }
-  } catch (error: any) {
-    console.error('[Print Bill] Error:', error);
-    console.error("[API] Internal error:", error);
-    res.status(500).json({ error: "Internal server error" });
-  }
-}));
+  }),
+);
 
 // Routes items to kitchen stations by category, falling back to default kitchen.
-export function routeItemsToStations(db: any, orderItems: any[]): { stationName: string; printer: any; items: any[] }[] {
-  const rawStations = db.prepare(
-    `SELECT * FROM kitchen_stations WHERE is_active = 1 AND printer_id IS NOT NULL AND category_ids IS NOT NULL AND category_ids != ''`
-  ).all() as any[];
+export function routeItemsToStations(
+  db: any,
+  orderItems: any[],
+): { stationName: string; printer: any; items: any[] }[] {
+  const rawStations = db
+    .prepare(`SELECT * FROM kitchen_stations WHERE is_active = 1 AND printer_id IS NOT NULL`)
+    .all() as any[];
 
   const stations = rawStations
     .map((s) => {
       let categoryIds: string[] = [];
-      try {
-        categoryIds = JSON.parse(s.category_ids) || [];
-      } catch {
-        categoryIds = [];
+      let validCategories = true;
+      if (s.category_ids != null && String(s.category_ids).trim() !== '') {
+        try {
+          const parsed = JSON.parse(s.category_ids);
+          if (Array.isArray(parsed)) {
+            categoryIds = parsed.filter((id) => id != null && String(id).trim() !== '').map(String);
+          } else {
+            validCategories = false;
+          }
+        } catch {
+          validCategories = false;
+        }
       }
-      const printer = db.prepare(
-        `SELECT * FROM printers
+      const printer = db
+        .prepare(
+          `SELECT * FROM printers
          WHERE id = ? AND connection_type != 'webusb'`,
-      ).get(s.printer_id);
-      return { ...s, categoryIds, printer };
+        )
+        .get(s.printer_id);
+      return { ...s, categoryIds, validCategories, printer };
     })
-    .filter((s) => s.categoryIds.length > 0 && s.printer);
+    .filter((s) => s.validCategories && s.printer);
 
   if (stations.length === 0) {
     return [{ stationName: 'Kitchen', printer: null, items: orderItems }];
   }
 
+  const restrictedStations = stations.filter((s) => s.categoryIds.length > 0);
+  const unrestrictedStation = stations.find((s) => s.categoryIds.length === 0);
+
   const groups = new Map<string, { stationName: string; printer: any; items: any[] }>();
   const unrouted: any[] = [];
 
   for (const item of orderItems) {
-    const product: any = item.product_id ? db.prepare('SELECT category_id FROM products WHERE id = ?').get(item.product_id) : null;
-    const categoryId = product?.category_id;
-    const matched = categoryId ? stations.find((s) => s.categoryIds.includes(categoryId)) : undefined;
+    const product: any = item.product_id
+      ? db
+          .prepare(
+            'SELECT p.category_id, c.parent_id FROM products p LEFT JOIN categories c ON c.id = p.category_id WHERE p.id = ?',
+          )
+          .get(item.product_id)
+      : null;
+    const categoryId = product?.category_id != null ? String(product.category_id) : null;
+    const parentId = product?.parent_id != null ? String(product.parent_id) : null;
+    const matched =
+      (categoryId
+        ? restrictedStations.find((s) => s.categoryIds.includes(categoryId))
+        : undefined) ??
+      (parentId ? restrictedStations.find((s) => s.categoryIds.includes(parentId)) : undefined) ??
+      unrestrictedStation;
     if (matched) {
       if (!groups.has(matched.id)) {
         groups.set(matched.id, { stationName: matched.name, printer: matched.printer, items: [] });
@@ -596,98 +1396,473 @@ export function routeItemsToStations(db: any, orderItems: any[]): { stationName:
 
 // POST /api/printers/print-kot — print KOT via backend (desktop app).
 // Uses `sales` so the waiter terminal's "server" role can print its own orders.
-router.post('/print-kot', requireRole(...ROLE_ACCESS.sales), asyncHandler(async (req: Request, res: Response) => {
-  // Enforce master KOT printing toggle for all automatic and manual print requests.
-  if (!isKotPrintingEnabled()) {
-    return res.status(403).json({ error: 'KOT printing is disabled for this business' });
-  }
-  try {
-    const { orderId, stationName, items, useUnicode = false } = req.body;
-    // Global text shaping setting; explicit boolean overrides printer profile capability.
-    const arabicShapingOverride = typeof req.body?.arabicShaping === 'boolean' ? req.body.arabicShaping : undefined;
-
-    if (!orderId) {
-      return res.status(400).json({ error: 'orderId is required' });
+router.post(
+  '/print-kot',
+  requirePermission('printing.execute'),
+  asyncHandler(async (req: Request, res: Response) => {
+    // Enforce master KOT printing toggle for all automatic and manual print requests.
+    if (!isKotPrintingEnabled()) {
+      return res.status(403).json({
+        error: 'KOT printing is disabled for this business',
+        code: 'KOT_PRINTING_DISABLED',
+      });
     }
+    try {
+      const { orderId, stationName, items, useUnicode = false } = req.body;
+      // Global text shaping setting; explicit boolean overrides printer profile capability.
+      const arabicShapingOverride =
+        typeof req.body?.arabicShaping === 'boolean' ? req.body.arabicShaping : undefined;
 
-    const db = getDatabase();
-    const printer = db.prepare(
-      `SELECT * FROM printers
+      if (!orderId) {
+        return res.status(400).json({ error: 'orderId is required' });
+      }
+
+      const db = getDatabase();
+      const preCheckOrder = db
+        .prepare('SELECT id, release_status FROM orders WHERE id = ?')
+        .get(orderId) as { id: number; release_status?: string | null } | undefined;
+      if (preCheckOrder?.release_status && preCheckOrder.release_status !== 'released') {
+        return res.status(409).json({
+          error: 'Cannot print KOT for a scheduled order before it is released to the kitchen',
+        });
+      }
+
+      const printer = db
+        .prepare(
+          `SELECT * FROM printers
        WHERE connection_type != 'webusb'
        ORDER BY is_default DESC, name
        LIMIT 1`,
-    ).get();
+        )
+        .get();
 
-    if (!printer) {
-      return res.status(400).json({ error: 'No default printer configured. Add a printer in Settings.' });
-    }
-
-    const order: any = db.prepare('SELECT * FROM orders WHERE id = ?').get(orderId);
-    if (!order) {
-      return res.status(404).json({ error: 'Order not found' });
-    }
-
-    const kotLanguage = resolveTenantKotLanguage(db);
-
-    // Fetch order items from database
-    const orderItems: any[] = getEffectiveOrderItems(db, orderId);
-
-    // Fetch table/customer info if available so backend KOT metadata matches
-    // the browser and WebUSB paths.
-    if (order.table_id) {
-      const table: any = db.prepare('SELECT * FROM tables WHERE id = ?').get(order.table_id);
-      if (table) {
-        order.table = { name: table.number };
+      if (!printer) {
+        return res
+          .status(400)
+          .json({ error: 'No default printer configured. Add a printer in Settings.' });
       }
-    }
-    if (order.customer_id) {
-      const customer = db.prepare('SELECT name FROM customers WHERE id = ?').get(order.customer_id) as { name: string } | null;
-      if (customer) order.customer = { name: customer.name };
-    }
 
-    // Specific station prints one ticket; unassigned item overrides route by station.
-    let success = true;
-    const warnings: NonNullable<Awaited<ReturnType<typeof printKOTDetailed>>['warnings']> = [];
-    let failure: Awaited<ReturnType<typeof printKOTDetailed>> | null = null;
-    const kotSourceItems = (Array.isArray(items) ? items : orderItems)
-      .filter((item: any) => isKotItemPending(item?.status));
-
-    if (stationName) {
-      const station = stationName || 'Kitchen';
-      if (kotSourceItems.length > 0) {
-        const result = await printKOTDetailed(order, kotSourceItems, station, useUnicode, undefined, getHttpRequestSignal(req), arabicShapingOverride, kotLanguage);
-        success = result.ok;
-        failure = result.ok ? null : result;
-        warnings.push(...(result.warnings || []));
+      const order: any = db.prepare('SELECT * FROM orders WHERE id = ?').get(orderId);
+      if (!order) {
+        return res.status(404).json({ error: 'Order not found' });
       }
-    } else {
-      const groups = routeItemsToStations(db, kotSourceItems).filter((g) => g.items.length > 0);
-      for (const group of groups) {
-        const result = await printKOTDetailed(order, group.items, group.stationName, useUnicode, group.printer || undefined, getHttpRequestSignal(req), arabicShapingOverride, kotLanguage);
-        success = success && result.ok;
-        warnings.push(...(result.warnings || []));
-        if (!result.ok && !failure) failure = result;
-      }
-    }
 
-    if (success) {
-      res.json({ success: true, warnings });
-    } else {
-      res.status(502).json({ error: failure?.detail || 'KOT print failed. Check printer connection.', detail: failure?.detail, failure_class: failure?.failureClass, code: failure?.code, correlation_id: failure?.correlationId, stage: failure?.stage });
+      const kotLanguage = resolveTenantKotLanguage(db);
+
+      // Fetch order items from database
+      const orderItems: any[] = getEffectiveOrderItems(db, orderId);
+
+      // Fetch table/customer info if available so backend KOT metadata matches
+      // the browser and WebUSB paths.
+      if (order.table_id) {
+        const table: any = db.prepare('SELECT * FROM tables WHERE id = ?').get(order.table_id);
+        if (table) {
+          order.table = { name: table.number };
+        }
+      }
+      if (order.customer_id) {
+        const customer = db
+          .prepare('SELECT name FROM customers WHERE id = ?')
+          .get(order.customer_id) as { name: string } | null;
+        if (customer) order.customer = { name: customer.name };
+      }
+      order.show_large_order_number =
+        tenantSettingValue(db, 'bill_show_large_order_number') !== 'false';
+
+      // Specific station prints one ticket; unassigned item overrides route by station.
+      let success = true;
+      const warnings: NonNullable<Awaited<ReturnType<typeof printKOTDetailed>>['warnings']> = [];
+      let failure: Awaited<ReturnType<typeof printKOTDetailed>> | null = null;
+      let failedPrinter: any = printer;
+      const kotSourceItems = (Array.isArray(items) ? items : orderItems).filter((item: any) =>
+        isKotItemPending(item?.status),
+      );
+
+      if (stationName) {
+        const station = stationName || 'Kitchen';
+        if (kotSourceItems.length > 0) {
+          const result = await printKOTDetailed(
+            order,
+            kotSourceItems,
+            station,
+            useUnicode,
+            undefined,
+            getHttpRequestSignal(req),
+            arabicShapingOverride,
+            kotLanguage,
+          );
+          success = result.ok;
+          failure = result.ok ? null : result;
+          warnings.push(...(result.warnings || []));
+        }
+      } else {
+        const groups = routeItemsToStations(db, kotSourceItems).filter((g) => g.items.length > 0);
+        for (const group of groups) {
+          const result = await printKOTDetailed(
+            order,
+            group.items,
+            group.stationName,
+            useUnicode,
+            group.printer || undefined,
+            getHttpRequestSignal(req),
+            arabicShapingOverride,
+            kotLanguage,
+          );
+          success = success && result.ok;
+          warnings.push(...(result.warnings || []));
+          if (!result.ok && !failure) {
+            failure = result;
+            failedPrinter = group.printer || printer;
+          }
+        }
+      }
+
+      if (success) {
+        res.json({ success: true, warnings });
+      } else {
+        const connectionType =
+          failedPrinter?.connection_type === 'network' ||
+          failedPrinter?.connection_type === 'usb' ||
+          failedPrinter?.connection_type === 'webusb'
+            ? failedPrinter.connection_type
+            : 'unknown';
+        res.status(502).json({
+          error: failure?.detail || 'KOT print failed. Check printer connection.',
+          detail: failure?.detail,
+          failure_class: failure?.failureClass,
+          connection_type: connectionType,
+          code: failure?.code,
+          correlation_id: failure?.correlationId,
+          stage: failure?.stage,
+        });
+      }
+    } catch (error: any) {
+      res.locals.postHogError = error;
+      console.error('[Print KOT] Error:', error);
+      console.error('[API] Internal error:', error);
+      res.status(500).json({ error: 'Internal server error' });
     }
-  } catch (error: any) {
-    console.error('[Print KOT] Error:', error);
-    console.error("[API] Internal error:", error);
-    res.status(500).json({ error: "Internal server error" });
-  }
-}));
+  }),
+);
+
+router.get(
+  '/delivery-slip-payment/:orderId',
+  requirePermission('printing.execute'),
+  (req: Request, res: Response) => {
+    try {
+      const db = getDatabase();
+      const order = db.prepare('SELECT * FROM orders WHERE id = ?').get(req.params.orderId) as
+        | (DeliverySlipOrderRow & { id: number })
+        | undefined;
+      if (!order) {
+        return res.status(404).json({ error: 'Order not found' });
+      }
+
+      const bills = getDeliverySlipBills(db, order.id);
+      const settings = Object.fromEntries(
+        (
+          db.prepare('SELECT key, value FROM settings').all() as { key: string; value: string }[]
+        ).map(({ key, value }) => [key, value]),
+      );
+      const regional = resolveRegionalSnapshot(settings);
+      const { payment } = buildDeliverySlipPrintData(
+        { ...order, bills },
+        [],
+        {},
+        {
+          locale: regional.locale,
+          currency: regional.currency,
+          currencyDisplay: regional.preferences.currencyDisplay,
+          digits: regional.preferences.digits,
+        },
+      );
+      return res.json({ payment });
+    } catch (error: unknown) {
+      res.locals.postHogError = error;
+      console.error('[Delivery Slip Payment] Error:', error);
+      return res.status(500).json({ error: 'Internal server error' });
+    }
+  },
+);
+
+// POST /api/printers/print-delivery-slip. No bill is required, so a slip can be
+// handed over before the customer pays. See docs/reference/product-invariants.md.
+router.post(
+  '/print-delivery-slip',
+  requirePermission('printing.execute'),
+  asyncHandler(async (req: Request, res: Response) => {
+    try {
+      const { orderId, useUnicode = false } = req.body;
+      const arabicShapingOverride =
+        typeof req.body?.arabicShaping === 'boolean' ? req.body.arabicShaping : undefined;
+
+      if (!orderId) {
+        return res.status(400).json({ error: 'orderId is required' });
+      }
+
+      const db = getDatabase();
+      const printer = db
+        .prepare(
+          `SELECT * FROM printers
+       WHERE connection_type != 'webusb'
+       ORDER BY is_default DESC, name
+       LIMIT 1`,
+        )
+        .get();
+      if (!printer) {
+        return res
+          .status(400)
+          .json({ error: 'No default printer configured. Add a printer in Settings.' });
+      }
+
+      const order = getOrderWithItems(db, Number(orderId));
+      if (!order) {
+        return res.status(404).json({ error: 'Order not found' });
+      }
+
+      const bills = getDeliverySlipBills(db, order.id);
+      const deliverySlipOrder = { ...order, bills };
+
+      const items = getEffectiveOrderItems(db, orderId);
+
+      // The slip prints the address in full, so it reads the column the receipt
+      // route deliberately omits.
+      const customer:
+        | { name?: string; phone?: string; country_code?: string; address?: string }
+        | undefined = order.customer_id
+        ? (db
+            .prepare('SELECT name, phone, country_code, address FROM customers WHERE id = ?')
+            .get(order.customer_id) as {
+            name?: string;
+            phone?: string;
+            country_code?: string;
+            address?: string;
+          })
+        : undefined;
+      const phone = customer?.phone
+        ? customer.country_code && !customer.phone.startsWith(customer.country_code)
+          ? `${customer.country_code} ${customer.phone}`
+          : customer.phone
+        : '';
+
+      const language = resolveTenantReceiptLanguages(db).primary;
+      // The delivery exception, or the receipt setting when it is off. Blank only
+      // when both say hide, so the slip and a delivery receipt cannot disagree.
+      const showCustomerPhone =
+        (
+          db
+            .prepare(
+              "SELECT value FROM settings WHERE key = 'bill_delivery_show_customer_phone_always'",
+            )
+            .get() as { value?: string } | undefined
+        )?.value !== 'false' ||
+        (
+          db.prepare("SELECT value FROM settings WHERE key = 'bill_show_customer_phone'").get() as
+            | { value?: string }
+            | undefined
+        )?.value !== 'false';
+      const result = await printDeliverySlipDetailed(
+        deliverySlipOrder,
+        items,
+        {
+          name: customer?.name || '',
+          phone,
+          // The address confirmed for this delivery wins over the customer's
+          // standing record; the slip records which one it printed.
+          address: order.delivery_address || customer?.address || '',
+        },
+        useUnicode,
+        undefined,
+        getHttpRequestSignal(req),
+        arabicShapingOverride,
+        language,
+        showCustomerPhone,
+      );
+
+      if (result.ok) {
+        return res.json({ success: true, warnings: result.warnings || [] });
+      }
+      const connectionType =
+        (printer as any)?.connection_type === 'network' ||
+        (printer as any)?.connection_type === 'usb' ||
+        (printer as any)?.connection_type === 'webusb'
+          ? (printer as any).connection_type
+          : 'unknown';
+      return res.status(502).json({
+        error: result.detail || 'Delivery slip print failed. Check printer connection.',
+        detail: result.detail,
+        failure_class: result.failureClass,
+        connection_type: connectionType,
+        code: result.code,
+        correlation_id: result.correlationId,
+        stage: result.stage,
+      });
+    } catch (error: unknown) {
+      res.locals.postHogError = error;
+      console.error('[Print Delivery Slip] Error:', error);
+      console.error('[API] Internal error:', error);
+      res.status(500).json({ error: 'Internal server error' });
+    }
+  }),
+);
+
+router.post(
+  '/print-payment-ticket',
+  requirePermission('printing.execute'),
+  asyncHandler(async (req: Request, res: Response) => {
+    try {
+      const orderId = req.body.orderId || req.body.order_id;
+      const printerId = req.body.printerId || req.body.printer_id;
+      const { useUnicode = false, preview = false } = req.body;
+      if (!orderId) {
+        return res.status(400).json({ error: 'orderId is required' });
+      }
+
+      const db = getDatabase();
+      let printer = printerId
+        ? db.prepare('SELECT * FROM printers WHERE id = ?').get(printerId)
+        : db
+            .prepare(
+              `SELECT * FROM printers
+               WHERE connection_type != 'webusb'
+               ORDER BY is_default DESC, name
+               LIMIT 1`,
+            )
+            .get() ||
+          db
+            .prepare(
+              `SELECT * FROM printers
+               WHERE connection_type = 'webusb'
+               ORDER BY is_default DESC, name
+               LIMIT 1`,
+            )
+            .get();
+
+      if (!printer && preview === true) {
+        printer = { id: 0, name: 'Default 80mm Preview', paper_width: '80mm' };
+      }
+
+      if (!printer) {
+        return res
+          .status(400)
+          .json({ error: 'No default printer configured. Add a printer in Settings.' });
+      }
+
+      const order = getOrderWithItems(db, Number(orderId));
+      if (!order) {
+        return res.status(404).json({ error: 'Order not found' });
+      }
+
+      let tableName: string | null = null;
+      if (order.table_id) {
+        const tableRow = db
+          .prepare('SELECT number FROM tables WHERE id = ?')
+          .get(order.table_id) as { number: string } | undefined;
+        tableName = tableRow?.number ?? null;
+      }
+
+      const rawItems = (order.items || []) as Array<{
+        status?: string;
+        product_name?: string;
+        quantity?: number;
+        unit_price?: number;
+        total?: number;
+      }>;
+      const items = rawItems
+        .filter((item) => !isTerminalItemStatus(item.status))
+        .map((item) => ({
+          product_name: item.product_name || '',
+          quantity: item.quantity || 1,
+          unit_price: item.unit_price || 0,
+          total: item.total || 0,
+        }));
+      const refundedItemsTotal = rawItems
+        .filter((item) => item.status === 'refunded')
+        .reduce((sum, item) => sum + Number(item.total || 0), 0);
+      const ticketTotal =
+        items.length === 0
+          ? 0
+          : Math.max(0, Number((Number(order.total || 0) - refundedItemsTotal).toFixed(4)));
+
+      const balanceRow = db
+        .prepare(
+          `SELECT COALESCE(SUM(CASE WHEN payment_status != 'refunded' THEN balance ELSE 0 END), 0) AS total_balance,
+                  COUNT(*) AS bill_count
+           FROM bills
+           WHERE order_id = ?`,
+        )
+        .get(order.id) as { total_balance: number; bill_count: number } | undefined;
+      const balance =
+        balanceRow && balanceRow.bill_count > 0 ? Number(balanceRow.total_balance) : ticketTotal;
+
+      const result = await printPaymentTicketDetailed(
+        {
+          id: order.id,
+          order_number: order.order_number,
+          type: order.type,
+          table_id: order.table_id,
+          table_name: tableName,
+          total: ticketTotal,
+          created_at: order.created_at,
+          scheduled_for: order.scheduled_for,
+        },
+        items,
+        {
+          balance: Number(balance),
+          useUnicode,
+          targetPrinter: printer,
+          signal: getHttpRequestSignal(req),
+          preview: Boolean(preview),
+        },
+      );
+
+      if (preview && result.ok) {
+        return res.json({
+          success: true,
+          preview: true,
+          bytes: result.bytes || [],
+          warnings: result.warnings || [],
+        });
+      }
+
+      if (result.ok && result.connection_type === 'webusb') {
+        return res.json({
+          success: true,
+          webusb: true,
+          bytes: Array.from(result.bytes || []),
+          printerName: (printer as { name?: string }).name,
+          warnings: result.warnings || [],
+        });
+      }
+
+      if (result.ok) {
+        return res.json({ success: true, warnings: result.warnings || [] });
+      }
+      return res.status(502).json({
+        error: result.detail || 'Payment ticket print failed. Check printer connection.',
+        detail: result.detail,
+        failure_class: result.failureClass,
+        code: result.code,
+        correlation_id: result.correlationId,
+        stage: result.stage,
+      });
+    } catch (error: unknown) {
+      res.locals.postHogError = error;
+      console.error('[Print Payment Ticket] Error:', error);
+      console.error('[API] Internal error:', error);
+      res.status(500).json({ error: 'Internal server error' });
+    }
+  }),
+);
 
 export const printerRoutes = router;
 
 /** Tenant-configured language for print labels, defaulting to 'en'. */
 export function tenantLanguage(db: ReturnType<typeof getDatabase>): string {
   try {
-    const row = db.prepare("SELECT value FROM settings WHERE key = 'language'").get() as { value?: string } | undefined;
+    const row = db.prepare("SELECT value FROM settings WHERE key = 'language'").get() as
+      | { value?: string }
+      | undefined;
     return row?.value || 'en';
   } catch {
     return 'en';
@@ -696,7 +1871,9 @@ export function tenantLanguage(db: ReturnType<typeof getDatabase>): string {
 
 function tenantSettingValue(db: ReturnType<typeof getDatabase>, key: string): string | undefined {
   try {
-    const row = db.prepare('SELECT value FROM settings WHERE key = ?').get(key) as { value?: string } | undefined;
+    const row = db.prepare('SELECT value FROM settings WHERE key = ?').get(key) as
+      | { value?: string }
+      | undefined;
     return row?.value;
   } catch {
     return undefined;
@@ -704,7 +1881,10 @@ function tenantSettingValue(db: ReturnType<typeof getDatabase>, key: string): st
 }
 
 /** Resolves primary and optional secondary receipt languages from tenant policy. */
-function resolveTenantReceiptLanguages(db: ReturnType<typeof getDatabase>): { primary: string; additional?: string } {
+function resolveTenantReceiptLanguages(db: ReturnType<typeof getDatabase>): {
+  primary: string;
+  additional?: string;
+} {
   const policy = parseStoredLanguagePolicy(
     BILL_LANGUAGE_POLICY_KEY,
     tenantSettingValue(db, BILL_LANGUAGE_POLICY_KEY),
@@ -722,4 +1902,84 @@ function resolveTenantKotLanguage(db: ReturnType<typeof getDatabase>): string {
     tenantSettingValue(db, KOT_LANGUAGE_POLICY_KEY),
   ) as KotLanguagePolicy;
   return resolveKotLanguage(policy, tenantLanguage(db));
+}
+
+/**
+ * Automatically prints KOT tickets via configured backend printers when a
+ * scheduled order is released to the kitchen and `auto_print_kot` is enabled.
+ */
+export async function autoPrintReleasedOrderKot(
+  db: ReturnType<typeof getDatabase>,
+  orderId: string | number,
+): Promise<boolean> {
+  try {
+    if (!isKotPrintingEnabled()) return false;
+    if (tenantSettingValue(db, 'auto_print_kot') !== 'true') return false;
+
+    const printer = db
+      .prepare(
+        `SELECT * FROM printers
+         WHERE connection_type != 'webusb'
+         ORDER BY is_default DESC, name
+         LIMIT 1`,
+      )
+      .get();
+    if (!printer) return false;
+
+    const order = db
+      .prepare("SELECT * FROM orders WHERE id = ? AND release_status = 'released'")
+      .get(orderId) as
+      | (Record<string, unknown> & {
+          table_id?: string | number | null;
+          customer_id?: string | number | null;
+        })
+      | undefined;
+    if (!order) return false;
+
+    if (order.table_id) {
+      const table = db.prepare('SELECT number FROM tables WHERE id = ?').get(order.table_id) as
+        | { number: string }
+        | undefined;
+      if (table) order.table = { name: table.number };
+    }
+    if (order.customer_id) {
+      const customer = db
+        .prepare('SELECT name FROM customers WHERE id = ?')
+        .get(order.customer_id) as { name: string } | undefined;
+      if (customer) order.customer = { name: customer.name };
+    }
+    order.show_large_order_number =
+      tenantSettingValue(db, 'bill_show_large_order_number') !== 'false';
+
+    const kotLanguage = resolveTenantKotLanguage(db);
+    const useUnicode = tenantSettingValue(db, 'printer_use_unicode') === 'true';
+    const arabicShapingSetting = tenantSettingValue(db, 'printer_arabic_shaping');
+    const arabicShapingOverride =
+      arabicShapingSetting !== undefined ? arabicShapingSetting === 'true' : undefined;
+
+    const kotSourceItems = getEffectiveOrderItems(db, String(orderId)).filter(
+      (item: { status?: string | null }) => isKotItemPending(item?.status),
+    );
+    if (kotSourceItems.length === 0) return false;
+
+    const groups = routeItemsToStations(db, kotSourceItems).filter((g) => g.items.length > 0);
+    let anyPrinted = false;
+    for (const group of groups) {
+      const result = await printKOTDetailed(
+        order as Parameters<typeof printKOTDetailed>[0],
+        group.items,
+        group.stationName,
+        useUnicode,
+        group.printer || undefined,
+        undefined,
+        arabicShapingOverride,
+        kotLanguage,
+      );
+      if (result.ok) anyPrinted = true;
+    }
+    return anyPrinted;
+  } catch (error) {
+    console.error('[Scheduled Release KOT] Automatic KOT print failed:', error);
+    return false;
+  }
 }

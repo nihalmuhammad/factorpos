@@ -6,6 +6,7 @@ export {
   getCountryByCode,
   listTimeZones,
   isValidTimeZone,
+  resolveIntlCurrencyDisplay,
   getCurrencySymbol,
   formatCurrency,
   formatCurrencyForTenant,
@@ -46,8 +47,16 @@ function displayNamesForLocale(locale: string): Intl.DisplayNames {
 
 /** Resolve a country name for the active UI locale without changing its ISO identity. */
 export function getLocalizedCountryName(code: string, locale: string): string {
-  const normalizedCode = String(code || '').trim().toUpperCase();
+  const normalizedCode = String(code || '')
+    .trim()
+    .toUpperCase();
   if (!normalizedCode) return '';
+
+  const englishName = englishCountryName(normalizedCode) || normalizedCode;
+
+  if (!locale || locale === 'en') {
+    return englishName;
+  }
 
   try {
     const localized = displayNamesForLocale(locale).of(normalizedCode);
@@ -56,7 +65,7 @@ export function getLocalizedCountryName(code: string, locale: string): string {
     // Fall through to the static English name/ISO code for unsupported runtimes or locales.
   }
 
-  return englishCountryName(normalizedCode) || normalizedCode;
+  return englishName;
 }
 
 /** Match localized names plus English names, ISO codes, currencies, and locale identifiers. */
@@ -74,7 +83,10 @@ export function countryMatchesQuery(country: Country, query: string, locale: str
 }
 
 /** Sort countries by their localized display name while keeping IN and AR pinned first. */
-export function sortCountriesByLocalizedName(countries: readonly Country[], locale: string): Country[] {
+export function sortCountriesByLocalizedName(
+  countries: readonly Country[],
+  locale: string,
+): Country[] {
   const pinned = ['IN', 'AR'];
   const pinIndex = (code: string) => {
     const index = pinned.indexOf(code);
