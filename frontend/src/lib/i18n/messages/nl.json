@@ -475,7 +475,9 @@
     "partialCost": "Gedeeltelijke kostprijs",
     "ingredientCostLabel": "Kostprijs: {amount}",
     "profitMarginLabel": "Winst: {profit} ({margin})",
-    "dailySalesWhatsAppTitle": "Dagelijks verkooprapport"
+    "dailySalesWhatsAppTitle": "Dagelijks verkooprapport",
+    "exportMonthlyVatLabel": "Btw-rapport",
+    "exportMonthlyVat": "Maandelijkse btw-facturen (Excel) — {month}"
   },
   "diagnosticsPrompt": {
     "body": "FactorPOS heeft {count, plural, one {# probleem} other {# problemen}} op dit apparaat vastgelegd. Foutrapporten automatisch versturen? Ze helpen ons fouten in FactorPOS te vinden en bevatten geen klant- of betaalgegevens.",

@@ -475,7 +475,9 @@
     "partialCost": "일부 원가 반영",
     "ingredientCostLabel": "원가: {amount}",
     "profitMarginLabel": "이익: {profit} ({margin})",
-    "dailySalesWhatsAppTitle": "일일 매출 보고서"
+    "dailySalesWhatsAppTitle": "일일 매출 보고서",
+    "exportMonthlyVatLabel": "부가가치세 보고서",
+    "exportMonthlyVat": "월별 부가가치세 송장 (Excel) — {month}"
   },
   "diagnosticsPrompt": {
     "body": "FloCafe가 이 기기에서 {count, plural, other {#건의 문제}}를 기록했습니다. 오류 보고서를 자동으로 보낼까요? 보고서는 FloCafe의 버그를 찾는 데 도움이 되며 고객이나 결제 데이터는 들어 있지 않습니다.",

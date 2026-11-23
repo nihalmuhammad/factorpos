@@ -475,7 +475,9 @@
     "partialCost": "Bahagyang gastos",
     "ingredientCostLabel": "Gastos: {amount}",
     "profitMarginLabel": "Tubo: {profit} ({margin})",
-    "dailySalesWhatsAppTitle": "Ulat ng Pang-araw-araw na Benta"
+    "dailySalesWhatsAppTitle": "Ulat ng Pang-araw-araw na Benta",
+    "exportMonthlyVatLabel": "Ulat ng VAT",
+    "exportMonthlyVat": "Buwanang mga invoice ng VAT (Excel) — {month}"
   },
   "diagnosticsPrompt": {
     "body": "May {count, plural, one {# problemang} other {# problemang}} na naitala ang FactorPOS sa device na ito. Awtomatikong ipadala ang mga ulat ng error? Tinutulungan nila kaming makahanap ng mga bug sa FactorPOS at wala silang data ng customer o bayad.",

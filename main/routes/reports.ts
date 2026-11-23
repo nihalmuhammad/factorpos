@@ -68,6 +68,14 @@ import {
   serializeCustomerSalesXlsx,
 } from '../services/customer-sales-export';
 import {
+  buildMonthlyVatDataset,
+  monthlyVatExportFilename,
+  MonthlyVatExportValidationError,
+  resolveMonthlyVatBasis,
+  resolveMonthRange,
+  serializeMonthlyVatXlsx,
+} from '../services/monthly-vat-export';
+import {
   serializeXReportCsv,
   serializeXReportHtml,
   serializeXReportXlsx,
@@ -2155,6 +2163,35 @@ router.get(
         return res.status(400).json({ error: error.message });
       }
       console.error('[API] Customer sales export error:', error);
+      res.status(500).json({ error: 'Internal server error' });
+    }
+  },
+);
+
+// FactorPOS: owner-only monthly VAT invoice report (xlsx). One month per request.
+router.get(
+  '/monthly-vat/export',
+  requirePermission('reports.daily-sales.export'),
+  async (req: Request, res: Response) => {
+    try {
+      const { month } = resolveMonthRange(req.query.month);
+      const basis = resolveMonthlyVatBasis(req.query.basis);
+      const dataset = buildMonthlyVatDataset({ month, basis });
+      res.setHeader(
+        'Content-Type',
+        'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      );
+      res.setHeader(
+        'Content-Disposition',
+        `attachment; filename="${monthlyVatExportFilename(month)}"`,
+      );
+      return res.send(await serializeMonthlyVatXlsx(dataset));
+    } catch (error: unknown) {
+      res.locals.postHogError = error;
+      if (error instanceof MonthlyVatExportValidationError) {
+        return res.status(400).json({ error: error.message });
+      }
+      console.error('[API] Monthly VAT export error:', error);
       res.status(500).json({ error: 'Internal server error' });
     }
   },

@@ -95,6 +95,19 @@ See [API.md § GET `/api/reports/daily-sales/export`](api.md#get-apireportsdaily
 - **`bill_total`** is set on the first item row of each bill only, so summing the column equals the sum of bill totals. Walk-in bills have blank customer columns. Refunds are not reflected.
 - **Code:** `main/services/customer-sales-export.ts` builds and serializes; `main/routes/reports.ts` validates and sets headers.
 
+## Monthly VAT invoice report (FactorPOS)
+
+`GET /api/reports/monthly-vat/export?month=YYYY-MM` returns one `xlsx` workbook for the month, for the VAT return and the external VAT accountant. Same permission as the daily sales export (`reports.daily-sales.export`, owner by default). It reads paid bills and refunds only.
+
+- **Month boundaries:** `basis=calendar` (default) uses midnight to midnight in the store timezone, which matches the invoice date. `basis=business_day` uses the store's `business_day_start_time` instead, so a sale at 02:00 on the 1st with a 04:00 day close counts in the previous month.
+- **Invoices:** every bill with `paid_at` in the month. `amount_before_vat = total - round_off - tax_amount`, `vat_amount = tax_amount`, `total_with_vat = total - round_off`; round-off is shown separately because it is not taxable supply. `effective_vat_percent` is computed from those two amounts. `refunded_amount` sums every refund on the bill, whatever its date.
+- **Credit notes:** one row per refund with `created_at` in the month (dated when issued, like the daily sales export). Refunds store only a VAT-inclusive amount, so the VAT is split with the VAT share of the refunded item (`vat_basis = item_ratio`) or of the whole invoice (`invoice_ratio`).
+- **Money:** all sums are taken in minor units (halalas) and converted once, so `Σ Daily.net_vat = Summary.net_vat` exactly.
+- **Sheets:** `Summary` (business name, VAT registration number, totals, net output VAT), `Invoices`, `Credit notes`, `Daily`. Every table has an English and an Arabic header row; money cells are numeric with the currency's decimals; invoice and order numbers are text.
+- **Filename:** `vat-invoices-YYYY-MM.xlsx`.
+- **Not yet ZATCA data:** columns for ICV, UUID and reporting status are added when FactorPOS signs invoices (see [ZATCA roadmap](../zatca-roadmap.md)).
+- **Code:** `main/services/monthly-vat-export.ts` builds and serializes; `main/routes/reports.ts` validates; the Dashboard export menu downloads the month of the selected period's start. Tests: `tests/monthly-vat-export.test.ts` (`npm run test:monthly-vat-export`).
+
 ## Tests
 
 - `tests/daily-sales-export.test.ts` (`npm run test:daily-sales-export`) - role gating, single-day and date-range validation (93-day cap, reversed/mixed/incomplete/invalid dates), range equivalence (`N`-day range equals sum of `N` single-day exports), business-day cutoff across multi-day ranges, XLSX sheet/metric assertions (`Summary`, `Daily`, `Taxes`, `Items`, `Payments`), per-tax-rate summary reconciliation, shared-base multi-component taxes, historical snapshot immunity to product tax changes, incomplete historical detail warnings, Payments rows (store-local time, verbatim transaction id), CSV headers and filenames, `format=html` parity with XLSX (single-day and range, non-Latin store names, HTML escaping, and large-dataset rendering without row truncation), formula neutralization, and empty-day header-only sheets.

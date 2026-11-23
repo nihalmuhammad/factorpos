@@ -475,7 +475,9 @@
     "partialCost": "పాక్షిక ఖర్చు",
     "ingredientCostLabel": "ఖర్చు: {amount}",
     "profitMarginLabel": "లాభం: {profit} ({margin})",
-    "dailySalesWhatsAppTitle": "రోజువారీ అమ్మకాల నివేదిక"
+    "dailySalesWhatsAppTitle": "రోజువారీ అమ్మకాల నివేదిక",
+    "exportMonthlyVatLabel": "వ్యాట్ నివేదిక",
+    "exportMonthlyVat": "నెలవారీ వ్యాట్ ఇన్వాయిస్లు (Excel) — {month}"
   },
   "diagnosticsPrompt": {
     "body": "FactorPOS ఈ పరికరంలో {count, plural, one {# సమస్య} other {# సమస్యలు}} నమోదు చేసింది. లోప నివేదికలను స్వయంచాలకంగా పంపాలా? అవి FactorPOS లోని బగ్లను కనుగొనడంలో మాకు సహాయపడతాయి, వాటిలో కస్టమర్ లేదా చెల్లింపు డేటా ఉండదు.",

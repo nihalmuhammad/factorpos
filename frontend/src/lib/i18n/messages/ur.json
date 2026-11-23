@@ -475,7 +475,9 @@
     "partialCost": "جزوی لاگت",
     "ingredientCostLabel": "لاگت: {amount}",
     "profitMarginLabel": "منافع: {profit} ({margin})",
-    "dailySalesWhatsAppTitle": "روزانہ فروخت کی رپورٹ"
+    "dailySalesWhatsAppTitle": "روزانہ فروخت کی رپورٹ",
+    "exportMonthlyVatLabel": "وی اے ٹی رپورٹ",
+    "exportMonthlyVat": "ماہانہ وی اے ٹی انوائسز (Excel) — {month}"
   },
   "diagnosticsPrompt": {
     "body": "FactorPOS نے اس ڈیوائس پر {count, plural, one {# مسئلہ} other {# مسائل}} ریکارڈ کیا۔ خرابی کی رپورٹیں خودکار بھیجیں؟ یہ ہمیں FactorPOS میں بگز تلاش کرنے میں مدد کرتی ہیں اور ان میں گاہک یا ادائیگی کا کوئی ڈیٹا نہیں ہوتا۔",

@@ -475,7 +475,9 @@
     "partialCost": "Costo parziale",
     "ingredientCostLabel": "Costo: {amount}",
     "profitMarginLabel": "Profitto: {profit} ({margin})",
-    "dailySalesWhatsAppTitle": "Report vendite giornaliere"
+    "dailySalesWhatsAppTitle": "Report vendite giornaliere",
+    "exportMonthlyVatLabel": "Report IVA",
+    "exportMonthlyVat": "Fatture IVA mensili (Excel) — {month}"
   },
   "diagnosticsPrompt": {
     "body": "FactorPOS ha registrato {count, plural, one {# problema} other {# problemi}} su questo dispositivo. Inviare automaticamente i rapporti di errore? Ci aiutano a trovare i bug di FactorPOS e non contengono dati di clienti o pagamenti.",

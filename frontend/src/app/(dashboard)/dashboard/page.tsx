@@ -566,6 +566,24 @@ export default function DashboardPage() {
     }
   };
 
+  // FactorPOS: monthly VAT invoice workbook for the month of the selected period's start.
+  const exportMonthlyVat = async () => {
+    if (isExporting) return;
+    setIsExporting(true);
+    const month = range.startDate.slice(0, 7);
+    try {
+      const res = await api.get('/reports/monthly-vat/export', {
+        params: { month },
+        responseType: 'blob',
+      });
+      downloadBlob(res.data as Blob, `vat-invoices-${month}.xlsx`);
+    } catch {
+      toast.error(tCommon('downloadFailed'));
+    } finally {
+      setIsExporting(false);
+    }
+  };
+
   const handleSendDailySalesWhatsApp = async (phoneE164: string): Promise<boolean> => {
     try {
       const dateParams =
@@ -950,6 +968,12 @@ export default function DashboardPage() {
               <DropdownMenuItem onSelect={() => exportCustomerSales('csv')}>
                 <FileText size={14} />
                 {t('exportCsv')}
+              </DropdownMenuItem>
+              <DropdownMenuSeparator />
+              <DropdownMenuLabel>{t('exportMonthlyVatLabel')}</DropdownMenuLabel>
+              <DropdownMenuItem onSelect={() => exportMonthlyVat()}>
+                <FileSpreadsheet size={14} />
+                {t('exportMonthlyVat', { month: range.startDate.slice(0, 7) })}
               </DropdownMenuItem>
             </DropdownMenuContent>
           </DropdownMenu>

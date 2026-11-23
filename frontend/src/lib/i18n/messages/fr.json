@@ -475,7 +475,9 @@
     "partialCost": "Coût partiel",
     "ingredientCostLabel": "Coût : {amount}",
     "profitMarginLabel": "Bénéfice : {profit} ({margin})",
-    "dailySalesWhatsAppTitle": "Rapport des ventes quotidiennes"
+    "dailySalesWhatsAppTitle": "Rapport des ventes quotidiennes",
+    "exportMonthlyVatLabel": "Rapport de TVA",
+    "exportMonthlyVat": "Factures de TVA mensuelles (Excel) — {month}"
   },
   "diagnosticsPrompt": {
     "body": "FactorPOS a enregistré {count, plural, one {# problème} other {# problèmes}} sur cet appareil. Envoyer automatiquement les rapports d'erreur ? Ils nous aident à trouver les bogues de FactorPOS et ne contiennent aucune donnée client ni de paiement.",

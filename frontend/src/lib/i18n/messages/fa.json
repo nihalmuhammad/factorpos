@@ -475,7 +475,9 @@
     "partialCost": "هزینه جزئی",
     "ingredientCostLabel": "هزینه: {amount}",
     "profitMarginLabel": "سود: {profit} ({margin})",
-    "dailySalesWhatsAppTitle": "گزارش فروش روزانه"
+    "dailySalesWhatsAppTitle": "گزارش فروش روزانه",
+    "exportMonthlyVatLabel": "گزارش مالیات بر ارزش افزوده",
+    "exportMonthlyVat": "فاکتورهای ماهانه مالیات بر ارزش افزوده (Excel) — {month}"
   },
   "diagnosticsPrompt": {
     "body": "FactorPOS روی این دستگاه {count, plural, one {# مشکل} other {# مشکل}} ثبت کرد. گزارش‌های خطا به‌صورت خودکار فرستاده شوند؟ این گزارش‌ها به ما کمک می‌کنند خطاهای FactorPOS را پیدا کنیم و هیچ دادهٔ مشتری یا پرداختی ندارند.",

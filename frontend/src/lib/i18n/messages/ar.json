@@ -475,7 +475,9 @@
     "partialCost": "تكلفة جزئية",
     "ingredientCostLabel": "التكلفة: {amount}",
     "profitMarginLabel": "الربح: {profit} ({margin})",
-    "dailySalesWhatsAppTitle": "تقرير المبيعات اليومية"
+    "dailySalesWhatsAppTitle": "تقرير المبيعات اليومية",
+    "exportMonthlyVatLabel": "تقرير ضريبة القيمة المضافة",
+    "exportMonthlyVat": "فواتير الضريبة الشهرية (Excel) — {month}"
   },
   "diagnosticsPrompt": {
     "body": "سجّل FactorPOS {count, plural, one {مشكلة واحدة} two {مشكلتين} few {# مشاكل} many {# مشكلة} other {# مشكلة}} على هذا الجهاز. هل تُرسَل تقارير الأخطاء تلقائياً؟ تساعدنا في إيجاد الأخطاء في FactorPOS ولا تحتوي على بيانات عملاء أو مدفوعات.",

@@ -475,7 +475,9 @@
     "partialCost": "Ragad sebagian",
     "ingredientCostLabel": "Ragad: {amount}",
     "profitMarginLabel": "Bathi: {profit} ({margin})",
-    "dailySalesWhatsAppTitle": "Laporan Dodolan Saben Dina"
+    "dailySalesWhatsAppTitle": "Laporan Dodolan Saben Dina",
+    "exportMonthlyVatLabel": "Laporan PPN",
+    "exportMonthlyVat": "Faktur PPN saben sasi (Excel) — {month}"
   },
   "diagnosticsPrompt": {
     "body": "FactorPOS nyathet {count, plural, other {# masalah}} ing piranti iki. Ngirim laporan kesalahan kanthi otomatis? Laporan iki mbantu kita nemokake bug ing FactorPOS lan ora ngemot data pelanggan utawa pambayaran.",

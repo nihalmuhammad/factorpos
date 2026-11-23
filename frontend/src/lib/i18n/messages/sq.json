@@ -475,7 +475,9 @@
     "partialCost": "Kosto e pjesshme",
     "ingredientCostLabel": "Kosto: {amount}",
     "profitMarginLabel": "Fitimi: {profit} ({margin})",
-    "dailySalesWhatsAppTitle": "Raporti i shitjeve ditore"
+    "dailySalesWhatsAppTitle": "Raporti i shitjeve ditore",
+    "exportMonthlyVatLabel": "Raporti i TVSH-së",
+    "exportMonthlyVat": "Faturat mujore të TVSH-së (Excel) — {month}"
   },
   "diagnosticsPrompt": {
     "body": "FactorPOS regjistroi {count, plural, one {# problem} other {# probleme}} në këtë pajisje. Të dërgohen raportet e gabimeve automatikisht? Ato na ndihmojnë të gjejmë gabime në FactorPOS dhe nuk përmbajnë të dhëna klientësh ose pagesash.",

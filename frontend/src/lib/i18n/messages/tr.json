@@ -475,7 +475,9 @@
     "partialCost": "Kısmi maliyet",
     "ingredientCostLabel": "Maliyet: {amount}",
     "profitMarginLabel": "Kâr: {profit} ({margin})",
-    "dailySalesWhatsAppTitle": "Günlük Satış Raporu"
+    "dailySalesWhatsAppTitle": "Günlük Satış Raporu",
+    "exportMonthlyVatLabel": "KDV raporu",
+    "exportMonthlyVat": "Aylık KDV faturaları (Excel) — {month}"
   },
   "diagnosticsPrompt": {
     "body": "FactorPOS bu cihazda {count, plural, one {# sorun} other {# sorun}} kaydetti. Hata raporları otomatik olarak gönderilsin mi? FactorPOS'teki hataları bulmamıza yardımcı olurlar ve müşteri veya ödeme verisi içermezler.",

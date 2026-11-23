@@ -475,7 +475,9 @@
     "partialCost": "ต้นทุนบางส่วน",
     "ingredientCostLabel": "ต้นทุน: {amount}",
     "profitMarginLabel": "กำไร: {profit} ({margin})",
-    "dailySalesWhatsAppTitle": "รายงานยอดขายรายวัน"
+    "dailySalesWhatsAppTitle": "รายงานยอดขายรายวัน",
+    "exportMonthlyVatLabel": "รายงานภาษีมูลค่าเพิ่ม",
+    "exportMonthlyVat": "ใบกำกับภาษีมูลค่าเพิ่มรายเดือน (Excel) — {month}"
   },
   "diagnosticsPrompt": {
     "body": "FactorPOS บันทึก {count, plural, other {# ปัญหา}} บนอุปกรณ์นี้ ส่งรายงานข้อผิดพลาดโดยอัตโนมัติหรือไม่ รายงานช่วยให้เราหาข้อบกพร่องใน FactorPOS และไม่มีข้อมูลลูกค้าหรือการชำระเงิน",

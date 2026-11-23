@@ -230,6 +230,7 @@ test('FactorPOS regression suites stay in npm test', () => {
     'test:raster',
     'test:shutdown-lifecycle',
     'test:factorpos-migrations',
+    'test:monthly-vat-export',
     'test:cash-closures',
     'test:country-localization',
     'test:currency',

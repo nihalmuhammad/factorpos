@@ -475,7 +475,9 @@
     "partialCost": "Часткова собівартість",
     "ingredientCostLabel": "Собівартість: {amount}",
     "profitMarginLabel": "Прибуток: {profit} ({margin})",
-    "dailySalesWhatsAppTitle": "Щоденний звіт про продажі"
+    "dailySalesWhatsAppTitle": "Щоденний звіт про продажі",
+    "exportMonthlyVatLabel": "Звіт з ПДВ",
+    "exportMonthlyVat": "Рахунки з ПДВ за місяць (Excel) — {month}"
   },
   "diagnosticsPrompt": {
     "body": "FactorPOS зафіксував {count, plural, one {# проблему} few {# проблеми} many {# проблем} other {# проблеми}} на цьому пристрої. Надсилати звіти про помилки автоматично? Вони допомагають нам знаходити помилки у FactorPOS і не містять даних про клієнтів або платежі.",

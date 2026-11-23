@@ -475,7 +475,9 @@
     "partialCost": "Частичная себестоимость",
     "ingredientCostLabel": "Себестоимость: {amount}",
     "profitMarginLabel": "Прибыль: {profit} ({margin})",
-    "dailySalesWhatsAppTitle": "Отчёт о ежедневных продажах"
+    "dailySalesWhatsAppTitle": "Отчёт о ежедневных продажах",
+    "exportMonthlyVatLabel": "Отчёт по НДС",
+    "exportMonthlyVat": "Счета с НДС за месяц (Excel) — {month}"
   },
   "diagnosticsPrompt": {
     "body": "FactorPOS зарегистрировал {count, plural, one {# проблему} few {# проблемы} many {# проблем} other {# проблемы}} на этом устройстве. Отправлять отчёты об ошибках автоматически? Они помогают нам находить ошибки в FactorPOS и не содержат данных о клиентах или платежах.",

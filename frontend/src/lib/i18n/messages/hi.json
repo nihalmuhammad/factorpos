@@ -475,7 +475,9 @@
     "partialCost": "आंशिक लागत",
     "ingredientCostLabel": "लागत: {amount}",
     "profitMarginLabel": "लाभ: {profit} ({margin})",
-    "dailySalesWhatsAppTitle": "दैनिक बिक्री रिपोर्ट"
+    "dailySalesWhatsAppTitle": "दैनिक बिक्री रिपोर्ट",
+    "exportMonthlyVatLabel": "वैट रिपोर्ट",
+    "exportMonthlyVat": "मासिक वैट इनवॉइस (Excel) — {month}"
   },
   "diagnosticsPrompt": {
     "body": "FactorPOS ने इस डिवाइस पर {count, plural, one {# समस्या} other {# समस्याएँ}} दर्ज कीं। त्रुटि रिपोर्ट अपने आप भेजें? ये हमें FactorPOS में बग ढूँढने में मदद करती हैं और इनमें ग्राहक या भुगतान का कोई डेटा नहीं होता।",

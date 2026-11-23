@@ -475,7 +475,9 @@
     "partialCost": "Teilweise Kosten",
     "ingredientCostLabel": "Kosten: {amount}",
     "profitMarginLabel": "Gewinn: {profit} ({margin})",
-    "dailySalesWhatsAppTitle": "Tagesumsatzbericht"
+    "dailySalesWhatsAppTitle": "Tagesumsatzbericht",
+    "exportMonthlyVatLabel": "MwSt.-Bericht",
+    "exportMonthlyVat": "Monatliche MwSt.-Rechnungen (Excel) — {month}"
   },
   "diagnosticsPrompt": {
     "body": "FactorPOS hat {count, plural, one {# Problem} other {# Probleme}} auf diesem Gerät aufgezeichnet. Fehlerberichte automatisch senden? Sie helfen uns, Fehler in FactorPOS zu finden, und enthalten keine Kunden- oder Zahlungsdaten.",

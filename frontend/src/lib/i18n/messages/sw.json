@@ -475,7 +475,9 @@
     "partialCost": "Gharama ya sehemu",
     "ingredientCostLabel": "Gharama: {amount}",
     "profitMarginLabel": "Faida: {profit} ({margin})",
-    "dailySalesWhatsAppTitle": "Ripoti ya Mauzo ya Kila Siku"
+    "dailySalesWhatsAppTitle": "Ripoti ya Mauzo ya Kila Siku",
+    "exportMonthlyVatLabel": "Ripoti ya VAT",
+    "exportMonthlyVat": "Ankara za VAT za mwezi (Excel) — {month}"
   },
   "diagnosticsPrompt": {
     "body": "FactorPOS ilirekodi {count, plural, one {tatizo #} other {matatizo #}} kwenye kifaa hiki. Tuma ripoti za hitilafu kiotomatiki? Zinatusaidia kupata hitilafu katika FactorPOS na hazina data ya wateja au malipo.",

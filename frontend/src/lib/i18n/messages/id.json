@@ -475,7 +475,9 @@
     "partialCost": "Biaya sebagian",
     "ingredientCostLabel": "Biaya: {amount}",
     "profitMarginLabel": "Laba: {profit} ({margin})",
-    "dailySalesWhatsAppTitle": "Laporan Penjualan Harian"
+    "dailySalesWhatsAppTitle": "Laporan Penjualan Harian",
+    "exportMonthlyVatLabel": "Laporan PPN",
+    "exportMonthlyVat": "Faktur PPN bulanan (Excel) — {month}"
   },
   "diagnosticsPrompt": {
     "body": "FactorPOS mencatat {count, plural, other {# masalah}} di perangkat ini. Kirim laporan galat secara otomatis? Laporan ini membantu kami menemukan bug di FactorPOS dan tidak berisi data pelanggan atau pembayaran.",

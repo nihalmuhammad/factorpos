@@ -475,7 +475,9 @@
     "partialCost": "பகுதிச் செலவு",
     "ingredientCostLabel": "செலவு: {amount}",
     "profitMarginLabel": "லாபம்: {profit} ({margin})",
-    "dailySalesWhatsAppTitle": "தினசரி விற்பனை அறிக்கை"
+    "dailySalesWhatsAppTitle": "தினசரி விற்பனை அறிக்கை",
+    "exportMonthlyVatLabel": "வாட் அறிக்கை",
+    "exportMonthlyVat": "மாதாந்திர வாட் விலைப்பட்டியல்கள் (Excel) — {month}"
   },
   "diagnosticsPrompt": {
     "body": "FactorPOS இந்தச் சாதனத்தில் {count, plural, one {# சிக்கல்} other {# சிக்கல்கள்}} பதிவு செய்தது. பிழை அறிக்கைகளைத் தானாக அனுப்பவா? அவை FactorPOS-இல் உள்ள பிழைகளைக் கண்டறிய எங்களுக்கு உதவுகின்றன, வாடிக்கையாளர் அல்லது கட்டணத் தரவு எதுவும் அவற்றில் இல்லை.",

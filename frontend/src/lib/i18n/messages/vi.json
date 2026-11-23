@@ -475,7 +475,9 @@
     "partialCost": "Giá vốn một phần",
     "ingredientCostLabel": "Giá vốn: {amount}",
     "profitMarginLabel": "Lợi nhuận: {profit} ({margin})",
-    "dailySalesWhatsAppTitle": "Báo cáo doanh thu hằng ngày"
+    "dailySalesWhatsAppTitle": "Báo cáo doanh thu hằng ngày",
+    "exportMonthlyVatLabel": "Báo cáo VAT",
+    "exportMonthlyVat": "Hóa đơn VAT hằng tháng (Excel) — {month}"
   },
   "diagnosticsPrompt": {
     "body": "FactorPOS đã ghi nhận {count, plural, other {# vấn đề}} trên thiết bị này. Tự động gửi báo cáo lỗi? Báo cáo giúp chúng tôi tìm lỗi trong FactorPOS và không chứa dữ liệu khách hàng hay thanh toán.",

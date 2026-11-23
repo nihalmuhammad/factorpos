@@ -475,7 +475,9 @@
     "partialCost": "一部原価のみ",
     "ingredientCostLabel": "原価: {amount}",
     "profitMarginLabel": "利益: {profit} ({margin})",
-    "dailySalesWhatsAppTitle": "日次売上レポート"
+    "dailySalesWhatsAppTitle": "日次売上レポート",
+    "exportMonthlyVatLabel": "付加価値税レポート",
+    "exportMonthlyVat": "月次の付加価値税請求書（Excel）— {month}"
   },
   "diagnosticsPrompt": {
     "body": "FactorPOS はこの端末で {count, plural, other {# 件の問題}} を記録しました。エラーレポートを自動で送信しますか？レポートは FactorPOS の不具合を見つけるのに役立ち、顧客データや支払いデータは含まれません。",

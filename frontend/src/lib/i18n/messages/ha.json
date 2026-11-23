@@ -475,7 +475,9 @@
     "partialCost": "Farashin wani ɓangare",
     "ingredientCostLabel": "Farashin samarwa: {amount}",
     "profitMarginLabel": "Riba: {profit} ({margin})",
-    "dailySalesWhatsAppTitle": "Rahoton Ciniki na Yau da Kullum"
+    "dailySalesWhatsAppTitle": "Rahoton Ciniki na Yau da Kullum",
+    "exportMonthlyVatLabel": "Rahoton VAT",
+    "exportMonthlyVat": "Takardun kuɗin VAT na wata (Excel) — {month}"
   },
   "diagnosticsPrompt": {
     "body": "FactorPOS ya rubuta {count, plural, one {matsala #} other {matsaloli #}} a wannan na'urar. A aika rahoton kuskure kai tsaye? Suna taimaka mana mu sami kurakurai a FactorPOS kuma ba su da bayanan abokin ciniki ko biyan kuɗi.",

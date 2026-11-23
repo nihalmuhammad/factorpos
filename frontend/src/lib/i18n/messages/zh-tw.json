@@ -475,7 +475,9 @@
     "partialCost": "部分已知成本",
     "ingredientCostLabel": "成本: {amount}",
     "profitMarginLabel": "利潤: {profit} ({margin})",
-    "dailySalesWhatsAppTitle": "每日銷售報表"
+    "dailySalesWhatsAppTitle": "每日銷售報表",
+    "exportMonthlyVatLabel": "加值稅報表",
+    "exportMonthlyVat": "每月加值稅發票（Excel）— {month}"
   },
   "diagnosticsPrompt": {
     "body": "FactorPOS 在這部裝置上記錄了 {count, plural, other {# 個問題}}。自動傳送錯誤報告嗎？這些報告幫助我們找出 FactorPOS 的缺陷，而且不含顧客或付款資料。",
