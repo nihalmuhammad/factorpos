@@ -56,12 +56,14 @@ Recheck the official pages before each phase; this is not tax advice.
 ## Phases
 
 ### 0. Foundations — done 2026-11-24
+
 - FactorPOS-owned migrations moved to their own name-tracked list.
 - Shop databases at FactorPOS v85 are moved back to v84 (with a backup) so
   FloCafe's own migration 85 and later still run.
 - Earlier ZATCA fork history kept as local branch `archive/zatca-fork-3.9.0`.
 
 ### 1. Catch up with FloCafe (3.9.0 → 3.14.0) — merged on branch, not released
+
 - Merged FloCafe 3.14.0 on branch `update/flocafe-3.14.0` (2026-11-24),
   following [FACTORPOS_UPSTREAM_UPDATES.md](FACTORPOS_UPSTREAM_UPDATES.md).
 - Brings FloCafe's document-tax rounding fixes, delivery features, per-staff
@@ -73,7 +75,9 @@ Recheck the official pages before each phase; this is not tax advice.
   v85 database copy) before the other shops.
 
 ### 2. Monthly VAT invoice report (Excel)
+
 Can ship before signing exists, because it reads paid bills and refunds.
+
 - Owner/manager screen: pick a month, download `.xlsx`.
 - Sheet "Invoices": one row per invoice. Columns: invoice number, date and time
   (Asia/Riyadh), order number and token, payment method, amount before VAT,
@@ -88,17 +92,20 @@ Can ship before signing exists, because it reads paid bills and refunds.
   business day vs calendar day, refunds in a later month.
 
 ### 3. Fiscal records (port from the fork)
+
 - Port the fiscal reservation, frozen snapshot and bill status commits as
   FactorPOS migrations.
 - Fit the fork's driver-collection work around FloCafe's own delivery features
   rather than adding a second delivery model.
 
 ### 4. ZATCA engine (port from the prototype)
+
 - Bill snapshot → UBL 2.1 simplified invoice XML; credit and debit notes.
 - ICV/PIH chain, invoice hash, ECDSA stamp, 9-tag QR.
 - Validate every document type with the current official SDK in CI.
 
 ### 5. Onboarding and keys
+
 - Per terminal (EGS): CSR, OTP from the FATOORA portal, compliance CSID,
   compliance checks, production CSID, renewal before expiry.
 - Private key protected on Windows (DPAPI/CNG); never in the repo, logs or
@@ -106,15 +113,18 @@ Can ship before signing exists, because it reads paid bills and refunds.
 - Settings screen showing onboarding state and certificate expiry.
 
 ### 6. Reporting worker
+
 - Durable queue in SQLite; reports each invoice right after signing; retries
   with backoff when offline.
 - Alerts before the 24-hour limit (BR-KSA-98); manager screen for warnings and
   rejections.
 
 ### 7. Receipt
+
 - Bilingual Arabic/English simplified invoice with the QR code on the 80 mm
   printer. FloCafe's printer settings do not yet offer this.
 
 ### 8. Pilot
+
 - Windows hardware tests, simulation environment at one shop, VAT adviser
   review, then production at one shop before the rest.

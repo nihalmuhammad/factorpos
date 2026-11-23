@@ -1,7 +1,7 @@
 # Writing FloCafe documentation
 
 `docs/` describes the current supported system. This file describes how to write it.
-It applies to agents and human contributors alike. See [AGENTS.md](AGENTS.md) for the short policy
+It applies to agents and human contributors alike. See `AGENTS.md` (local, untracked in FactorPOS) for the short policy
 and [docs/README.md](docs/README.md) for the index.
 
 ## 1. Purpose
@@ -133,5 +133,5 @@ Use it for a named exception, not to silence a check you disagree with. If a rul
 constant false positive, fix the rule instead.
 
 When a claim depends on runtime behaviour, run the focused test suite that covers it. The
-verification table in [AGENTS.md](AGENTS.md) lists the minimum check per change type. Do not claim
+verification table in `AGENTS.md` lists the minimum check per change type. Do not claim
 verification you did not run; report a check you could not run, and why.
