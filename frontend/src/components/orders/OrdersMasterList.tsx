@@ -7,6 +7,7 @@ import { Ltr } from '@/components/layout/Ltr';
 import { useFormatCurrency } from '@/hooks/useFormatCurrency';
 import { parseDbTimestamp, cn } from '@/lib/utils';
 import { orderStatusBadge, ORDER_TYPE_KEYS } from './OrderCard';
+import { useEdition } from '@/hooks/useEdition';
 
 function OrderTypeIcon({ type }: { type: Order['type'] }) {
   const cls = 'shrink-0 text-muted-foreground';
@@ -35,6 +36,7 @@ export function OrdersMasterList({
   onSelect: (orderId: number) => void;
   now: number;
 }) {
+  const { showsOrderToken } = useEdition(); // FactorPOS: KOT edition only
   const tOrders = useTranslations('orders');
   const tCommon = useTranslations('common');
   const fmt = useFormatCurrency();
@@ -72,7 +74,7 @@ export function OrdersMasterList({
                 <span className="font-bold text-sm text-foreground tracking-tight">
                   #<Ltr>{order.order_number}</Ltr>
                 </span>
-                {order.token_number != null && (
+                {showsOrderToken && order.token_number != null && (
                   <span className="text-xs font-semibold text-foreground">
                     TOKEN #<Ltr>{order.token_number}</Ltr>
                   </span>

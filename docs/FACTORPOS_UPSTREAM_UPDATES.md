@@ -77,7 +77,8 @@ How to resolve the usual conflicts:
 | `frontend/src/lib/i18n/languages.ts` | FloCafe's new language entries, with `selectable: false`. |
 | `main/index.ts`, `main/updater-shutdown.ts` | FloCafe's changes plus the FactorPOS app name, data folder and `backupBeforeInstall`. |
 | `main/printers/document-compact.ts`, `shared/print/document.ts`, `frontend/src/lib/printer/web-print.ts`, `frontend/src/lib/printer/receipt-encoder.ts` | The FactorPOS order-note layout and token; take FloCafe's fixes around them. |
-| `main/routes/settings.ts`, `main/routes/auth.ts`, `main/countries.ts` | Saudi defaults and Western digits. |
+| `main/routes/settings.ts`, `main/routes/auth.ts`, `main/countries.ts` | Saudi defaults and Western digits; per-edition bill format (`effectiveBillTemplateValue`, `isEditionBillTemplate`) and the tenant `edition` field. |
+| `main/routes/printers.ts`, `frontend/src/components/orders/*`, dashboard page, settings page | Per-edition bill format and token display (`useEdition`). |
 | `main/services/google-drive.ts` | `DRIVE_BACKUP_FOLDER_NAME = 'FactorPOS Backups'`: shop backups already live in that Drive folder. |
 | `main/routes/orders.ts` | The `token_number` column and `generateTokenNumber()` in order creation. |
 | `main/routes/index.ts`, `frontend/src/app/(dashboard)/settings/page.tsx` | The `/api/zatca` mount and the `ZatcaSettingsCard` on the Tax tab. |

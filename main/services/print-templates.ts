@@ -1,5 +1,7 @@
 import { getDatabase } from '../db';
 import { loadMerchantPrintTemplateRow } from './merchant-print-templates';
+import { billTemplateAllowed, defaultBillTemplate } from '../../shared/edition';
+import { currentEdition } from '../edition';
 
 // FactorPOS: 'saudi' is the Saudi simplified tax invoice with the ZATCA QR.
 export const CORE_BILL_TEMPLATES = ['classic', 'compact', 'saudi'] as const;
@@ -79,6 +81,33 @@ export function parseBillTemplateSelection(rawValue: unknown): BillTemplateSelec
 /** Canonical persistence form for a selection (stored in settings). */
 export function serializeBillTemplateSelection(selection: BillTemplateSelection): string {
   return JSON.stringify({ source: selection.source, id: selection.id });
+}
+
+/**
+ * FactorPOS: the bill template this edition prints for a stored value. The ZATCA edition
+ * always prints the Saudi simplified tax invoice; the KOT edition never does. A missing
+ * or disallowed value becomes the edition's default (ZATCA: saudi, KOT: compact).
+ */
+export function effectiveBillTemplateValue(stored: unknown): string {
+  const edition = currentEdition();
+  const selection = parseBillTemplateSelection(stored);
+  if (selection && billTemplateAllowed(edition, selection)) {
+    return typeof stored === 'string' ? stored : serializeBillTemplateSelection(selection);
+  }
+  if (
+    !selection &&
+    edition === 'kot' &&
+    (stored === undefined || stored === null || stored === '')
+  ) {
+    return 'classic'; // FloCafe's default for a till that never chose a format
+  }
+  return defaultBillTemplate(edition);
+}
+
+/** FactorPOS: whether this edition lets the customer bill use the given template. */
+export function isEditionBillTemplate(value: unknown): boolean {
+  const selection = parseBillTemplateSelection(value);
+  return Boolean(selection) && billTemplateAllowed(currentEdition(), selection!);
 }
 
 /** Upgrades any resolvable template representation to its canonical JSON format. */

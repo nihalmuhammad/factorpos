@@ -18,6 +18,8 @@ export interface Tenant {
   slug: string;
   database_name: string;
   business_type: 'restaurant';
+  /** FactorPOS edition of this till ('kot' or 'zatca'); missing on older servers. */
+  edition?: 'kot' | 'zatca';
   service_model?: 'qsr' | 'finedine';
   country: string;
   currency: string;

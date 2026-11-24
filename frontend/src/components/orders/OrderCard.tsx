@@ -57,6 +57,7 @@ import {
   type OrderPaymentBadgeStatus,
 } from '@/lib/order-payment-state';
 import PendingOrderItemEdits from './PendingOrderItemEdits';
+import { useEdition } from '@/hooks/useEdition';
 
 type OrdersKey = keyof AppConfig['Messages']['orders'];
 type WhatsAppStatusKey = keyof AppConfig['Messages']['whatsapp']['status'];
@@ -258,6 +259,7 @@ export function OrderCard({
   onRestoreItem,
   onItemEditResolved,
 }: OrderCardProps) {
+  const { showsOrderToken } = useEdition(); // FactorPOS: KOT edition only
   const tOrders = useTranslations('orders');
   const tCommon = useTranslations('common');
   const tPos = useTranslations('pos');
@@ -380,7 +382,7 @@ export function OrderCard({
             <span className="font-bold text-base text-foreground tracking-tight">
               #<Ltr>{order.order_number}</Ltr>
             </span>
-            {order.token_number != null && (
+            {showsOrderToken && order.token_number != null && (
               <span className="text-sm font-semibold text-foreground">
                 TOKEN #<Ltr>{order.token_number}</Ltr>
               </span>

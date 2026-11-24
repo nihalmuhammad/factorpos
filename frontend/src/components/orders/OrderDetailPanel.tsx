@@ -71,6 +71,7 @@ import {
   whatsappReceiptStatusBadge,
   ORDER_TYPE_KEYS,
 } from './OrderCard';
+import { useEdition } from '@/hooks/useEdition';
 
 /** Callbacks the Orders page already owns; the panel composes them and never
  * reimplements billing, checkout, cancel or refund behaviour. */
@@ -189,6 +190,7 @@ function OrderDetailContent({
   onRestoreItem,
   onItemEditResolved,
 }: OrderDetailPanelProps & { order: Order }) {
+  const { showsOrderToken } = useEdition(); // FactorPOS: KOT edition only
   const tOrders = useTranslations('orders');
   const tCommon = useTranslations('common');
   const tPos = useTranslations('pos');
@@ -329,7 +331,7 @@ function OrderDetailContent({
             <span className="font-bold text-lg text-foreground tracking-tight">
               #<Ltr>{order.order_number}</Ltr>
             </span>
-            {order.token_number != null && (
+            {showsOrderToken && order.token_number != null && (
               <span className="text-sm font-semibold text-foreground">
                 TOKEN #<Ltr>{order.token_number}</Ltr>
               </span>

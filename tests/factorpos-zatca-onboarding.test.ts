@@ -42,6 +42,8 @@ const {
   now,
   installAndActivateTestTaxPack,
 } = require('./helpers/test-setup');
+// These run as the ZATCA edition (the KOT edition has no ZATCA features).
+require('../main/edition').setEditionForTests('zatca');
 const saudiVatPack = require('../main/tax-packs/community-saudi-arabia.json');
 const { orderRoutes } = require('../main/routes/orders');
 const { billRoutes } = require('../main/routes/bills');

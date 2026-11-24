@@ -67,6 +67,7 @@ import {
   PRODUCT_ANALYTICS_LEVEL_SETTING,
   parseProductAnalyticsLevel,
 } from '../services/posthog-identity';
+import { currentEdition } from '../edition';
 
 const router = Router();
 
@@ -153,6 +154,8 @@ function buildLocalTenant(db: ReturnType<typeof getDatabase>, userId: string, us
     slug: 'local',
     database_name: 'local',
     business_type: s.business_type || 'restaurant',
+    // FactorPOS: 'kot' or 'zatca', fixed by the installer (main/edition.ts).
+    edition: currentEdition(),
     country: snapshot?.country || '',
     currency: snapshot?.currency || '',
     currency_symbol: snapshot?.currencySymbol || '',

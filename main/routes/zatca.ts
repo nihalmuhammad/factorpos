@@ -30,8 +30,16 @@ import { onboardingState, OnboardingError, runOnboarding } from '../services/zat
 import { CsrFieldError } from '../services/zatca/csr';
 import { documentsForDay, markDayReviewed, reportingSummary } from '../services/zatca/reporting';
 import { zatcaReporting } from '../services/zatca/reporting-worker';
+import { currentEdition } from '../edition';
+import { editionFeatures } from '../../shared/edition';
 
 const router = Router();
+
+// The KOT edition has no ZATCA features: every ZATCA route is absent there.
+router.use((_req, res, next) => {
+  if (editionFeatures(currentEdition()).zatca) return next();
+  res.status(404).json({ error: 'Not available in this edition', code: 'zatca_not_in_edition' });
+});
 
 /** Seller settings the screen edits, with the request field each comes from. */
 const SELLER_FIELDS = {

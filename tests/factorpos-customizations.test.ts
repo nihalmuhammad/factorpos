@@ -263,6 +263,29 @@ test('ZATCA reporting: queued with every signed document, worker runs with the a
   assert.match(read('frontend/src/app/(dashboard)/layout.tsx'), /<ZatcaReportingAlert \/>/);
 });
 
+test('editions: KOT by default; the ZATCA installer has its own identity and feed', () => {
+  assert.equal(pkg.factorposEdition, 'kot', 'the default build is the KOT edition');
+  const zatca = require('../scripts/release/electron-builder-zatca.cjs');
+  assert.equal(zatca.extraMetadata.factorposEdition, 'zatca');
+  assert.notEqual(zatca.appId, pkg.build.appId, 'own app ID: own install and data folder');
+  assert.equal(zatca.productName, 'FactorPOS ZATCA');
+  assert.equal(zatca.publish.provider, 'generic');
+  assert.match(zatca.publish.url, /\/releases\/download\/zatca-updates$/, 'own update feed');
+  assert.match(zatca.win.artifactName, /^factorpos-zatca-/);
+  assert.equal(pkg.build.publish.provider, 'github', 'KOT keeps the versioned GitHub feed');
+  for (const file of [
+    'frontend/src/app/(dashboard)/dashboard/page.tsx',
+    'frontend/src/components/orders/OrderCard.tsx',
+    'frontend/src/components/orders/OrdersMasterList.tsx',
+    'frontend/src/components/orders/OrderDetailPanel.tsx',
+  ]) {
+    assert.match(read(file), /showsOrderToken && order\.token_number != null/, file);
+  }
+  const workflow = read('.github/workflows/factorpos-release.yml');
+  assert.match(workflow, /edition: zatca/, 'the release builds the ZATCA installer');
+  assert.match(workflow, /gh release upload zatca-updates/, 'and refreshes its feed');
+});
+
 test('orders carry the day token and setup preselects Saudi Arabia', () => {
   const orders = read('main/routes/orders.ts');
   assert.match(
@@ -329,6 +352,7 @@ test('FactorPOS regression suites stay in npm test', () => {
     'test:shutdown-lifecycle',
     'test:factorpos-migrations',
     'test:factorpos-saudi-invoice',
+    'test:factorpos-editions',
     'test:factorpos-zatca-fiscal-records',
     'test:factorpos-zatca-engine',
     'test:factorpos-zatca-onboarding',

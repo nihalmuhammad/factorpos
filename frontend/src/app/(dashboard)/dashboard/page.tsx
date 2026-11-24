@@ -60,6 +60,7 @@ import { downloadBlob } from '@/lib/download';
 import { exportReportAsPdf, MenuPopupBlockedError } from '@/lib/export-pdf';
 import { SendWhatsAppReportModal } from '@/components/dashboard/SendWhatsAppReportModal';
 import { shareDailySalesViaWhatsApp } from '@/lib/whatsapp-share';
+import { useEdition } from '@/hooks/useEdition';
 
 interface PaymentMethodBreakdown {
   method: string | null;
@@ -254,6 +255,7 @@ const BUILT_IN_PAYMENT_KEYS = {
 } as const satisfies Record<'cash' | 'card', PosKey>;
 
 export default function DashboardPage() {
+  const { showsOrderToken } = useEdition(); // FactorPOS: KOT edition only
   const searchParams = useSearchParams();
   const { currentTenant } = useAuthStore();
   const t = useTranslations('dashboard');
@@ -1152,7 +1154,7 @@ export default function DashboardPage() {
                           <span className="text-sm font-medium text-foreground">
                             #<Ltr>{order.order_number}</Ltr>
                           </span>
-                          {order.token_number != null && (
+                          {showsOrderToken && order.token_number != null && (
                             <span className="text-xs font-semibold text-foreground">
                               TOKEN #<Ltr>{order.token_number}</Ltr>
                             </span>
