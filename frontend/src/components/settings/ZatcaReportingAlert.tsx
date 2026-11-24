@@ -10,6 +10,7 @@ import api from '@/lib/api';
 import { tenantCan } from '@/lib/permissions';
 import { useAuthStore } from '@/store/auth';
 import { useZatcaText } from './zatca-text';
+import { useEdition } from '@/hooks/useEdition';
 
 const POLL_MS = 5 * 60_000;
 
@@ -22,7 +23,8 @@ interface Summary {
 export function ZatcaReportingAlert() {
   const zt = useZatcaText();
   const tenant = useAuthStore((s) => s.currentTenant);
-  const enabled = tenant?.country === 'SA' && tenantCan(tenant, 'reports.view');
+  const { zatca } = useEdition();
+  const enabled = zatca && tenantCan(tenant, 'reports.view');
   const [summary, setSummary] = useState<Summary | null>(null);
 
   useEffect(() => {

@@ -17,6 +17,8 @@ import { creditNoteInput, invoiceInput, ZatcaDocumentError } from './zatca/docum
 import { FIRST_PREVIOUS_INVOICE_HASH, signZatcaDocument } from './zatca/signing';
 import type { ZatcaDocumentInput } from './zatca/xml';
 import { enqueueReport } from './zatca/reporting';
+import { currentEdition } from '../edition';
+import { editionFeatures } from '../../shared/edition';
 
 type Database = ReturnType<typeof getDatabase>;
 
@@ -65,6 +67,8 @@ function hasFiscalTables(db: Database): boolean {
 
 /** The active ZATCA environment, or null when issuance is switched off. */
 export function activeZatcaEnvironment(db: Database): ZatcaEnvironment | null {
+  // The KOT edition never issues ZATCA documents, whatever the stored setting says.
+  if (!editionFeatures(currentEdition()).zatca) return null;
   if (!hasFiscalTables(db)) return null;
   const value = setting(db, 'zatca_environment') || 'disabled';
   if (value === 'disabled') return null;

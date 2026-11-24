@@ -54,6 +54,7 @@ interface ZatcaOverview {
   environment: string;
   seller: Record<SellerKey, string> & { name: string; vat_number: string };
   seller_check: { complete: boolean; problem: string | null };
+  vat_check?: { ok: boolean; problem: string | null };
   onboarding: {
     status: OnboardingStatus;
     egsUuid: string | null;
@@ -336,11 +337,18 @@ export function ZatcaSettingsCard({ canManage = false }: { canManage?: boolean }
           <Button
             variant={issuing ? 'outline' : 'default'}
             onClick={() => setEnvironment(issuing ? 'disabled' : 'simulation')}
-            disabled={!canManage || busy !== null || (!issuing && status !== 'active')}
+            disabled={
+              !canManage ||
+              busy !== null ||
+              (!issuing && (status !== 'active' || data.vat_check?.ok === false))
+            }
           >
             {busy === 'environment' ? <Loader2 className="size-4 animate-spin" /> : null}
             {issuing ? zt('switchOff') : zt('switchOn')}
           </Button>
+          {!issuing && data.vat_check?.ok === false && (
+            <p className="text-xs text-amber-700 dark:text-amber-400">{zt('vatRequired')}</p>
+          )}
           <p className="text-xs text-muted-foreground">{zt('productionNote')}</p>
         </section>
       </CardContent>

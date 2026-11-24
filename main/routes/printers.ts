@@ -73,6 +73,7 @@ import {
   RegionalNotConfiguredError,
 } from '../countries';
 import { asyncHandler } from '../middleware/async-handler';
+import { effectiveBillTemplateValue } from '../services/print-templates';
 import { getHttpRequestSignal } from '../shutdown';
 
 const router = Router();
@@ -1233,7 +1234,8 @@ router.post(
         receipt_logo_raster: settings.receipt_logo_raster || '',
         footer_note: settings.bill_footer_message || '',
       };
-      const billTemplate = settings.bill_template;
+      // FactorPOS: the format this edition prints (ZATCA: Saudi invoice only).
+      const billTemplate = effectiveBillTemplateValue(settings.bill_template);
       // Resolves primary and optional secondary receipt languages from tenant policy.
       const receiptLanguages = resolveTenantReceiptLanguages(db);
       console.log('[Print Bill] Preparing receipt', { template: billTemplate || 'classic' });

@@ -3,9 +3,14 @@
 # ---------------------------------------------------------------
 # Push a tag `vX.Y.Z` (all shops) or `vX.Y.Z-beta.N` (pilot PC with the beta
 # channel switched on) whose version matches package.json. The workflow runs
-# the full test suite, builds the unsigned NSIS installer, smoke-tests an
-# install on Windows, and publishes a GitHub Release that the in-app updater
-# reads (latest.yml for stable, beta.yml for beta).
+# the full test suite, builds the unsigned NSIS installer of each edition
+# (shared/edition.ts), smoke-tests an install of each on Windows, and publishes:
+#   - KOT edition ("FactorPOS"): the versioned GitHub Release, which its in-app
+#     updater reads (latest.yml for stable, beta.yml for beta);
+#   - ZATCA edition ("FactorPOS ZATCA"): its installer is attached to the same
+#     release for download, and its update files go to the fixed prerelease
+#     `zatca-updates`, the only feed a ZATCA till reads
+#     (scripts/editions/electron-builder-zatca.cjs).
 #
 # Tags start with "v" on purpose: upstream FloCafe's release.yml triggers on
 # tags starting with a digit and builds for platforms FactorPOS doesn't ship.
@@ -104,10 +109,26 @@ jobs:
         run: xvfb-run -a --server-args='-screen 0 1280x800x24' npm test
 
   build-windows:
-    name: Build and smoke-test Windows installer
+    name: Build and smoke-test Windows installer (${{ matrix.edition }})
     needs: [metadata, test]
     runs-on: windows-latest
     timeout-minutes: 40
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - edition: kot
+            builder-config: ''
+            prefix: factorpos
+            product: FactorPOS
+            artifact: factorpos-release-files
+            sums: SHA256SUMS.txt
+          - edition: zatca
+            builder-config: --config scripts/editions/electron-builder-zatca.cjs
+            prefix: factorpos-zatca
+            product: FactorPOS ZATCA
+            artifact: factorpos-zatca-release-files
+            sums: SHA256SUMS-zatca.txt
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -156,7 +177,7 @@ jobs:
       - name: Build unsigned NSIS installer
         # bash: pwsh mangles the -c.publish.channel=... argument.
         shell: bash
-        run: npx electron-builder --win nsis --x64 --publish never --config.npmRebuild=false -c.publish.channel="${{ needs.metadata.outputs.channel }}"
+        run: npx electron-builder ${{ matrix.builder-config }} --win nsis --x64 --publish never --config.npmRebuild=false -c.publish.channel="${{ needs.metadata.outputs.channel }}"
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: false
 
@@ -165,8 +186,9 @@ jobs:
         env:
           VERSION: ${{ needs.metadata.outputs.version }}
           CHANNEL: ${{ needs.metadata.outputs.channel }}
+          PREFIX: ${{ matrix.prefix }}
         run: |
-          $exe = "release\factorpos-$env:VERSION-win-x64.exe"
+          $exe = "release\$env:PREFIX-$env:VERSION-win-x64.exe"
           foreach ($file in @($exe, "$exe.blockmap", "release\$env:CHANNEL.yml")) {
             if (-not (Test-Path $file)) { throw "Missing release file: $file" }
           }
@@ -181,16 +203,25 @@ jobs:
         shell: pwsh
         env:
           VERSION: ${{ needs.metadata.outputs.version }}
+          PREFIX: ${{ matrix.prefix }}
+          PRODUCT: ${{ matrix.product }}
+          EDITION: ${{ matrix.edition }}
         run: |
-          $installer = Get-Item "release\factorpos-$env:VERSION-win-x64.exe"
+          $installer = Get-Item "release\$env:PREFIX-$env:VERSION-win-x64.exe"
           $install = Start-Process -FilePath $installer.FullName -ArgumentList '/S' -PassThru -Wait
           if ($install.ExitCode -ne 0) { throw "Silent install failed with exit code $($install.ExitCode)." }
 
-          $app = Get-ChildItem "$env:LOCALAPPDATA\Programs" -Filter 'FactorPOS.exe' -File -Recurse | Select-Object -First 1
-          if ($null -eq $app) { throw 'Installed FactorPOS.exe was not found.' }
+          $app = Get-ChildItem "$env:LOCALAPPDATA\Programs" -Filter "$env:PRODUCT.exe" -File -Recurse | Select-Object -First 1
+          if ($null -eq $app) { throw "Installed $env:PRODUCT.exe was not found." }
           $updateConfig = Join-Path $app.DirectoryName 'resources\app-update.yml'
           if (-not (Test-Path $updateConfig)) { throw "Installed app has no updater config at $updateConfig" }
           Get-Content $updateConfig
+          if ($env:EDITION -eq 'zatca' -and -not (Select-String -Path $updateConfig -Pattern 'zatca-updates' -Quiet)) {
+            throw 'The ZATCA edition must update only from the zatca-updates feed.'
+          }
+          if ($env:EDITION -eq 'kot' -and (Select-String -Path $updateConfig -Pattern 'zatca-updates' -Quiet)) {
+            throw 'The KOT edition must not read the ZATCA update feed.'
+          }
 
           Start-Process -FilePath $app.FullName | Out-Null
           $healthy = $false
@@ -207,26 +238,30 @@ jobs:
       - name: Stop installed app
         if: always()
         shell: pwsh
-        run: Get-Process -Name 'FactorPOS' -ErrorAction SilentlyContinue | Stop-Process -Force
+        env:
+          PRODUCT: ${{ matrix.product }}
+        run: Get-Process -Name $env:PRODUCT -ErrorAction SilentlyContinue | Stop-Process -Force
 
       - name: Write SHA-256 checksums
         shell: pwsh
         env:
           VERSION: ${{ needs.metadata.outputs.version }}
+          PREFIX: ${{ matrix.prefix }}
+          SUMS: ${{ matrix.sums }}
         run: |
-          $exe = Get-Item "release\factorpos-$env:VERSION-win-x64.exe"
+          $exe = Get-Item "release\$env:PREFIX-$env:VERSION-win-x64.exe"
           $hash = (Get-FileHash $exe.FullName -Algorithm SHA256).Hash.ToLower()
-          "$hash  $($exe.Name)" | Out-File -FilePath 'release\SHA256SUMS.txt' -Encoding ascii
+          "$hash  $($exe.Name)" | Out-File -FilePath "release\$env:SUMS" -Encoding ascii
 
       - name: Upload release files
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: factorpos-release-files
+          name: ${{ matrix.artifact }}
           path: |
-            release/factorpos-${{ needs.metadata.outputs.version }}-win-x64.exe
-            release/factorpos-${{ needs.metadata.outputs.version }}-win-x64.exe.blockmap
-            release/${{ needs.metadata.outputs.channel }}.yml
-            release/SHA256SUMS.txt
+            release/${{ matrix.prefix }}-${{ needs.metadata.outputs.version }}-win-x64.exe
+            release/${{ matrix.prefix }}-${{ needs.metadata.outputs.version }}-win-x64.exe.blockmap
+            release/*.yml
+            release/${{ matrix.sums }}
           if-no-files-found: error
           retention-days: 7
 
@@ -243,10 +278,17 @@ jobs:
           name: factorpos-release-files
           path: release
 
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: factorpos-zatca-release-files
+          path: release-zatca
+
       - name: Create release
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
+          VERSION: ${{ needs.metadata.outputs.version }}
+          CHANNEL: ${{ needs.metadata.outputs.channel }}
           PRERELEASE: ${{ needs.metadata.outputs.prerelease }}
         run: |
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
@@ -258,9 +300,39 @@ jobs:
           else
             FLAGS=(--latest)
           fi
-          gh release create "$TAG" release/* \
+          # KOT edition: installer and its update file. ZATCA edition: installer only
+          # (its update files live in the zatca-updates feed, below).
+          gh release create "$TAG" \
+            "release/factorpos-$VERSION-win-x64.exe" \
+            "release/factorpos-$VERSION-win-x64.exe.blockmap" \
+            "release/$CHANNEL.yml" \
+            release/SHA256SUMS.txt \
+            "release-zatca/factorpos-zatca-$VERSION-win-x64.exe" \
+            release-zatca/SHA256SUMS-zatca.txt \
             --repo "$GITHUB_REPOSITORY" \
             --title "FactorPOS $TAG" \
             --generate-notes \
             --verify-tag \
             "${FLAGS[@]}"
+
+      - name: Refresh the ZATCA edition update feed
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.metadata.outputs.version }}
+        run: |
+          # A fixed prerelease whose tag is not a version, so the KOT edition's updater
+          # never picks it; ZATCA tills read latest.yml / beta.yml from it.
+          if ! gh release view zatca-updates --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create zatca-updates \
+              --repo "$GITHUB_REPOSITORY" \
+              --prerelease --latest=false \
+              --target "$GITHUB_SHA" \
+              --title "FactorPOS ZATCA update feed" \
+              --notes "Update feed for the FactorPOS ZATCA edition. Download installers from the versioned releases."
+          fi
+          # Installer first, then the update files that point at it.
+          gh release upload zatca-updates \
+            "release-zatca/factorpos-zatca-$VERSION-win-x64.exe" \
+            "release-zatca/factorpos-zatca-$VERSION-win-x64.exe.blockmap" \
+            --repo "$GITHUB_REPOSITORY" --clobber
+          gh release upload zatca-updates release-zatca/*.yml --repo "$GITHUB_REPOSITORY" --clobber

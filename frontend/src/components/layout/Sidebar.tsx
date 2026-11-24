@@ -62,6 +62,7 @@ import {
   SidebarRail,
   useSidebar,
 } from '@/components/ui/sidebar';
+import { editionFeatures, normalizeEdition } from '@shared/edition';
 
 // Leaf keys of the `nav` message namespace (use-intl resolves leaf keys
 // within the namespace scope, so no dotted keys).
@@ -121,7 +122,7 @@ const ALL_NAV_ITEMS: NavItem[] = [
     businessTypes: null,
   },
   {
-    // FactorPOS: ZATCA invoice review (Saudi shops).
+    // FactorPOS: ZATCA invoice review (ZATCA edition).
     href: '/zatca',
     labelKey: 'zatca',
     icon: FileBadge,
@@ -208,7 +209,8 @@ export default function AppSidebar() {
     if (item.href === '/settings?tab=kds' && !kdsEnabled) return false;
     // WhatsApp integration not enabled on this tenant → hide the nav entry.
     if (item.href === '/whatsapp' && !whatsappEnabled) return false;
-    if (item.href === '/zatca' && currentTenant?.country !== 'SA') return false;
+    if (item.href === '/zatca' && !editionFeatures(normalizeEdition(currentTenant?.edition)).zatca)
+      return false;
     const permitted =
       item.href === '/staff'
         ? tenantCan(currentTenant, 'staff.view') || tenantCan(currentTenant, 'authorization.manage')

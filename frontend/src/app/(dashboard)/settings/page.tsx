@@ -85,6 +85,8 @@ import { CurrencyResetDialog } from '@/components/settings/CurrencyResetDialog';
 import { WhatsAppEnableCard } from '@/components/settings/WhatsAppEnableCard';
 import { TaxConfigurationPanel } from '@/components/settings/TaxConfigurationPanel';
 import { ZatcaSettingsCard } from '@/components/settings/ZatcaSettingsCard';
+import { useEdition } from '@/hooks/useEdition';
+import { billTemplateAllowed } from '@shared/edition';
 import { PaymentMethodsSettings } from '@/components/settings/PaymentMethodsSettings';
 import { ChargesSettingsCard } from '@/components/settings/ChargesSettingsCard';
 import {
@@ -1995,7 +1997,12 @@ export default function SettingsPage() {
   const [billForm, setBillForm] = useState<BillTemplateForm>(initBillTemplate);
   const [savedBillForm, setSavedBillForm] = useState<BillTemplateForm>(initBillTemplate);
   const billFormRef = useRef(billForm);
-  const [billTemplateCards, setBillTemplateCards] = useState<TemplateCard[]>(TEMPLATE_CARDS);
+  const { edition, zatca: editionZatca } = useEdition(); // FactorPOS
+  const [billTemplateCards, setBillTemplateCards] = useState<TemplateCard[]>(() =>
+    TEMPLATE_CARDS.filter((card) =>
+      billTemplateAllowed(edition, { source: card.selectionSource, id: card.id }),
+    ),
+  );
   const saveBillTemplate = async (silent: boolean = false) => {
     if (!isAdmin) return;
     posSettings.setBillTemplate(billForm.billTemplate);
@@ -2969,7 +2976,10 @@ export default function SettingsPage() {
                   : ('billTemplateMerchantCreated' as const),
           }),
         );
-      const cards = [...TEMPLATE_CARDS, ...pluginCards, ...merchantCards];
+      // FactorPOS: only the formats this edition prints (ZATCA: Saudi invoice only).
+      const cards = [...TEMPLATE_CARDS, ...pluginCards, ...merchantCards].filter((card) =>
+        billTemplateAllowed(edition, { source: card.selectionSource, id: card.id }),
+      );
       setBillTemplateCards(cards);
       let storedId: unknown = templateResponse?.data.setting?.value;
       let storedSource: string | null = null;
@@ -5056,8 +5066,8 @@ export default function SettingsPage() {
                 canManageSettings={isAdmin}
                 canManageTaxConfiguration={canManageTaxConfiguration}
               />
-              {/* FactorPOS: ZATCA e-invoicing for Saudi shops. */}
-              {currentTenant?.country === 'SA' && (
+              {/* FactorPOS: ZATCA e-invoicing (ZATCA edition). */}
+              {editionZatca && (
                 <div className="mt-6">
                   <ZatcaSettingsCard canManage={canManageTaxConfiguration} />
                 </div>

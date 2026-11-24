@@ -49,6 +49,8 @@ import { capturePostHogException, startPostHog, stopPostHog } from './services/p
 import { googleDrive } from './services/google-drive';
 import { localBackup, SESSION_BACKUP_MIN_AGE_MS } from './services/local-backup';
 import { zatcaReporting } from './services/zatca/reporting-worker';
+import { currentEdition } from './edition';
+import { editionFeatures, editionProductName } from '../shared/edition';
 import {
   closeStatus,
   closeStatusWhenSeen,
@@ -720,7 +722,7 @@ async function showRuntimeStuckDialog(reason: string): Promise<void> {
 
   await dialog.showMessageBox({
     type: 'info',
-    title: 'FactorPOS',
+    title: editionProductName(currentEdition()), // FactorPOS or FactorPOS ZATCA
     message:
       'Diagnostic captured. If sharing is enabled and this device is online, it will be sent automatically.',
     buttons: ['Quit'],
@@ -1598,7 +1600,8 @@ async function initialize(): Promise<void> {
       startPostHog();
       googleDrive.start();
       localBackup.start();
-      zatcaReporting.start(); // FactorPOS: report signed ZATCA documents
+      // FactorPOS: report signed ZATCA documents (ZATCA edition only).
+      if (editionFeatures(currentEdition()).zatca) zatcaReporting.start();
 
       console.log('[Flo] Starting KDS server on port 3002...');
       await startKdsServer();

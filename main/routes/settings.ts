@@ -72,7 +72,9 @@ import { MAX_PDF_HTML_BYTES, renderHtmlToPdfBuffer } from '../services/html-to-p
 import { isPosCategorySort, isPosItemSort, readPosSortSettings } from '../lib/pos-sort';
 import {
   CORE_BILL_TEMPLATES,
+  effectiveBillTemplateValue,
   isAvailableBillTemplate,
+  isEditionBillTemplate,
   listInstalledPrintTemplates,
   upgradeBillTemplateValue,
 } from '../services/print-templates';
@@ -300,7 +302,7 @@ function businessShape(s: Record<string, string>) {
     receipt_logo: s.receipt_logo || '',
     receipt_logo_raster: s.receipt_logo_raster || '',
     bill_footer_message: s.bill_footer_message || '',
-    bill_template: s.bill_template || 'classic',
+    bill_template: effectiveBillTemplateValue(s.bill_template), // FactorPOS: per edition
     currency_display: resolveStoredLocalePreference(
       'currency_display',
       s.currency_display,
@@ -2383,6 +2385,11 @@ router.get(
         }
         return res.status(404).json({ error: 'Setting not found' });
       }
+      if (key === 'bill_template') {
+        // FactorPOS editions: report the format this edition actually prints.
+        const row = setting as { value: string };
+        return res.json({ setting: { ...row, value: effectiveBillTemplateValue(row.value) } });
+      }
       res.json({ setting });
     } catch (error: any) {
       res.locals.postHogError = error;
@@ -2408,6 +2415,13 @@ router.put(
       // Upgrades legacy string values to canonical structured JSON on save.
       if (req.params.key === 'bill_template' && !isAvailableBillTemplate(value)) {
         return res.status(400).json({ error: 'Unsupported bill template' });
+      }
+      // FactorPOS editions: ZATCA prints only the Saudi tax invoice; KOT never does.
+      if (req.params.key === 'bill_template' && !isEditionBillTemplate(value)) {
+        return res.status(400).json({
+          error: 'This edition of FactorPOS cannot use that bill format',
+          code: 'bill_template_not_in_edition',
+        });
       }
       if (req.params.key === 'theme_mode' && !isThemeMode(value)) {
         return res.status(400).json({ error: 'Invalid theme_mode value' });

@@ -132,6 +132,14 @@ Covered by `npm run test:factorpos-dashboard-performance`.
   integration e-invoicing must keep issuing tax invoices from their compliant system
   until production. Only the Saudi renderers read the signed invoice; classic and
   compact bills are unchanged.
+- Editions (`shared/edition.ts`, `main/edition.ts`, `frontend/src/hooks/useEdition.ts`):
+  `factorposEdition` in the packaged package.json, `kot` by default and `zatca` in the
+  installer built with `scripts/editions/electron-builder-zatca.cjs`. The edition decides
+  the bill formats (`effectiveBillTemplateValue` / `isEditionBillTemplate` in
+  `main/services/print-templates.ts`, read in `main/routes/settings.ts` and
+  `main/routes/printers.ts`), the token on the order screens, and every ZATCA feature
+  (`activeZatcaEnvironment`, the `/api/zatca` routes, the reporting worker, sidebar,
+  alert bar and settings card). Kitchen KOT printing is the same in both.
 - ZATCA fiscal records (`main/services/zatca-fiscal.ts`, FactorPOS migration
   `2026-11-24-zatca-fiscal-records`): off unless `zatca_environment` is `simulation`.
   Hooks: `recordFiscalInvoiceIfPaid` in `main/routes/bills.ts` (four paid paths) and

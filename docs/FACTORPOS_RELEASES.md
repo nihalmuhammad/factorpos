@@ -8,6 +8,21 @@ install". Nothing installs until someone chooses **Install Windows POS
 Update → Restart Now** and enters the Master PIN, so updates can wait until
 the shop is closed.
 
+## Editions
+
+Each release builds two Windows installers from the same code (`shared/edition.ts`):
+
+| Edition | Installer | Customer bill | Updates from |
+|---|---|---|---|
+| KOT (existing shops) | `factorpos-<version>-win-x64.exe`, app "FactorPOS" | Compact token ORDER NOTE (or classic); token on screens; no ZATCA | The versioned release (`latest.yml` / `beta.yml`) |
+| ZATCA | `factorpos-zatca-<version>-win-x64.exe`, app "FactorPOS ZATCA" | ZATCA Phase 2 simplified tax invoice only; no token; ZATCA settings, review page and alerts | The fixed prerelease `zatca-updates` (its own `latest.yml` / `beta.yml`) |
+
+Both print kitchen KOT tickets the same way. The editions are separate apps: own app
+ID, install folder, data folder (`%APPDATA%\factorpos` and `%APPDATA%\FactorPOS ZATCA`)
+and update feed, so a till never changes edition on update. Install one edition per
+PC: both use port 3001. Moving a shop to the other edition means a fresh install of
+that edition (its data starts empty).
+
 ## What happens when an update is installed
 
 1. The Master PIN is checked.
@@ -79,7 +94,8 @@ binary.
 
 ## Installing or reinstalling by hand
 
-From the release page, download `factorpos-<version>-win-x64.exe` and run it.
+From the release page, download `factorpos-<version>-win-x64.exe` (KOT edition) or
+`factorpos-zatca-<version>-win-x64.exe` (ZATCA edition) and run it.
 Installers are **unsigned** for now, so Windows SmartScreen shows
 "Windows protected your PC": choose **More info → Run anyway**. The
 `SHA256SUMS.txt` file lists the expected checksum
@@ -92,7 +108,9 @@ each download against the SHA-512 in `latest.yml` over HTTPS.
 
 - Version: **Help → About**.
 - Updater config: `%LOCALAPPDATA%\Programs\FactorPOS\resources\app-update.yml`
-  should name `owner: nihalmuhammad` and `repo: factorpos`.
+  should name `owner: nihalmuhammad` and `repo: factorpos`. On the ZATCA edition,
+  `%LOCALAPPDATA%\Programs\FactorPOS ZATCA\resources\app-update.yml` should name the
+  `zatca-updates` URL.
 - Update log: **Help → Open Logs Folder**, then search for `[Update]`.
 
 ## Not done yet
