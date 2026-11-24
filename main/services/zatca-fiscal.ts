@@ -12,6 +12,10 @@
 import { randomUUID } from 'crypto';
 import { getDatabase, now } from '../db';
 import { getCurrencyMinorUnitFactor } from '../countries';
+import { loadSigningCredential } from './zatca/credentials';
+import { creditNoteInput, invoiceInput, ZatcaDocumentError } from './zatca/document';
+import { FIRST_PREVIOUS_INVOICE_HASH, signZatcaDocument } from './zatca/signing';
+import type { ZatcaDocumentInput } from './zatca/xml';
 
 type Database = ReturnType<typeof getDatabase>;
 
@@ -98,7 +102,79 @@ function sellerSnapshot(db: Database) {
     address: setting(db, 'business_address'),
     country: setting(db, 'country'),
     timezone: setting(db, 'timezone'),
+    // ZATCA's structured seller address and commercial registration (CRN).
+    crn: setting(db, 'zatca_seller_crn'),
+    street: setting(db, 'zatca_seller_street'),
+    building_number: setting(db, 'zatca_seller_building_number'),
+    district: setting(db, 'zatca_seller_district'),
+    city: setting(db, 'zatca_seller_city'),
+    postal_code: setting(db, 'zatca_seller_postal_code'),
   };
+}
+
+/** Local signing time (Asia/Riyadh unless the shop has another zone): yyyy-MM-ddTHH:mm:ss. */
+function signingTime(timezone: string): string {
+  const parts = new Intl.DateTimeFormat('en-GB', {
+    timeZone: timezone || 'Asia/Riyadh',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hourCycle: 'h23',
+  }).formatToParts(new Date());
+  const get = (type: string) => parts.find((part) => part.type === type)?.value ?? '';
+  return `${get('year')}-${get('month')}-${get('day')}T${get('hour')}:${get('minute')}:${get('second')}`;
+}
+
+/**
+ * Before a new fiscal document: every earlier one must be signed (the hash chain needs
+ * the previous hash), and the till must hold a signing credential.
+ */
+function prepareSigning(db: Database, environment: ZatcaEnvironment) {
+  if (db.prepare("SELECT 1 FROM zatca_fiscal_documents WHERE status != 'signed' LIMIT 1").get()) {
+    throw new FiscalConflictError(
+      'An earlier ZATCA document is not signed yet, so no new invoice can be issued. Ask a manager to review it.',
+      'zatca_unsigned_document_pending',
+    );
+  }
+  let credential;
+  try {
+    credential = loadSigningCredential(db, environment);
+  } catch (error) {
+    throw new FiscalConflictError(
+      `The ZATCA signing key could not be used: ${(error as Error).message}`,
+      'zatca_credential_unusable',
+    );
+  }
+  if (!credential) {
+    throw new FiscalConflictError(
+      'This till has no ZATCA signing certificate yet. Finish ZATCA onboarding before issuing invoices.',
+      'zatca_credential_missing',
+    );
+  }
+  const previous = db
+    .prepare('SELECT invoice_hash FROM zatca_fiscal_documents ORDER BY counter DESC LIMIT 1')
+    .get() as { invoice_hash: string | null } | undefined;
+  return { credential, previousInvoiceHash: previous?.invoice_hash || FIRST_PREVIOUS_INVOICE_HASH };
+}
+
+/** Builds and signs the document; ZATCA rule problems become 409 refusals. */
+function signDocument(
+  build: () => ZatcaDocumentInput,
+  credential: ReturnType<typeof prepareSigning>['credential'],
+  timezone: string,
+) {
+  let input: ZatcaDocumentInput;
+  try {
+    input = build();
+  } catch (error) {
+    if (error instanceof ZatcaDocumentError)
+      throw new FiscalConflictError(error.message, error.code);
+    throw error;
+  }
+  return signZatcaDocument(input, credential, signingTime(timezone));
 }
 
 function billCurrency(db: Database): string {
@@ -160,14 +236,33 @@ export function recordPaidBillInvoice(
   // VAT-inclusive invoice total excludes the non-taxable cash round-off.
   const totalWithVat = toMinor(bill.total, factor) - toMinor(bill.round_off, factor);
   const vat = toMinor(bill.tax_amount, factor);
+  const { credential, previousInvoiceHash } = prepareSigning(db, environment);
   const id = randomUUID();
   const counter = nextCounter(db);
   const createdAt = now();
+  const issuedAt = String(bill.paid_at || createdAt);
+  const seller = sellerSnapshot(db);
+  const snapshot = { seller, bill, order };
+  const signed = signDocument(
+    () =>
+      invoiceInput({
+        snapshot: snapshot as Parameters<typeof invoiceInput>[0]['snapshot'],
+        documentId: id,
+        counter,
+        previousInvoiceHash,
+        issuedAt,
+        totalWithVatMinor: totalWithVat,
+        vatMinor: vat,
+      }),
+    credential,
+    seller.timezone,
+  );
   db.prepare(
     `INSERT INTO zatca_fiscal_documents
       (id, document_type, bill_id, counter, environment, status, total_with_vat_minor, vat_minor,
-       currency, issued_at, snapshot_json, created_at)
-     VALUES (?, 'simplified_invoice', ?, ?, ?, 'recorded', ?, ?, ?, ?, ?, ?)`,
+       currency, issued_at, snapshot_json, signed_xml, invoice_hash, previous_invoice_hash,
+       qr_payload, created_at, signed_at)
+     VALUES (?, 'simplified_invoice', ?, ?, ?, 'signed', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     id,
     bill.id,
@@ -176,11 +271,16 @@ export function recordPaidBillInvoice(
     totalWithVat,
     vat,
     currency,
-    String(bill.paid_at || createdAt),
-    JSON.stringify({ seller: sellerSnapshot(db), bill, order }),
+    issuedAt,
+    JSON.stringify(snapshot),
+    signed.xml,
+    signed.invoiceHash,
+    previousInvoiceHash,
+    signed.qr,
+    createdAt,
     createdAt,
   );
-  return { id, counter, status: 'recorded' };
+  return { id, counter, status: 'signed' };
 }
 
 /**
@@ -223,14 +323,42 @@ export function recordRefundCreditNote(
     bill?: Record<string, unknown>;
   };
   const vatMinor = creditNoteVatMinor(db, refund, originalSnapshot.bill ?? {}, amountMinor, factor);
+  const { credential, previousInvoiceHash } = prepareSigning(db, environment);
   const id = randomUUID();
   const counter = nextCounter(db);
   const createdAt = now();
+  const issuedAt = String(refund.created_at || createdAt);
+  const seller = sellerSnapshot(db);
+  const itemName = refund.order_item_id
+    ? (
+        db
+          .prepare('SELECT product_name FROM order_items WHERE id = ?')
+          .get(refund.order_item_id) as { product_name?: string } | undefined
+      )?.product_name
+    : undefined;
+  const signed = signDocument(
+    () =>
+      creditNoteInput({
+        seller,
+        documentId: id,
+        counter,
+        previousInvoiceHash,
+        issuedAt,
+        originalInvoiceNumber: String(originalSnapshot.bill?.bill_number ?? ''),
+        refund,
+        itemName,
+        totalWithVatMinor: amountMinor,
+        vatMinor,
+      }),
+    credential,
+    seller.timezone,
+  );
   db.prepare(
     `INSERT INTO zatca_fiscal_documents
       (id, document_type, bill_id, refund_id, original_document_id, counter, environment, status,
-       total_with_vat_minor, vat_minor, currency, issued_at, snapshot_json, created_at)
-     VALUES (?, 'simplified_credit_note', ?, ?, ?, ?, ?, 'recorded', ?, ?, ?, ?, ?, ?)`,
+       total_with_vat_minor, vat_minor, currency, issued_at, snapshot_json, signed_xml,
+       invoice_hash, previous_invoice_hash, qr_payload, created_at, signed_at)
+     VALUES (?, 'simplified_credit_note', ?, ?, ?, ?, ?, 'signed', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     id,
     billId,
@@ -241,12 +369,17 @@ export function recordRefundCreditNote(
     amountMinor,
     vatMinor,
     currency,
-    String(refund.created_at || createdAt),
+    issuedAt,
     JSON.stringify({
-      seller: sellerSnapshot(db),
+      seller,
       original: { document_id: original.id, counter: original.counter },
       refund,
     }),
+    signed.xml,
+    signed.invoiceHash,
+    previousInvoiceHash,
+    signed.qr,
+    createdAt,
     createdAt,
   );
   return { id, counter };

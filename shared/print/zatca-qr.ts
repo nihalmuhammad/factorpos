@@ -80,6 +80,22 @@ export function encodeZatcaQr(fields: ZatcaQrFields): string {
   return base64(bytes);
 }
 
+/**
+ * TLV-encodes tags 1..n in order (Base64). Strings are UTF-8; byte arrays are used as
+ * they are (tags 8 and 9 of a signed invoice: public key and certificate signature).
+ */
+export function encodeZatcaQrTags(values: ReadonlyArray<string | Uint8Array>): string {
+  const bytes: number[] = [];
+  values.forEach((value, index) => {
+    const encoded = typeof value === 'string' ? utf8(value) : Array.from(value);
+    if (encoded.length > MAX_TLV_VALUE_BYTES) {
+      throw new Error(`ZATCA QR tag ${index + 1} is longer than ${MAX_TLV_VALUE_BYTES} bytes`);
+    }
+    bytes.push(index + 1, encoded.length, ...encoded);
+  });
+  return base64(bytes);
+}
+
 /** Decodes a ZATCA TLV Base64 string back into tag → value (for tests and checks). */
 export function decodeZatcaQr(payload: string): Map<number, string> {
   const binary =
