@@ -246,6 +246,23 @@ test('ZATCA onboarding stays mounted, simulation-only, with keys in secure stora
   );
 });
 
+test('ZATCA reporting: queued with every signed document, worker runs with the app', () => {
+  const fiscal = read('main/services/zatca-fiscal.ts');
+  assert.ok(
+    (fiscal.match(/enqueueReport\(db, id, createdAt\);/g) ?? []).length >= 2,
+    'invoices and credit notes are queued',
+  );
+  const index = read('main/index.ts');
+  assert.match(index, /zatcaReporting\.start\(\);/, 'worker starts with the app');
+  assert.match(index, /run: \(\) => zatcaReporting\.stop\(\)/, 'worker stops on shutdown');
+  assert.match(read('frontend/src/components/layout/Sidebar.tsx'), /href: '\/zatca'/);
+  assert.match(
+    read('frontend/src/components/layout/AuthGuard.tsx'),
+    /\['\/zatca', 'reports\.view'\]/,
+  );
+  assert.match(read('frontend/src/app/(dashboard)/layout.tsx'), /<ZatcaReportingAlert \/>/);
+});
+
 test('orders carry the day token and setup preselects Saudi Arabia', () => {
   const orders = read('main/routes/orders.ts');
   assert.match(
@@ -315,6 +332,7 @@ test('FactorPOS regression suites stay in npm test', () => {
     'test:factorpos-zatca-fiscal-records',
     'test:factorpos-zatca-engine',
     'test:factorpos-zatca-onboarding',
+    'test:factorpos-zatca-reporting',
     'test:monthly-vat-export',
     'test:cash-closures',
     'test:country-localization',

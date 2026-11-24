@@ -675,7 +675,8 @@
     "user": "Người dùng",
     "whatsapp": "WhatsApp",
     "inventory": "Kho",
-    "tables": "Bàn"
+    "tables": "Bàn",
+    "zatca": "Hóa đơn ZATCA"
   },
   "orders": {
     "active": "Đang hoạt động",

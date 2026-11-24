@@ -16,6 +16,7 @@ import { loadSigningCredential } from './zatca/credentials';
 import { creditNoteInput, invoiceInput, ZatcaDocumentError } from './zatca/document';
 import { FIRST_PREVIOUS_INVOICE_HASH, signZatcaDocument } from './zatca/signing';
 import type { ZatcaDocumentInput } from './zatca/xml';
+import { enqueueReport } from './zatca/reporting';
 
 type Database = ReturnType<typeof getDatabase>;
 
@@ -280,6 +281,7 @@ export function recordPaidBillInvoice(
     createdAt,
     createdAt,
   );
+  enqueueReport(db, id, createdAt);
   return { id, counter, status: 'signed' };
 }
 
@@ -382,6 +384,7 @@ export function recordRefundCreditNote(
     createdAt,
     createdAt,
   );
+  enqueueReport(db, id, createdAt);
   return { id, counter };
 }
 

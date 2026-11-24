@@ -1,7 +1,7 @@
 /**
- * FactorPOS: the FATOORA (ZATCA e-invoicing) API calls onboarding needs: compliance
- * CSID from an OTP, compliance invoice checks, production CSID. API version V2.
- * Reporting (roadmap phase 6) will add the reporting call here.
+ * FactorPOS: the FATOORA (ZATCA e-invoicing) API calls FactorPOS makes: compliance
+ * CSID from an OTP, compliance invoice checks, production CSID (onboarding, phase 5)
+ * and reporting simplified documents (phase 6). API version V2.
  */
 import type { ZatcaPortal } from './csr';
 
@@ -49,6 +49,19 @@ export interface FatooraClient {
     doc: { invoiceHash: string; uuid: string; xml: string },
   ): Promise<ComplianceCheckResult>;
   productionCsid(auth: FatooraAuth, complianceRequestId: string): Promise<IssuedCsid>;
+  /**
+   * Reports a signed simplified document. Returns ZATCA's verdict (accepted, with
+   * warnings, or rejected); throws FatooraError when there is no verdict (network,
+   * credentials, rate limit, server error), which the caller retries.
+   */
+  reportInvoice(
+    auth: FatooraAuth,
+    doc: { invoiceHash: string; uuid: string; xml: string },
+  ): Promise<ReportingResult>;
+}
+
+export interface ReportingResult extends ComplianceCheckResult {
+  httpStatus: number;
 }
 
 type FetchLike = (url: string, init: RequestInit) => Promise<Response>;
@@ -164,6 +177,30 @@ export function createFatooraClient(baseUrl: string, fetchImpl: FetchLike = fetc
       });
       if (!res.ok) throw new FatooraError(errorText(res.body, res.status), res.status);
       return issued(res.body);
+    },
+
+    async reportInvoice(auth, doc) {
+      const res = await call('/invoices/reporting/single', {
+        method: 'POST',
+        headers: { Authorization: basicAuth(auth), 'Clearance-Status': '0' },
+        body: {
+          invoiceHash: doc.invoiceHash,
+          uuid: doc.uuid,
+          invoice: Buffer.from(doc.xml, 'utf8').toString('base64'),
+        },
+      });
+      const results = res.body?.validationResults;
+      // 200 accepted, 202 accepted with warnings, 400 rejected: each carries a verdict.
+      if (!results || ![200, 202, 400, 409].includes(res.status)) {
+        throw new FatooraError(errorText(res.body, res.status), res.status);
+      }
+      return {
+        httpStatus: res.status,
+        status: String(results.status ?? ''),
+        reportingStatus: res.body?.reportingStatus ?? null,
+        errors: messages(results.errorMessages),
+        warnings: messages(results.warningMessages),
+      };
     },
   };
 }

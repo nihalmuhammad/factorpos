@@ -675,7 +675,8 @@
     "user": "Gebruiker",
     "whatsapp": "WhatsApp",
     "inventory": "Voorraad",
-    "tables": "Tafels"
+    "tables": "Tafels",
+    "zatca": "ZATCA-facturen"
   },
   "orders": {
     "active": "Actief",

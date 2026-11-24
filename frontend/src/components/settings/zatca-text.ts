@@ -2,6 +2,8 @@
 // carries English and Arabic itself instead of adding keys to all 32 FloCafe locales;
 // every other language sees English.
 
+import { useLocale } from 'use-intl';
+
 export const ZATCA_TEXT_EN = {
   title: 'ZATCA e-invoicing (Phase 2)',
   description:
@@ -67,6 +69,51 @@ export const ZATCA_TEXT_EN = {
   },
   warningsOne: '1 warning',
   warningsMany: '{count} warnings',
+  review: {
+    title: 'ZATCA invoices',
+    description:
+      'Every signed invoice and credit note is reported to ZATCA automatically. Review each day here, send waiting documents by hand, and mark the day reviewed.',
+    date: 'Day',
+    today: 'Today',
+    notEnabled: 'ZATCA invoices are not switched on. Turn them on in Settings → Tax.',
+    empty: 'No ZATCA documents were issued on this day.',
+    loading: 'Loading…',
+    counter: 'No.',
+    number: 'Document',
+    type: 'Type',
+    time: 'Time',
+    total: 'Total',
+    vat: 'VAT',
+    status: 'ZATCA',
+    invoice: 'Invoice',
+    creditNote: 'Credit note',
+    statuses: {
+      pending: 'Waiting',
+      reported: 'Reported',
+      warning: 'Reported with warnings',
+      rejected: 'Rejected',
+      review: 'Needs checking',
+    },
+    totals: 'Day totals',
+    totalsLine: '{count} documents · total {total} · VAT {vat}',
+    sendWaiting: 'Send waiting now',
+    resend: 'Send again',
+    sent: 'Sent to ZATCA',
+    markReviewed: 'Mark day reviewed',
+    reviewed: 'Reviewed by {by} at {at}',
+    reviewedToast: 'Day marked reviewed',
+    attempts: '{count} tries; next try {at}',
+    correctionHint:
+      'To correct a reported invoice, refund it from Orders: FactorPOS issues and reports the credit note. A rejected document stays issued; correct it the same way after checking the errors.',
+    genericError: 'Something went wrong. Please try again.',
+  },
+  alert: {
+    nearLimit:
+      '{count} ZATCA documents are still waiting to be reported. ZATCA requires reporting within 24 hours.',
+    overdue: '{count} ZATCA documents are past the 24-hour reporting limit.',
+    rejected: 'ZATCA rejected {count} documents. Check them and correct with a credit note.',
+    open: 'Open ZATCA invoices',
+  },
 } as const;
 
 type Shape<T> = { [K in keyof T]: T[K] extends string ? string : Shape<T[K]> };
@@ -134,4 +181,62 @@ export const ZATCA_TEXT_AR: Shape<typeof ZATCA_TEXT_EN> = {
   },
   warningsOne: 'تحذير واحد',
   warningsMany: '{count} تحذيرات',
+  review: {
+    title: 'فواتير زاتكا',
+    description:
+      'تُبلَّغ كل فاتورة وإشعار دائن موقّع إلى زاتكا تلقائيًا. راجع كل يوم هنا، وأرسل المستندات المنتظرة يدويًا، وعلّم اليوم كمراجَع.',
+    date: 'اليوم',
+    today: 'اليوم الحالي',
+    notEnabled: 'فواتير زاتكا غير مفعّلة. فعّلها من الإعدادات ← الضريبة.',
+    empty: 'لم تصدر مستندات زاتكا في هذا اليوم.',
+    loading: 'جارٍ التحميل…',
+    counter: 'الرقم',
+    number: 'المستند',
+    type: 'النوع',
+    time: 'الوقت',
+    total: 'الإجمالي',
+    vat: 'الضريبة',
+    status: 'زاتكا',
+    invoice: 'فاتورة',
+    creditNote: 'إشعار دائن',
+    statuses: {
+      pending: 'بانتظار الإرسال',
+      reported: 'تم الإبلاغ',
+      warning: 'تم الإبلاغ مع تحذيرات',
+      rejected: 'مرفوض',
+      review: 'يحتاج إلى تحقق',
+    },
+    totals: 'إجماليات اليوم',
+    totalsLine: '{count} مستند · الإجمالي {total} · الضريبة {vat}',
+    sendWaiting: 'إرسال المنتظر الآن',
+    resend: 'إعادة الإرسال',
+    sent: 'تم الإرسال إلى زاتكا',
+    markReviewed: 'تعليم اليوم كمراجَع',
+    reviewed: 'راجعه {by} في {at}',
+    reviewedToast: 'تم تعليم اليوم كمراجَع',
+    attempts: '{count} محاولات؛ المحاولة التالية {at}',
+    correctionHint:
+      'لتصحيح فاتورة مُبلَّغة، استردّها من الطلبات: يُصدر FactorPOS إشعار الدائن ويبلّغ عنه. المستند المرفوض يبقى صادرًا؛ صحّحه بالطريقة نفسها بعد مراجعة الأخطاء.',
+    genericError: 'حدث خطأ. يرجى المحاولة مرة أخرى.',
+  },
+  alert: {
+    nearLimit: '{count} من مستندات زاتكا ما زالت بانتظار الإبلاغ. تشترط زاتكا الإبلاغ خلال 24 ساعة.',
+    overdue: '{count} من مستندات زاتكا تجاوزت مهلة الإبلاغ (24 ساعة).',
+    rejected: 'رفضت زاتكا {count} مستندات. راجعها وصحّحها بإشعار دائن.',
+    open: 'فتح فواتير زاتكا',
+  },
 };
+
+/** English or Arabic ZATCA text for the current UI language; `{name}` placeholders. */
+export function useZatcaText() {
+  const locale = useLocale();
+  const text: unknown = locale.toLowerCase().startsWith('ar') ? ZATCA_TEXT_AR : ZATCA_TEXT_EN;
+  return (key: string, params: Record<string, string | number> = {}) => {
+    const value = key
+      .split('.')
+      .reduce<unknown>((node, part) => (node as Record<string, unknown> | undefined)?.[part], text);
+    let out = typeof value === 'string' ? value : key;
+    for (const [name, v] of Object.entries(params)) out = out.replace(`{${name}}`, String(v));
+    return out;
+  };
+}

@@ -675,7 +675,8 @@
     "uptimeLabel": "Çalışma Süresi",
     "user": "Kullanıcı",
     "whatsapp": "WhatsApp",
-    "inventory": "Stok"
+    "inventory": "Stok",
+    "zatca": "ZATCA faturaları"
   },
   "orders": {
     "active": "Aktif",

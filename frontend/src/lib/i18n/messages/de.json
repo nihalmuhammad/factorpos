@@ -675,7 +675,8 @@
     "user": "Benutzer",
     "whatsapp": "WhatsApp",
     "inventory": "Bestand",
-    "tables": "Tische"
+    "tables": "Tische",
+    "zatca": "ZATCA-Rechnungen"
   },
   "orders": {
     "active": "Aktiv",

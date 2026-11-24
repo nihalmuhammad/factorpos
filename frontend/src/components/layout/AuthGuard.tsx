@@ -25,6 +25,7 @@ export const LANDING_PAGE_CANDIDATES = [
   ['settings.view', '/settings'],
   ['support.use', '/support'],
   ['printers.manage', '/print-test'],
+  ['reports.view', '/zatca'], // FactorPOS: ZATCA invoice review
 ] as const;
 
 export function getLandingPage(tenant?: Tenant | null): string {
@@ -87,6 +88,7 @@ export const PAGE_PERMISSIONS = [
   ['/addon-groups', 'catalog.manage'],
   ['/inventory', 'inventory.view'],
   ['/expenses', 'expenses.view'],
+  ['/zatca', 'reports.view'], // FactorPOS: ZATCA invoice review
   ['/tables', 'tables.view'],
   ['/customers', 'customers.view'],
   ['/whatsapp', 'whatsapp.use'],

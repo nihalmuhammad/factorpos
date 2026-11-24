@@ -675,7 +675,8 @@
     "user": "ব্যবহারকারী",
     "whatsapp": "হোয়াটসঅ্যাপ",
     "inventory": "ইনভেন্টরি",
-    "tables": "টেবিল"
+    "tables": "টেবিল",
+    "zatca": "ZATCA ইনভয়েস"
   },
   "orders": {
     "active": "সক্রিয়",

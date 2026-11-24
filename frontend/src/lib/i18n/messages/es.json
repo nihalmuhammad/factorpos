@@ -675,7 +675,8 @@
     "user": "Usuario",
     "whatsapp": "WhatsApp",
     "inventory": "Inventario",
-    "tables": "Mesas"
+    "tables": "Mesas",
+    "zatca": "Facturas ZATCA"
   },
   "orders": {
     "active": "Activos",

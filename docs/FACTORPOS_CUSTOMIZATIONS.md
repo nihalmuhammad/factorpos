@@ -119,6 +119,12 @@ Covered by `npm run test:factorpos-migrations`.
   `zatca_credentials`. The settings card (`frontend/src/components/settings/ZatcaSettingsCard.tsx`)
   sits on the Tax tab for Saudi shops and carries its own English and Arabic text
   (`zatca-text.ts`) rather than adding keys to every FloCafe locale.
+- ZATCA reporting (`main/services/zatca/reporting.ts`, `reporting-worker.ts`):
+  `enqueueReport` runs inside `recordPaidBillInvoice` and `recordRefundCreditNote`; the
+  worker starts after the local backup in `main/index.ts` and stops in the shutdown
+  list. Review page `frontend/src/app/(dashboard)/zatca/page.tsx` (sidebar item
+  `nav.zatca`, route permission `reports.view` in `AuthGuard.tsx`, Saudi shops only) and
+  the deadline bar `ZatcaReportingAlert` in the dashboard layout.
 - First-run setup preselects Saudi Arabia, SAR and Asia/Riyadh, and lists the selected
   country first (`frontend/src/lib/factorpos-setup.ts`); FloCafe pins India and Argentina
   to the top, which hid the Saudi tick and made India a one-click mistake. FloCafe 3.14 no

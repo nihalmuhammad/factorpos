@@ -47,6 +47,7 @@ import { telemetry } from './services/telemetry';
 import { capturePostHogException, startPostHog, stopPostHog } from './services/posthog';
 import { googleDrive } from './services/google-drive';
 import { localBackup, SESSION_BACKUP_MIN_AGE_MS } from './services/local-backup';
+import { zatcaReporting } from './services/zatca/reporting-worker';
 import {
   closeStatus,
   closeStatusWhenSeen,
@@ -1595,6 +1596,7 @@ async function initialize(): Promise<void> {
       startPostHog();
       googleDrive.start();
       localBackup.start();
+      zatcaReporting.start(); // FactorPOS: report signed ZATCA documents
 
       console.log('[Flo] Starting KDS server on port 3002...');
       await startKdsServer();
@@ -1926,6 +1928,7 @@ const cleanupCoordinator = createShutdownCoordinator(
     { name: 'posthog', run: () => stopPostHog(), blocksDatabase: true },
     { name: 'Google Drive', run: () => googleDrive.stop(), blocksDatabase: true },
     { name: 'local backup', run: () => localBackup.stop(), blocksDatabase: true },
+    { name: 'ZATCA reporting', run: () => zatcaReporting.stop(), blocksDatabase: true },
     { name: 'WhatsApp', run: () => shutdownWhatsApp(), blocksDatabase: true },
     { name: 'shutdown backup', run: () => backupOnShutdown(), blocksDatabase: true },
     { name: 'Bonjour', run: () => stopMdns() },

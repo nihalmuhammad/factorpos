@@ -675,7 +675,8 @@
     "user": "Пользователь",
     "whatsapp": "WhatsApp",
     "inventory": "Склад",
-    "tables": "Столы"
+    "tables": "Столы",
+    "zatca": "Счета ZATCA"
   },
   "orders": {
     "active": "Активные",
