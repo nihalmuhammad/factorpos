@@ -2446,6 +2446,7 @@ function initializeDatabase(
   repairSequences();
   autoRepairPaymentDetails();
   autoRepairDefaultPrinter();
+  startQueryPlannerMaintenance();
 
   if (app.isPackaged && !process.env.FLO_E2E_DB_PATH) {
     const markerPath = getDbInitializedMarkerPath();
@@ -2585,17 +2586,42 @@ export function appendJsonArray(
   );
 }
 
+const LAST_FULL_INTEGRITY_CHECK_KEY = 'factorpos_last_full_integrity_check_at';
+const FULL_INTEGRITY_CHECK_INTERVAL_MS = 7 * 24 * 60 * 60 * 1000;
+
+/**
+ * FactorPOS: the full integrity_check reads every row of every table and index, so launch time
+ * grew with the shop's sales history. quick_check verifies the same page and b-tree structure
+ * at a fraction of the cost but skips matching each index against its table, so the full check
+ * still runs when the last clean one is more than a week old (or never recorded).
+ */
+function shouldRunFullIntegrityCheck(): boolean {
+  try {
+    const last = Date.parse(getSettingValue(LAST_FULL_INTEGRITY_CHECK_KEY) ?? '');
+    const age = Date.now() - last;
+    return !Number.isFinite(age) || age < 0 || age >= FULL_INTEGRITY_CHECK_INTERVAL_MS;
+  } catch {
+    return true;
+  }
+}
+
 /** Runs on every startup. Logs loud warnings but never throws — DB stays available even if dirty. */
 function runStartupIntegrityCheck(): void {
   try {
-    const integrity = db.prepare('PRAGMA integrity_check').all() as { integrity_check: string }[];
-    const bad = integrity.filter((r) => r.integrity_check !== 'ok');
-    if (bad.length > 0) {
-      const msg = bad.map((r) => r.integrity_check).join('; ');
-      console.error('[DB] ⚠ integrity_check reported issues:', msg);
+    const check = shouldRunFullIntegrityCheck() ? 'integrity_check' : 'quick_check';
+    const results = (db.prepare(`PRAGMA ${check}`).all() as Record<string, unknown>[]).map((row) =>
+      String(Object.values(row)[0]),
+    );
+    const bad = results.filter((result) => result !== 'ok');
+    if (results.length === 0 || bad.length > 0) {
+      const msg = bad.join('; ') || 'no result';
+      console.error(`[DB] ⚠ ${check} reported issues:`, msg);
       dbHealthError = `Database integrity error: ${msg}`;
     } else {
-      console.log('[DB] integrity_check: ok');
+      console.log(`[DB] ${check}: ok`);
+      if (check === 'integrity_check') {
+        upsertSettings({ [LAST_FULL_INTEGRITY_CHECK_KEY]: new Date().toISOString() });
+      }
     }
 
     const fkViolations = db.prepare('PRAGMA foreign_key_check').all() as any[];
@@ -2609,6 +2635,40 @@ function runStartupIntegrityCheck(): void {
     }
   } catch (err: any) {
     console.error('[DB] Startup integrity check failed:', err.message);
+  }
+}
+
+const QUERY_PLANNER_REFRESH_MS = 6 * 60 * 60 * 1000;
+let queryPlannerTimer: ReturnType<typeof setInterval> | null = null;
+
+/**
+ * FactorPOS: nothing ever ran ANALYZE, so SQLite planned every query without row statistics and
+ * could pick an index that walks the whole sales history. PRAGMA optimize keeps sqlite_stat1
+ * current; analysis_limit caps each table's sample so the first run on a large shop database
+ * stays short. The 0x10002 form at open is SQLite's recommendation for long-lived connections.
+ */
+function startQueryPlannerMaintenance(): void {
+  stopQueryPlannerMaintenance();
+  runQueryPlannerOptimize('optimize = 0x10002');
+  queryPlannerTimer = setInterval(
+    () => runQueryPlannerOptimize('optimize'),
+    QUERY_PLANNER_REFRESH_MS,
+  );
+  queryPlannerTimer.unref?.();
+}
+
+function stopQueryPlannerMaintenance(): void {
+  if (queryPlannerTimer) clearInterval(queryPlannerTimer);
+  queryPlannerTimer = null;
+}
+
+function runQueryPlannerOptimize(pragma: string): void {
+  try {
+    if (!db?.open) return;
+    db.pragma('analysis_limit = 400');
+    db.pragma(pragma);
+  } catch (err) {
+    console.warn('[DB] PRAGMA optimize skipped:', err instanceof Error ? err.message : err);
   }
 }
 
@@ -2943,6 +3003,7 @@ export function waitForDatabaseRequests(timeoutMs?: number): Promise<void> {
 }
 
 export function closeDatabase(): void {
+  stopQueryPlannerMaintenance();
   if (db) {
     db.close();
     db = null as unknown as Database.Database;
@@ -10444,6 +10505,18 @@ export const FACTORPOS_MIGRATIONS: { id: string; up: () => void }[] = [
         `INSERT INTO settings (key, value, updated_at) VALUES ('bill_template', ?, ?)
          ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
       ).run(JSON.stringify({ source: 'core', id: 'compact' }), now());
+    },
+  },
+  {
+    // The dashboard's average table turn filters type, status and a completed_at window. With
+    // only idx_orders_type to use, it read every dine-in order the shop ever took on each load.
+    id: '2026-11-24-orders-table-turn-index',
+    up: () => {
+      if (!getTables(db).includes('orders')) return;
+      if (!getColumns(db, 'orders').includes('completed_at')) return;
+      db.exec(
+        'CREATE INDEX IF NOT EXISTS idx_orders_type_status_completed ON orders(type, status, completed_at)',
+      );
     },
   },
 ];
