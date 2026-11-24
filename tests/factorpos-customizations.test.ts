@@ -223,6 +223,10 @@ test('ZATCA fiscal records stay wired into payments and refunds, off by default'
   assert.match(db, /'2026-11-24-zatca-fiscal-records'/);
   assert.match(db, /VALUES \('zatca_environment', 'disabled', \?\)/);
   assert.match(db, /zatca_fiscal_documents_no_delete/);
+  assert.match(db, /'2026-11-24-zatca-credentials'/);
+  // Electron's BoringSSL has no secp256k1; signing must keep using @noble/curves.
+  assert.match(read('main/services/zatca/signing.ts'), /from '@noble\/curves\/secp256k1'/);
+  assert.equal(pkg.dependencies['@noble/curves'], '1.9.7');
 });
 
 test('orders carry the day token and setup preselects Saudi Arabia', () => {
@@ -292,6 +296,7 @@ test('FactorPOS regression suites stay in npm test', () => {
     'test:factorpos-migrations',
     'test:factorpos-saudi-invoice',
     'test:factorpos-zatca-fiscal-records',
+    'test:factorpos-zatca-engine',
     'test:monthly-vat-export',
     'test:cash-closures',
     'test:country-localization',

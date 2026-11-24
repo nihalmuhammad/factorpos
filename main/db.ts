@@ -10608,6 +10608,27 @@ export const FACTORPOS_MIGRATIONS: { id: string; up: () => void }[] = [
       ).run(now());
     },
   },
+  {
+    // ZATCA signing (roadmap phase 4): this till's certificate and private key. The key
+    // is stored encrypted with Electron safeStorage; see main/services/zatca/credentials.ts.
+    id: '2026-11-24-zatca-credentials',
+    up: () => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS zatca_credentials (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          environment TEXT NOT NULL CHECK (environment IN ('simulation', 'production')),
+          certificate TEXT NOT NULL,
+          private_key TEXT NOT NULL,
+          key_protection TEXT NOT NULL CHECK (key_protection IN ('safe_storage', 'plain_test')),
+          active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
+          created_at TEXT NOT NULL,
+          CHECK (key_protection = 'safe_storage' OR environment = 'simulation')
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS zatca_one_active_credential
+          ON zatca_credentials(environment) WHERE active = 1;
+      `);
+    },
+  },
 ];
 
 /**

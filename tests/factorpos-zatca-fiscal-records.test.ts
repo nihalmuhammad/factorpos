@@ -39,6 +39,10 @@ const saudiVatPack = require('../main/tax-packs/community-saudi-arabia.json');
 const { orderRoutes } = require('../main/routes/orders');
 const { billRoutes } = require('../main/routes/bills');
 const { refundRoutes } = require('../main/routes/refunds');
+const { saveSigningCredential } = require('../main/services/zatca/credentials');
+const { FIRST_PREVIOUS_INVOICE_HASH, invoiceHash } = require('../main/services/zatca/signing');
+const { makeTestCredential } = require('./helpers/zatca-test-credential');
+const { execFileSync } = require('child_process');
 const {
   assertBillNotFiscallyIssued,
   recordPaidBillInvoice,
@@ -62,9 +66,52 @@ function throwsWith(fn: () => unknown, pattern: RegExp): boolean {
   }
 }
 
+function findSdk(): string | null {
+  if (process.env.ZATCA_SDK_LAUNCHER) return process.env.ZATCA_SDK_LAUNCHER;
+  for (let dir = path.resolve(__dirname); dir !== path.dirname(dir); dir = path.dirname(dir)) {
+    const candidate = path.join(dir, '.local-tools', 'zatca-sdk');
+    if (fs.existsSync(candidate)) return candidate;
+  }
+  return null;
+}
+
+function sdkValidate(sdk: string, sdkDir: string, xml: string, previousHash: string): string {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'factorpos-fiscal-sdk-'));
+  fs.writeFileSync(path.join(dir, 'document.xml'), xml);
+  fs.writeFileSync(path.join(dir, 'pih.txt'), previousHash);
+  const config = JSON.parse(
+    fs.readFileSync(path.join(sdkDir, 'Configuration', 'local-config.json'), 'utf8'),
+  );
+  config.pihPath = path.join(dir, 'pih.txt');
+  fs.writeFileSync(path.join(dir, 'config.json'), JSON.stringify(config));
+  try {
+    return execFileSync(sdk, ['-validate', '-invoice', path.join(dir, 'document.xml')], {
+      cwd: dir,
+      env: { ...process.env, SDK_CONFIG: path.join(dir, 'config.json') },
+      encoding: 'utf8',
+    });
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
 async function main() {
   console.log('ZATCA fiscal records: invoices and credit notes from real payments and refunds');
   console.log('='.repeat(72));
+
+  // With ZATCA's SDK installed (development machines), sign with its test certificate and
+  // validate every document at the end; otherwise use a throwaway credential.
+  const sdk = findSdk();
+  const sdkDir = sdk ? path.join(path.dirname(sdk), 'zatca-einvoicing-sdk-Java-238-R3.4.8') : '';
+  const signingCredential = sdk
+    ? {
+        certificate: fs.readFileSync(path.join(sdkDir, 'Data', 'Certificates', 'cert.pem'), 'utf8'),
+        privateKey: fs.readFileSync(
+          path.join(sdkDir, 'Data', 'Certificates', 'ec-secp256k1-priv-key.pem'),
+          'utf8',
+        ),
+      }
+    : makeTestCredential();
 
   const db = initTestDb();
   setSetting(db, 'country', 'SA');
@@ -73,7 +120,7 @@ async function main() {
   setSetting(db, 'taxes_enabled', 'true');
   setSetting(db, 'business_name', 'Fiscal Test Shop');
   setSetting(db, 'business_address', 'Prince Naif Rd, Hofuf');
-  setSetting(db, 'tax_registration_number', '300000000000003');
+  setSetting(db, 'tax_registration_number', '399999999900003');
   installAndActivateTestTaxPack(db, saudiVatPack);
   const { authHeader: ownerAuth } = seedOwnerUser(db);
   const { userId: managerId, authHeader: managerAuth } = seedManagerUser(db);
@@ -136,8 +183,53 @@ async function main() {
       .prepare("SELECT * FROM bills WHERE payment_status = 'paid' ORDER BY id LIMIT 1")
       .get() as any;
 
-    console.log('\n─── Simulation: each paid bill gets one numbered invoice ───');
+    console.log(
+      '\n─── Simulation refuses to sell without a signing certificate or seller details ───',
+    );
     setSetting(db, 'zatca_environment', 'simulation');
+    {
+      const bill = await billFor([{ product_id: 'prod-tea', quantity: 1 }]);
+      const noCredential = await pay(bill);
+      assertEqualOrThrow(noCredential.status, 409, 'payment refused without a ZATCA certificate');
+      assertOrThrow(
+        /signing certificate/.test(String(noCredential.data?.error ?? '')),
+        'refusal explains the missing certificate',
+      );
+      const unpaid = db
+        .prepare('SELECT payment_status FROM bills WHERE id = ?')
+        .get(bill.id) as any;
+      assertOrThrow(unpaid.payment_status !== 'paid', 'the refused payment rolled back');
+      saveSigningCredential(
+        db,
+        { ...signingCredential, environment: 'simulation' },
+        'plain_test',
+        now(),
+      );
+      const noSeller = await pay(bill);
+      assertEqualOrThrow(
+        noSeller.status,
+        409,
+        'payment refused while seller details are incomplete',
+      );
+      assertOrThrow(
+        /seller details are incomplete/.test(String(noSeller.data?.error ?? '')),
+        'refusal lists the missing seller details',
+      );
+      for (const [key, value] of Object.entries({
+        zatca_seller_crn: '1010010000',
+        zatca_seller_street: 'Prince Naif Road',
+        zatca_seller_building_number: '2322',
+        zatca_seller_district: 'Al Khalidiyah',
+        zatca_seller_city: 'Al Ahsa',
+        zatca_seller_postal_code: '36361',
+      }))
+        setSetting(db, key, value);
+      assertEqualOrThrow(documents().length, 0, 'refused payments recorded nothing');
+      const counter = db.prepare('SELECT last_counter FROM zatca_fiscal_sequence').get() as any;
+      assertEqualOrThrow(counter.last_counter, 0, 'refused payments did not use a counter');
+    }
+
+    console.log('\n─── Simulation: each paid bill gets one numbered, signed invoice ───');
     const one = await billFor([{ product_id: 'prod-mandi', quantity: 2 }]);
     const two = await billFor([
       { product_id: 'prod-mandi', quantity: 1 },
@@ -145,7 +237,7 @@ async function main() {
     ]);
     const payOne = await pay(one);
     assertEqualOrThrow(payOne.status, 200, 'first bill paid');
-    assertEqualOrThrow(payOne.data.fiscal?.issuanceStatus, 'recorded', 'payment reports recorded');
+    assertEqualOrThrow(payOne.data.fiscal?.issuanceStatus, 'signed', 'payment reports signed');
     assertEqualOrThrow(payOne.data.fiscal?.counter, 1, 'first invoice counter is 1');
     const payTwo = await pay(two, 'card');
     assertEqualOrThrow(payTwo.data.fiscal?.counter, 2, 'second invoice counter is 2');
@@ -156,8 +248,42 @@ async function main() {
     assertEqualOrThrow(docs[0].total_with_vat_minor, 11500, 'invoice total 115.00 in halalas');
     assertEqualOrThrow(docs[0].vat_minor, 1500, 'invoice VAT 15.00 in halalas');
     assertEqualOrThrow(docs[1].total_with_vat_minor, 5865, 'second invoice total 58.65');
+    for (const doc of docs) {
+      assertEqualOrThrow(doc.status, 'signed', `invoice ${doc.counter} is signed`);
+      assertEqualOrThrow(
+        invoiceHash(doc.signed_xml),
+        doc.invoice_hash,
+        `invoice ${doc.counter} hash matches its XML`,
+      );
+      assertOrThrow(
+        doc.qr_payload && doc.signed_xml.includes(doc.qr_payload),
+        `invoice ${doc.counter} carries its QR`,
+      );
+    }
+    assertEqualOrThrow(
+      docs[0].previous_invoice_hash,
+      FIRST_PREVIOUS_INVOICE_HASH,
+      'chain starts at the initial PIH',
+    );
+    assertEqualOrThrow(
+      docs[1].previous_invoice_hash,
+      docs[0].invoice_hash,
+      'second invoice chains to the first',
+    );
+    assertOrThrow(
+      docs[0].signed_xml.includes(`<cbc:ID>${one.bill_number}</cbc:ID>`),
+      'invoice number is the bill number',
+    );
+    assertOrThrow(
+      docs[0].signed_xml.includes('<cbc:Name>Mandi</cbc:Name>'),
+      'item name in the invoice',
+    );
+    assertOrThrow(
+      docs[1].signed_xml.includes('<cbc:PaymentMeansCode>48</cbc:PaymentMeansCode>'),
+      'card payment means',
+    );
     const snapshot = JSON.parse(docs[0].snapshot_json);
-    assertEqualOrThrow(snapshot.seller.vat_number, '300000000000003', 'seller VAT number frozen');
+    assertEqualOrThrow(snapshot.seller.vat_number, '399999999900003', 'seller VAT number frozen');
     assertEqualOrThrow(snapshot.seller.name, 'Fiscal Test Shop', 'seller name frozen');
     assertEqualOrThrow(snapshot.bill.bill_number, one.bill_number, 'bill frozen');
     assertEqualOrThrow(snapshot.order.items.length, 1, 'order items frozen');
@@ -166,7 +292,7 @@ async function main() {
     console.log('\n─── Bill reads show the read-only status ───');
     {
       const read = await api(baseUrl, `/api/bills/${one.id}`, { headers: ownerAuth });
-      assertEqualOrThrow(read.data.bill.fiscal?.issuanceStatus, 'recorded', 'bill detail status');
+      assertEqualOrThrow(read.data.bill.fiscal?.issuanceStatus, 'signed', 'bill detail status');
       assertEqualOrThrow(read.data.bill.fiscal?.counter, 1, 'bill detail counter');
       const list = await api(baseUrl, '/api/bills?limit=50', { headers: ownerAuth });
       const before = list.data.bills.find((b: any) => b.id === paidBeforeSwitch.id);
@@ -281,9 +407,6 @@ async function main() {
         ),
         'the counter cannot go backwards',
       );
-      db.prepare(
-        "UPDATE zatca_fiscal_documents SET status = 'signed', invoice_hash = 'h1', signed_at = ? WHERE id = ?",
-      ).run(now(), doc.id);
       assertOrThrow(
         throwsWith(
           () =>
@@ -334,6 +457,21 @@ async function main() {
         counters.every((c: number, i: number) => c === i + 1),
         `counters stay gapless after the refused payment (${counters.join(',')})`,
       );
+    }
+
+    console.log('\n─── Official ZATCA SDK validation of every document ───');
+    if (!sdk) {
+      console.log('  (skipped: ZATCA SDK not installed in .local-tools)');
+    } else {
+      let previous = FIRST_PREVIOUS_INVOICE_HASH;
+      for (const doc of documents()) {
+        const output = sdkValidate(sdk, sdkDir, doc.signed_xml, previous);
+        assertOrThrow(
+          /GLOBAL VALIDATION RESULT = PASSED/.test(output),
+          `SDK passes document ${doc.counter} (${doc.document_type})`,
+        );
+        previous = doc.invoice_hash;
+      }
     }
   } finally {
     server.close();
