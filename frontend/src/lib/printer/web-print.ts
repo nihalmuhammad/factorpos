@@ -4,6 +4,7 @@ import type { Bill, Tenant } from '@/lib/types';
 import { receiptChargeLines } from '@/lib/charges';
 import toast from 'react-hot-toast';
 import type { PrintWarning } from './warnings';
+import type { ZatcaSignedReceipt } from '@print/zatca-qr';
 import {
   getCountryByCode,
   getCurrencyFractionDigits,
@@ -111,7 +112,12 @@ export interface WebPrintOptions {
   /** Resolved receipt languages supplied by the caller's print policy. */
   languages?: ResolvedPrintLanguages;
   /** FactorPOS: print the Saudi simplified tax invoice with this ZATCA QR image. */
-  saudiInvoice?: { qrDataUrl: string | null; vatNumber?: string };
+  saudiInvoice?: {
+    qrDataUrl: string | null;
+    vatNumber?: string;
+    /** The bill's signed ZATCA invoice, when there is one. */
+    signed?: ZatcaSignedReceipt | null;
+  };
 }
 
 /** Resolve tax-id label printed on receipt (special case for Iranian Economic Code). */
@@ -291,6 +297,7 @@ export function generateBillHtml(
       showTableNumber: opts.showTableNumber,
       isReprint: opts.isReprint,
       qrDataUrl: opts.saudiInvoice.qrDataUrl,
+      signed: opts.saudiInvoice.signed ?? null,
     });
   }
   const {

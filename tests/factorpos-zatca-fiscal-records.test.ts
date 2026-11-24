@@ -307,6 +307,61 @@ async function main() {
       await pay(unpaid);
     }
 
+    console.log('\n─── The Saudi bill prints the signed QR; unsigned bills keep the preview ───');
+    {
+      const doc = documents()[0];
+      const qr = await api(baseUrl, `/api/bills/${one.id}/zatca-qr`, { headers: ownerAuth });
+      assertEqualOrThrow(qr.status, 200, 'QR endpoint works for a signed bill');
+      assertEqualOrThrow(qr.data.payload, doc.qr_payload, 'it returns the signed QR (tags 1-9)');
+      assertEqualOrThrow(qr.data.signed?.environment, 'simulation', 'marked simulation');
+      assertOrThrow(
+        doc.signed_xml.includes(`<cbc:IssueTime>${qr.data.signed.issueTime}</cbc:IssueTime>`),
+        "issue time is the signed invoice's",
+      );
+      const unsignedQr = await api(baseUrl, `/api/bills/${paidBeforeSwitch.id}/zatca-qr`, {
+        headers: ownerAuth,
+      });
+      assertEqualOrThrow(unsignedQr.data.signed, null, 'a bill paid while off has no signed QR');
+      assertOrThrow(unsignedQr.data.payload !== doc.qr_payload, 'it keeps the preview QR');
+
+      const { renderSaudiReceiptViaDocument } = require('../main/printers/document-saudi');
+      const { escPosToText } = require('../main/printers/thermal');
+      const billRow = db.prepare('SELECT * FROM bills WHERE id = ?').get(one.id);
+      const printOptions = {
+        columns: 48,
+        isReprint: false,
+        useUnicode: false,
+        arabicShaping: false,
+        cutMode: 'partial',
+      };
+      const business = {
+        name: 'Fiscal Test Shop',
+        taxRegistrationNumber: '399999999900003',
+        timezone: 'Asia/Riyadh',
+      };
+      const printed = renderSaudiReceiptViaDocument({ items: [] }, billRow, business, printOptions);
+      assertEqualOrThrow(
+        printed.qrPayload,
+        doc.qr_payload,
+        'thermal Saudi bill prints the signed QR',
+      );
+      assertOrThrow(
+        escPosToText(printed.data).includes('SIMULATION - NOT A TAX INVOICE'),
+        'thermal bill carries the simulation banner',
+      );
+      const unsignedRow = db.prepare('SELECT * FROM bills WHERE id = ?').get(paidBeforeSwitch.id);
+      const preview = renderSaudiReceiptViaDocument(
+        { items: [] },
+        unsignedRow,
+        business,
+        printOptions,
+      );
+      assertOrThrow(
+        escPosToText(preview.data).includes('NOT A TAX INVOICE - PREVIEW'),
+        'an unsigned bill keeps the preview banner',
+      );
+    }
+
     console.log('\n─── No duplicates on retry ───');
     {
       const countBefore = documents().length;

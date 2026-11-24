@@ -125,10 +125,13 @@ Covered by `npm run test:factorpos-dashboard-performance`.
   ESC/POS QR; Arabic labels print through raster mode or Arabic shaping, and are left
   out on text-only printers). Browser: `frontend/src/lib/printer/saudi-web-print.ts`,
   with the QR image from `GET /api/bills/:id/zatca-qr`. Direct-USB (WebUSB) printers
-  use system print for this format. QR tags 6–9 (hash, signature, public key) come
-  with invoice signing (roadmap phase 4). Until then `ZATCA_PREVIEW_ONLY` prints a
-  "NOT A TAX INVOICE - PREVIEW" banner: shops already on ZATCA integration e-invoicing must keep issuing
-  tax invoices from their compliant system.
+  use system print for this format. A bill with a signed ZATCA invoice prints that
+  invoice's QR (tags 1–9) and issue time (`main/services/zatca/receipt.ts`), with a
+  simulation banner while signing in simulation. A bill without one prints the
+  "NOT A TAX INVOICE - PREVIEW" banner (`ZATCA_PREVIEW_ONLY`): shops already on ZATCA
+  integration e-invoicing must keep issuing tax invoices from their compliant system
+  until production. Only the Saudi renderers read the signed invoice; classic and
+  compact bills are unchanged.
 - ZATCA fiscal records (`main/services/zatca-fiscal.ts`, FactorPOS migration
   `2026-11-24-zatca-fiscal-records`): off unless `zatca_environment` is `simulation`.
   Hooks: `recordFiscalInvoiceIfPaid` in `main/routes/bills.ts` (four paid paths) and

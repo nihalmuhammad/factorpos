@@ -4,8 +4,9 @@
  * A FactorPOS-owned core bill template ('saudi'). It prints what a ZATCA simplified
  * tax invoice needs: seller name and address, seller VAT number, the
  * "Simplified Tax Invoice" title in Arabic and English, invoice number, issue date
- * and time, items, amount before VAT, VAT, total with VAT, and the ZATCA QR code
- * (TLV tags 1–5, see shared/print/zatca-qr.ts).
+ * and time, items, amount before VAT, VAT, total with VAT, and the ZATCA QR code.
+ * When the bill has a signed ZATCA invoice, its QR (tags 1–9) and issue time are
+ * printed; otherwise the preview QR (tags 1–5, see shared/print/zatca-qr.ts).
  *
  * Arabic lines print through the printer's raster mode when it is on, or as text
  * when the printer can represent Arabic (Arabic shaping); otherwise they are left
@@ -36,11 +37,12 @@ import {
 } from './formatting-helpers';
 import {
   encodeZatcaQr,
+  signedIssueText,
   zatcaQrFieldsForBill,
-  ZATCA_PREVIEW_BANNER_AR,
-  ZATCA_PREVIEW_BANNER_EN,
-  ZATCA_PREVIEW_ONLY,
+  zatcaReceiptBanner,
+  type ZatcaSignedReceipt,
 } from '../../shared/print/zatca-qr';
+import { signedReceiptForBillSafe } from '../services/zatca/receipt';
 
 export const SAUDI_INVOICE_TITLE_AR = 'فاتورة ضريبية مبسطة';
 export const SAUDI_INVOICE_TITLE_EN = 'SIMPLIFIED TAX INVOICE';
@@ -55,6 +57,11 @@ export interface SaudiReceiptOptions {
   /** Draw Arabic lines as raster groups (the raster pipeline renders them). */
   rasterArabic?: boolean;
   rasterGroups?: RasterSemanticLineGroup[];
+  /**
+   * The bill's signed ZATCA invoice: its QR (tags 1–9) and issue time are printed.
+   * null = none (preview QR, tags 1–5); undefined = look it up by bill id.
+   */
+  zatcaSigned?: ZatcaSignedReceipt | null;
 }
 
 export interface SaudiReceiptResult {
@@ -119,15 +126,33 @@ function formatIssueDate(dbTimestamp: string, timezone: string): string {
   return `${get('day')}/${get('month')}/${get('year')} ${get('hour')}:${get('minute')}:${get('second')}`;
 }
 
-/** Native ESC/POS QR (model 2, module size 6, error correction M), centred. */
-export function saudiQrEscPos(payload: string): Buffer {
+// QR version 1–40 byte capacity at error correction M (ISO/IEC 18004).
+const QR_BYTES_M = [
+  14, 26, 42, 62, 84, 106, 122, 152, 180, 213, 251, 287, 331, 362, 412, 450, 504, 560, 624, 666,
+  711, 779, 857, 911, 997, 1059, 1125, 1190, 1264, 1370, 1452, 1538, 1628, 1722, 1809, 1911, 1989,
+  2099, 2213, 2331,
+];
+
+/**
+ * Module (dot) size for a QR of `bytes` on paper `widthDots` wide: 6 when it fits (the
+ * preview QR always does), smaller for a signed QR (tags 1–9) on narrow paper.
+ */
+export function saudiQrModuleSize(bytes: number, widthDots: number): number {
+  const version = QR_BYTES_M.findIndex((capacity) => capacity >= bytes) + 1 || 40;
+  const modules = 17 + 4 * version + 8; // quiet zone of 4 modules each side
+  return Math.max(3, Math.min(6, Math.floor(widthDots / modules)));
+}
+
+/** Native ESC/POS QR (model 2, error correction M), centred; module size fits the paper. */
+export function saudiQrEscPos(payload: string, widthDots = 576): Buffer {
   const data = Buffer.from(payload, 'utf8');
+  const moduleSize = saudiQrModuleSize(data.length, widthDots);
   const pL = (data.length + 3) & 0xff;
   const pH = ((data.length + 3) >> 8) & 0xff;
   return Buffer.concat([
     Buffer.from([0x1b, 0x61, 0x01]),
     Buffer.from([0x1d, 0x28, 0x6b, 0x04, 0x00, 0x31, 0x41, 0x32, 0x00]),
-    Buffer.from([0x1d, 0x28, 0x6b, 0x03, 0x00, 0x31, 0x43, 0x06]),
+    Buffer.from([0x1d, 0x28, 0x6b, 0x03, 0x00, 0x31, 0x43, moduleSize]),
     Buffer.from([0x1d, 0x28, 0x6b, 0x03, 0x00, 0x31, 0x45, 0x31]),
     Buffer.from([0x1d, 0x28, 0x6b, pL, pH, 0x31, 0x50, 0x30]),
     data,
@@ -232,16 +257,20 @@ export function renderSaudiReceiptLines(
   lines.push(dash);
   center(SAUDI_INVOICE_TITLE_AR, ['BOLD']);
   center(SAUDI_INVOICE_TITLE_EN, ['BOLD']);
-  if (ZATCA_PREVIEW_ONLY) {
+  const signed = options.zatcaSigned ?? null;
+  const banner = zatcaReceiptBanner(signed);
+  if (banner) {
     lines.push(dash);
-    center(`** ${ZATCA_PREVIEW_BANNER_EN} **`, ['BOLD'], false);
-    center(ZATCA_PREVIEW_BANNER_AR, ['BOLD']);
+    center(`** ${banner.en} **`, ['BOLD'], false);
+    center(banner.ar, ['BOLD']);
   }
   lines.push(dash);
 
   const issuedAt = String(bill?.paid_at || bill?.created_at || order?.created_at || '');
   lines.push(normalize(row('Invoice No:', String(bill?.bill_number ?? ''), cols)));
-  const issueDate = formatIssueDate(issuedAt, String(business?.timezone ?? ''));
+  const issueDate = signed
+    ? signedIssueText(signed)
+    : formatIssueDate(issuedAt, String(business?.timezone ?? ''));
   if (issueDate) lines.push(normalize(row('Date:', issueDate, cols)));
   if (order?.order_number)
     lines.push(normalize(row('Order No:', String(order.order_number), cols)));
@@ -350,8 +379,8 @@ export function renderSaudiReceiptLines(
   }
   lines.push(dash);
 
-  let qrPayload: string | null = null;
-  if (vatNumber && sellerName && issuedAt) {
+  let qrPayload: string | null = signed?.qrPayload ?? null;
+  if (!qrPayload && vatNumber && sellerName && issuedAt) {
     try {
       qrPayload = encodeZatcaQr(zatcaQrFieldsForBill(bill, { name: sellerName, vatNumber }));
     } catch {
@@ -359,7 +388,8 @@ export function renderSaudiReceiptLines(
     }
   }
   if (qrPayload) {
-    lines.push(`{RAW_BYTES:${saudiQrEscPos(qrPayload).toString('base64')}}`);
+    const widthDots = capabilities?.raster.widthDots ?? (cols <= 32 ? 384 : 576);
+    lines.push(`{RAW_BYTES:${saudiQrEscPos(qrPayload, widthDots).toString('base64')}}`);
   } else {
     lines.push('{CENTER}Add the VAT number in Settings to print the ZATCA QR{/CENTER}');
   }
@@ -383,8 +413,11 @@ export function renderSaudiReceiptViaDocument(
   const warnings: PrintWarning[] = [];
   const rasterGroups: RasterSemanticLineGroup[] = [];
   const rasterOn = opts.capabilities !== undefined && rasterCapabilityEnabled(opts.capabilities);
+  const zatcaSigned =
+    opts.zatcaSigned !== undefined ? opts.zatcaSigned : signedReceiptForBillSafe(bill?.id);
   const { lines, qrPayload } = renderSaudiReceiptLines(order, bill, business, {
     ...opts,
+    zatcaSigned,
     rasterArabic: rasterOn,
     rasterGroups,
   });
@@ -392,6 +425,7 @@ export function renderSaudiReceiptViaDocument(
   const nativeLines = rasterOn
     ? renderSaudiReceiptLines(order, bill, business, {
         ...opts,
+        zatcaSigned,
         capabilities: {
           ...opts.capabilities!,
           raster: { ...opts.capabilities!.raster, enabled: false },

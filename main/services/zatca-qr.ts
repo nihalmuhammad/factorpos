@@ -1,6 +1,7 @@
 /**
- * FactorPOS: ZATCA QR for a stored bill (simplified tax invoice, TLV tags 1–5).
- * The thermal renderer builds the same payload from the print data; this is the
+ * FactorPOS: ZATCA QR for a stored bill, for the Saudi bill format. A bill with a
+ * signed ZATCA invoice gets that invoice's QR (tags 1–9) and issue time; otherwise the
+ * preview QR (tags 1–5). The thermal renderer resolves the same way; this is the
  * lookup the browser print path and the API use.
  */
 import QRCode from 'qrcode';
@@ -9,10 +10,12 @@ import {
   encodeZatcaQr,
   zatcaQrFieldsForBill,
   type ZatcaQrFields,
+  type ZatcaSignedReceipt,
 } from '../../shared/print/zatca-qr';
+import { signedReceiptForBill } from './zatca/receipt';
 
 export type BillZatcaQr =
-  | { ok: true; payload: string; fields: ZatcaQrFields }
+  | { ok: true; payload: string; fields: ZatcaQrFields; signed: ZatcaSignedReceipt | null }
   | { ok: false; status: 404 | 409; error: string };
 
 function setting(db: ReturnType<typeof getDatabase>, key: string): string {
@@ -38,9 +41,13 @@ export function buildBillZatcaQr(billId: string | number): BillZatcaQr {
     };
   }
   const fields = zatcaQrFieldsForBill(bill, { name, vatNumber });
-  return { ok: true, payload: encodeZatcaQr(fields), fields };
+  const signed = signedReceiptForBill(db, billId);
+  if (signed) return { ok: true, payload: signed.qrPayload, fields, signed };
+  return { ok: true, payload: encodeZatcaQr(fields), fields, signed: null };
 }
 
 export async function zatcaQrDataUrl(payload: string): Promise<string> {
-  return QRCode.toDataURL(payload, { errorCorrectionLevel: 'M', width: 256, margin: 1 });
+  // A signed QR (tags 1–9) has about four times the modules: render it sharper.
+  const width = payload.length > 200 ? 512 : 256;
+  return QRCode.toDataURL(payload, { errorCorrectionLevel: 'M', width, margin: 1 });
 }

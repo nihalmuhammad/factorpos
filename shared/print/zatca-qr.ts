@@ -4,20 +4,48 @@
  * Tags 1–5 per the ZATCA e-invoicing QR specification: seller name, VAT
  * registration number, invoice timestamp, invoice total with VAT, VAT total.
  * Phase 2 adds tags 6–9 (invoice hash, ECDSA signature, public key,
- * certificate signature); those exist only once invoices are signed with a
- * ZATCA-issued certificate, so they are not produced here.
+ * certificate signature); those exist only once a bill has a signed ZATCA invoice,
+ * whose stored QR (`ZatcaSignedReceipt`) the Saudi bill prints instead.
  *
  * Pure TypeScript so the Electron main process and the browser share one encoder.
  */
 
 /**
- * FactorPOS does not sign or report invoices to ZATCA yet (roadmap phases 4–6), so
- * the Saudi bill format is a preview: it prints a "not a tax invoice" banner and must
- * not be given to customers as their tax invoice. Phase 4 turns this off.
+ * A Saudi bill with no signed ZATCA invoice behind it (issuance off) is a preview: it
+ * prints a "not a tax invoice" banner and must not be given to customers as their tax
+ * invoice. A bill signed in the simulation environment prints a simulation banner;
+ * only a production-signed bill prints without one.
  */
 export const ZATCA_PREVIEW_ONLY = true;
 export const ZATCA_PREVIEW_BANNER_EN = 'NOT A TAX INVOICE - PREVIEW';
 export const ZATCA_PREVIEW_BANNER_AR = 'ليست فاتورة ضريبية - معاينة';
+export const ZATCA_SIMULATION_BANNER_EN = 'SIMULATION - NOT A TAX INVOICE';
+export const ZATCA_SIMULATION_BANNER_AR = 'محاكاة - ليست فاتورة ضريبية';
+
+/** The signed ZATCA invoice behind a bill, as the Saudi bill prints it. */
+export interface ZatcaSignedReceipt {
+  /** The signed document's QR (tags 1–9), Base64. */
+  readonly qrPayload: string;
+  readonly environment: 'simulation' | 'production';
+  /** IssueDate and IssueTime of the signed XML (local): YYYY-MM-DD and HH:mm:ss. */
+  readonly issueDate: string;
+  readonly issueTime: string;
+}
+
+/** The banner a Saudi bill prints, or null for a production-signed invoice. */
+export function zatcaReceiptBanner(
+  signed: ZatcaSignedReceipt | null | undefined,
+): { en: string; ar: string } | null {
+  if (signed?.environment === 'production') return null;
+  if (signed) return { en: ZATCA_SIMULATION_BANNER_EN, ar: ZATCA_SIMULATION_BANNER_AR };
+  return ZATCA_PREVIEW_ONLY ? { en: ZATCA_PREVIEW_BANNER_EN, ar: ZATCA_PREVIEW_BANNER_AR } : null;
+}
+
+/** dd/mm/yyyy HH:mm:ss from a signed invoice's issue date and time. */
+export function signedIssueText(signed: ZatcaSignedReceipt): string {
+  const [year, month, day] = signed.issueDate.split('-');
+  return `${day}/${month}/${year} ${signed.issueTime}`;
+}
 
 export interface ZatcaQrFields {
   readonly sellerName: string;

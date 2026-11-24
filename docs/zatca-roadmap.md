@@ -175,8 +175,14 @@ Details: [monthly VAT invoice report](reference/daily-sales-export.md#monthly-va
 - Done: "Saudi Tax Invoice" bill format, a bilingual Arabic/English simplified
   invoice with the QR (tags 1–5) on thermal and browser printing, and the Bill Template
   setting honoured on every print path.
-- Left: QR tags 6–9 once invoices are signed (phase 4); test prints on the pilot
-  80 mm printer; direct-USB (WebUSB) byte layout.
+- Done (branch `feat/zatca-signed-receipt`): when the bill has a signed ZATCA invoice,
+  the Saudi bill prints that invoice's stored QR (tags 1–9) and its IssueDate/IssueTime,
+  with a "SIMULATION - NOT A TAX INVOICE" banner while signing in simulation and no
+  banner in production. Bills without one keep the preview QR and banner. The thermal
+  QR module shrinks only when the signed QR would not fit (58 mm); other bill formats
+  are untouched.
+- Left: test prints on the pilot 80 mm and 58 mm printers and a scan with ZATCA's VAT
+  app; direct-USB (WebUSB) byte layout.
 
 ### 8. Pilot
 
