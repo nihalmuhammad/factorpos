@@ -147,6 +147,15 @@ Covered by `npm run test:factorpos-dashboard-performance`.
 - Email Error Log (Support): opens a local `.eml` draft with the recent log,
   sanitized by FloCafe's `sanitizeLogTail` before it is attached.
 - Support-ticket subjects say FactorPOS (`frontend/src/lib/operation-failure.ts`).
+- Submit Ticket goes to the owner's Google Apps Script web app, which emails the
+  address in its `NOTIFY_EMAIL` script property (never in this repository) and logs
+  the ticket in a Sheet and Drive
+  (`main/services/factorpos-ticket-relay.ts`, receiver and setup in
+  `scripts/support-ticket-apps-script/`). Tickets stay in FloCafe's
+  `support_ticket_outbox`, so the queue, retries and Support-screen status are
+  FloCafe's; FloCafe's cloud flush stands down while the relay is configured.
+  The release workflow stamps the URL and secret from repository secrets and
+  refuses to build without them. Covered by `npm run test:factorpos-ticket-relay`.
 
 ## Still pending
 
