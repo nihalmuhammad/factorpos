@@ -8,6 +8,7 @@ import { addonGroupRoutes } from './addon-groups';
 import { orderRoutes } from './orders';
 import { orderItemRoutes } from './order-items';
 import { billRoutes } from './bills';
+import { zatcaRoutes } from './zatca';
 import { refundRoutes } from './refunds';
 import { cashClosureRoutes } from './cash-closures';
 import { cashSessionRoutes } from './cash-sessions';
@@ -119,6 +120,7 @@ export function registerRoutes(app: Express): void {
   app.use('/api/kitchen', kitchenRoutes);
   app.use('/api/bills', billRoutes);
   app.use('/api/refunds', refundRoutes);
+  app.use('/api/zatca', zatcaRoutes); // FactorPOS: ZATCA settings and onboarding
   app.use('/api/cash-closures', cashClosureRoutes);
   app.use('/api/cash-sessions', cashSessionRoutes);
   app.use('/api/inventory', inventoryRoutes);

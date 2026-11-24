@@ -229,6 +229,23 @@ test('ZATCA fiscal records stay wired into payments and refunds, off by default'
   assert.equal(pkg.dependencies['@noble/curves'], '1.9.7');
 });
 
+test('ZATCA onboarding stays mounted, simulation-only, with keys in secure storage', () => {
+  assert.match(read('main/routes/index.ts'), /app\.use\('\/api\/zatca', zatcaRoutes\)/);
+  const routes = read('main/routes/zatca.ts');
+  assert.match(routes, /environment: 'simulation',/, 'onboarding runs against simulation only');
+  assert.match(routes, /zatca_production_not_enabled/, 'production issuance stays refused');
+  assert.match(read('main/db.ts'), /'2026-11-24-zatca-onboarding'/);
+  assert.match(
+    read('main/services/zatca/credentials.ts'),
+    /environment === 'simulation' && process\.env\.FACTORPOS_ZATCA_PLAIN_TEST_KEYS === '1'/,
+  );
+  assert.match(
+    read('frontend/src/app/(dashboard)/settings/page.tsx'),
+    /<ZatcaSettingsCard /,
+    'the ZATCA card is on the Tax tab',
+  );
+});
+
 test('orders carry the day token and setup preselects Saudi Arabia', () => {
   const orders = read('main/routes/orders.ts');
   assert.match(
@@ -297,6 +314,7 @@ test('FactorPOS regression suites stay in npm test', () => {
     'test:factorpos-saudi-invoice',
     'test:factorpos-zatca-fiscal-records',
     'test:factorpos-zatca-engine',
+    'test:factorpos-zatca-onboarding',
     'test:monthly-vat-export',
     'test:cash-closures',
     'test:country-localization',

@@ -10556,6 +10556,43 @@ export const FACTORPOS_MIGRATIONS: { id: string; up: () => void }[] = [
       `);
     },
   },
+  {
+    // Onboarding (roadmap phase 5): progress per attempt, and what the production
+    // CSID brings with the certificate (API secret, request id, till id, expiry).
+    id: '2026-11-24-zatca-onboarding',
+    up: () => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS zatca_onboarding (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          environment TEXT NOT NULL CHECK (environment IN ('simulation', 'production')),
+          portal TEXT NOT NULL,
+          egs_uuid TEXT NOT NULL,
+          status TEXT NOT NULL CHECK (status IN ('started', 'compliance_issued', 'checks_passed', 'active')),
+          csr TEXT NOT NULL,
+          private_key TEXT NOT NULL,
+          key_protection TEXT NOT NULL CHECK (key_protection IN ('safe_storage', 'plain_test')),
+          compliance_request_id TEXT,
+          compliance_certificate TEXT,
+          compliance_secret TEXT,
+          checks_json TEXT,
+          last_error TEXT,
+          credential_id INTEGER,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          CHECK (key_protection = 'safe_storage' OR environment = 'simulation')
+        );
+      `);
+      const columns = new Set(
+        (db.prepare('PRAGMA table_info(zatca_credentials)').all() as { name: string }[]).map(
+          (column) => column.name,
+        ),
+      );
+      for (const column of ['api_secret', 'request_id', 'egs_uuid', 'expires_at']) {
+        if (!columns.has(column))
+          db.exec(`ALTER TABLE zatca_credentials ADD COLUMN ${column} TEXT`);
+      }
+    },
+  },
 ];
 
 /**

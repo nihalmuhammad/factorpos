@@ -33,6 +33,50 @@ export interface TestCredential {
   publicKeyDer: Buffer;
 }
 
+const CA_SECRET = secp256k1.utils.randomPrivateKey();
+
+/** A test X.509 certificate (Base64 DER) for a given public key, signed by a test CA. */
+export function certificateForPublicKey(spki: Buffer, commonName = 'FactorPOS test EGS'): string {
+  const serial = Buffer.concat([Buffer.from([0x01]), crypto.randomBytes(8)]);
+  const tbs = seq(
+    tlv(0xa0, tlv(0x02, Buffer.from([0x02]))),
+    tlv(0x02, serial),
+    seq(ECDSA_SHA256),
+    name('FactorPOS test CA'),
+    seq(tlv(0x17, Buffer.from('260101000000Z')), tlv(0x17, Buffer.from('360101000000Z'))),
+    name(commonName),
+    spki,
+  );
+  const digest = crypto.createHash('sha256').update(tbs).digest();
+  const signature = Buffer.from(secp256k1.sign(digest, CA_SECRET).toDERRawBytes());
+  const der = seq(tbs, seq(ECDSA_SHA256), tlv(0x03, Buffer.concat([Buffer.from([0]), signature])));
+  return der.toString('base64');
+}
+
+function derItem(buf: Buffer, offset: number) {
+  let len = buf[offset + 1];
+  let start = offset + 2;
+  if (len & 0x80) {
+    const count = len & 0x7f;
+    len = 0;
+    for (let i = 0; i < count; i += 1) len = (len << 8) | buf[start + i];
+    start += count;
+  }
+  return { tag: buf[offset], offset, start, end: start + len };
+}
+
+/** The subjectPublicKeyInfo of a CSR sent the way FATOORA receives it (Base64 of the PEM). */
+export function csrPublicKey(csrBase64: string): Buffer {
+  const text = Buffer.from(csrBase64, 'base64').toString('utf8');
+  const der = Buffer.from(text.replace(/-----[^-]+-----/g, '').replace(/\s+/g, ''), 'base64');
+  const outer = derItem(der, 0);
+  const info = derItem(der, outer.start);
+  const version = derItem(der, info.start);
+  const subject = derItem(der, version.end);
+  const spki = derItem(der, subject.end);
+  return der.subarray(spki.offset, spki.end);
+}
+
 export function makeTestCredential(commonName = 'FactorPOS test EGS'): TestCredential {
   const secret = secp256k1.utils.randomPrivateKey();
   const point = Buffer.from(secp256k1.getPublicKey(secret, false));

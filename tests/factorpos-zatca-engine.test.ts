@@ -17,12 +17,15 @@ import {
   FIRST_PREVIOUS_INVOICE_HASH,
   invoiceHash,
   invoiceHashInput,
+  privateKeyScalar,
   signZatcaDocument,
   signedPropertiesDigest,
 } from '../main/services/zatca/signing';
 import type { ZatcaDocumentInput } from '../main/services/zatca/xml';
 import { decodeZatcaQr } from '../shared/print/zatca-qr';
 import { makeTestCredential } from './helpers/zatca-test-credential';
+import { secp256k1 } from '@noble/curves/secp256k1';
+import { buildCsr, certificationRequestInfo, generatePrivateKey } from '../main/services/zatca/csr';
 
 const seller = {
   name: 'مطعم رانسي | Rancy Restaurant',
@@ -195,7 +198,7 @@ function sdkValidate(xml: string, previousHash: string): string {
 }
 
 test(
-  'ZATCA SDK 3.4.8 validates a FactorPOS invoice, a second invoice and a credit note in one chain',
+  'ZATCA SDK 3.4.8 validates FactorPOS invoices, a credit note and a debit note in one chain',
   { skip: !sdk && 'ZATCA SDK not installed (.local-tools/zatca-sdk)' },
   () => {
     const credential = {
@@ -235,10 +238,26 @@ test(
       credential,
       '2026-11-24T07:10:00',
     );
+    const debit = signZatcaDocument(
+      invoice({
+        type: 'debit_note',
+        number: 'INV-20261124-0002-DN4',
+        counter: 4,
+        previousInvoiceHash: credit.invoiceHash,
+        originalInvoiceNumber: 'INV-20261124-0002',
+        reason: 'Price correction',
+        lines: [
+          { name: 'Price correction', quantity: 1, netMinor: 1000, vatMinor: 150, ratePercent: 15 },
+        ],
+      }),
+      credential,
+      '2026-11-24T07:15:00',
+    );
     for (const [label, doc, pih] of [
       ['first invoice', first, FIRST_PREVIOUS_INVOICE_HASH],
       ['second invoice', second, first.invoiceHash],
       ['credit note', credit, second.invoiceHash],
+      ['debit note', debit, credit.invoiceHash],
     ] as const) {
       const output = sdkValidate(doc.xml, pih);
       for (const check of ['XSD', 'EN', 'KSA', 'QR', 'SIGNATURE', 'PIH']) {
@@ -249,6 +268,117 @@ test(
         );
       }
       assert.match(output, /GLOBAL VALIDATION RESULT = PASSED/, `${label}: overall`);
+    }
+  },
+);
+
+// ─── Onboarding: the till's certificate signing request (CSR) ───
+
+const csrFields = {
+  commonName: 'TST-886431145-399999999900003',
+  serialNumber: '1-TST|2-TST|3-ed22f1d8-e6a2-1118-9b58-d9a8f11e445f',
+  vatNumber: '399999999900003',
+  organizationUnit: 'Riyadh Branch',
+  organizationName: 'Maximum Speed Tech Supply LTD',
+  invoiceType: '1100',
+  locationAddress: 'RRRD2929',
+  industry: 'Supply activities',
+};
+
+function csrDer(csr: { pem: string }): Buffer {
+  return Buffer.from(csr.pem.replace(/-----[^-]+-----/g, '').replace(/\s+/g, ''), 'base64');
+}
+
+test('CSR: signed by the till key, template and directory name per environment', () => {
+  const key = generatePrivateKey();
+  const csr = buildCsr(csrFields, 'simulation', key);
+  assert.equal(
+    Buffer.from(csr.base64, 'base64').toString('utf8'),
+    csr.pem,
+    'API form is Base64 of the PEM',
+  );
+  const der = csrDer(csr);
+  // CertificationRequestInfo is the first element; the signature is the last BIT STRING.
+  const infoLength = der.readUInt16BE(6);
+  const info = der.subarray(4, 8 + infoLength);
+  const rest = der.subarray(8 + infoLength);
+  // After the algorithm SEQUENCE: BIT STRING tag, length, unused-bits byte, then the signature.
+  const sigStart = 2 + rest[1] + 3;
+  const point = Buffer.from(secp256k1.getPublicKey(privateKeyScalar(key), false));
+  const publicKey = crypto.createPublicKey({
+    key: Buffer.concat([
+      Buffer.from('3056301006072a8648ce3d020106052b8104000a034200', 'hex'),
+      point,
+    ]),
+    format: 'der',
+    type: 'spki',
+  });
+  assert.ok(
+    crypto.verify('sha256', info, publicKey, rest.subarray(sigStart)),
+    'the CSR signature verifies with the till public key',
+  );
+  for (const [portal, template] of [
+    ['developer-portal', 'TSTZATCA-Code-Signing'],
+    ['simulation', 'PREZATCA-Code-Signing'],
+    ['production', 'ZATCA-Code-Signing'],
+  ] as const) {
+    const body = certificationRequestInfo(csrFields, portal, key);
+    assert.ok(body.includes(Buffer.from(template)), `${portal} uses ${template}`);
+  }
+  assert.ok(info.includes(Buffer.from(csrFields.serialNumber)), 'EGS serial in the directory name');
+});
+
+test('CSR: refuses malformed onboarding details', () => {
+  const key = generatePrivateKey();
+  assert.throws(
+    () => buildCsr({ ...csrFields, vatNumber: '123' }, 'simulation', key),
+    /VAT number/,
+  );
+  assert.throws(() => buildCsr({ ...csrFields, industry: ' ' }, 'simulation', key), /industry/);
+  assert.throws(
+    () => buildCsr({ ...csrFields, invoiceType: '0000' }, 'simulation', key),
+    /invoice type/,
+  );
+  assert.throws(
+    () => buildCsr({ ...csrFields, serialNumber: 'EGS-1' }, 'simulation', key),
+    /EGS serial/,
+  );
+  assert.throws(
+    () => buildCsr({ ...csrFields, vatNumber: '399999999910003' }, 'simulation', key),
+    /VAT group/,
+  );
+});
+
+test(
+  "CSR body is byte-identical to the ZATCA SDK's for the same key and details",
+  { skip: !sdk && 'ZATCA SDK not installed (.local-tools/zatca-sdk)' },
+  () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'factorpos-zatca-csr-'));
+    try {
+      const config = Object.entries({
+        'csr.common.name': csrFields.commonName,
+        'csr.serial.number': csrFields.serialNumber,
+        'csr.organization.identifier': csrFields.vatNumber,
+        'csr.organization.unit.name': csrFields.organizationUnit,
+        'csr.organization.name': csrFields.organizationName,
+        'csr.country.name': 'SA',
+        'csr.invoice.type': csrFields.invoiceType,
+        'csr.location.address': csrFields.locationAddress,
+        'csr.industry.business.category': csrFields.industry,
+      })
+        .map(([k, v]) => `${k}=${v}`)
+        .join('\n');
+      fs.writeFileSync(path.join(dir, 'csr.properties'), config);
+      const args = ['-csr', '-csrConfig', 'csr.properties', '-privateKey', 'key.pem'];
+      args.push('-generatedCsr', 'req.csr', '-pem', '-sim');
+      execFileSync(sdk!, args, { cwd: dir, encoding: 'utf8' });
+      const sdkKey = fs.readFileSync(path.join(dir, 'key.pem'), 'utf8');
+      const sdkCsr = csrDer({ pem: fs.readFileSync(path.join(dir, 'req.csr'), 'utf8') });
+      const sdkInfo = sdkCsr.subarray(4, 8 + sdkCsr.readUInt16BE(6));
+      const ours = certificationRequestInfo(csrFields, 'simulation', sdkKey);
+      assert.equal(ours.toString('hex'), sdkInfo.toString('hex'));
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
     }
   },
 );

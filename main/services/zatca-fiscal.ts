@@ -45,7 +45,7 @@ export class FiscalConflictError extends Error {
   }
 }
 
-function setting(db: Database, key: string): string {
+export function setting(db: Database, key: string): string {
   const row = db.prepare('SELECT value FROM settings WHERE key = ?').get(key) as
     | { value: string | null }
     | undefined;
@@ -95,7 +95,7 @@ function toMinor(value: unknown, factor: number): number {
   return Number.isFinite(n) ? Math.round(n * factor) : 0;
 }
 
-function sellerSnapshot(db: Database) {
+export function sellerSnapshot(db: Database) {
   return {
     name: setting(db, 'business_name'),
     vat_number: setting(db, 'tax_registration_number'),
@@ -113,7 +113,7 @@ function sellerSnapshot(db: Database) {
 }
 
 /** Local signing time (Asia/Riyadh unless the shop has another zone): yyyy-MM-ddTHH:mm:ss. */
-function signingTime(timezone: string): string {
+export function signingTime(timezone: string): string {
   const parts = new Intl.DateTimeFormat('en-GB', {
     timeZone: timezone || 'Asia/Riyadh',
     year: 'numeric',

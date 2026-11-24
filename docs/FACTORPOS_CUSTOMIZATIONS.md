@@ -110,6 +110,15 @@ Covered by `npm run test:factorpos-migrations`.
   `recordRefundCreditNote`. Depends on `@noble/curves` 1.9.7 because Electron's
   BoringSSL has no secp256k1 (pinned; 2.x is ESM-only). FactorPOS migration
   `2026-11-24-zatca-credentials` adds the till's signing credential table.
+- ZATCA onboarding (`main/services/zatca/csr.ts`, `fatoora.ts`, `onboarding.ts`,
+  routes in `main/routes/zatca.ts` mounted at `/api/zatca` in `main/routes/index.ts`):
+  CSR built natively (byte-identical to the SDK's), OTP → compliance CSID, compliance
+  checks of a sample invoice, credit note and debit note, production CSID. Keys and API
+  secrets are encrypted with Electron safeStorage; FactorPOS migration
+  `2026-11-24-zatca-onboarding` adds `zatca_onboarding` and the CSID columns on
+  `zatca_credentials`. The settings card (`frontend/src/components/settings/ZatcaSettingsCard.tsx`)
+  sits on the Tax tab for Saudi shops and carries its own English and Arabic text
+  (`zatca-text.ts`) rather than adding keys to every FloCafe locale.
 - First-run setup preselects Saudi Arabia, SAR and Asia/Riyadh, and lists the selected
   country first (`frontend/src/lib/factorpos-setup.ts`); FloCafe pins India and Argentina
   to the top, which hid the Saudi tick and made India a one-click mistake. FloCafe 3.14 no

@@ -124,16 +124,27 @@ Details: [monthly VAT invoice report](reference/daily-sales-export.md#monthly-va
   KSA, QR, signature and PIH pass for invoices, credit notes and chains, including
   documents produced through the POS. The SDK runs on development machines only
   (`.local-tools/zatca-sdk`); CI runs the same tests with a throwaway credential.
-- Left: debit notes; non-standard-rated lines (refused for now); payment-method
-  corrections on issued bills; the onboarding that creates real credentials (phase 5).
+- Left: debit notes for real sales (the XML supports them; onboarding uses one);
+  non-standard-rated lines (refused for now); payment-method corrections on issued bills.
 
-### 5. Onboarding and keys
+### 5. Onboarding and keys — built on branch `feat/zatca-onboarding`
 
-- Per terminal (EGS): CSR, OTP from the FATOORA portal, compliance CSID,
-  compliance checks, production CSID, renewal before expiry.
-- Private key protected on Windows (DPAPI/CNG); never in the repo, logs or
-  backups in plain text.
-- Settings screen showing onboarding state and certificate expiry.
+- Done: Settings → Tax → ZATCA card (Saudi shops): structured seller details (CR
+  number, address, branch, business category), onboarding with a FATOORA simulation
+  OTP, and the switch that turns simulation invoices on.
+- Onboarding (`main/services/zatca/onboarding.ts`): new secp256k1 key and CSR
+  (`csr.ts`, byte-identical to SDK 3.4.8's `fatoora -csr`), compliance CSID, ZATCA
+  checks of a sample simplified invoice, credit note and debit note, then the
+  production CSID becomes the till's signing credential with its API secret and
+  expiry. Each step is saved; a failed step resumes without a new OTP. A new OTP on an
+  active till renews the certificate (the old one is kept, inactive).
+- Keys and API secrets are encrypted with Electron safeStorage (DPAPI on Windows);
+  onboarding refuses to start when secure storage is unavailable.
+- Checked end to end against ZATCA's developer-portal sandbox (2026-11-24): CSR
+  accepted, all three samples PASS with no warnings, production CSID issued. CI uses a
+  local stand-in for FATOORA; with the SDK installed the samples are also SDK-validated.
+- Left: production onboarding (blocked until phase 6 and the pilot); a renewal reminder
+  before expiry; the FATOORA `PATCH /production/csids` renewal path if ZATCA requires it.
 
 ### 6. Reporting worker
 
