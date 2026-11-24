@@ -9,6 +9,7 @@ import { showPrintLanguageLoadErrorsToast } from '@/lib/printer/warnings-toast';
 import { tenantCan } from '@/lib/permissions';
 import { clearStaleBodyPointerEvents, normalizePathname } from '@/lib/utils';
 import type { Tenant } from '@/lib/types';
+import { editionFeatures, normalizeEdition } from '@shared/edition';
 
 export const LANDING_PAGE_CANDIDATES = [
   ['pos.use', '/pos'],
@@ -28,10 +29,19 @@ export const LANDING_PAGE_CANDIDATES = [
   ['reports.view', '/zatca'], // FactorPOS: ZATCA invoice review
 ] as const;
 
+/** FactorPOS: pages that exist only in one edition (shared/edition.ts). */
+export function editionAllowsPath(tenant: Tenant | null | undefined, path: string | null): boolean {
+  if (path === '/zatca' || path?.startsWith('/zatca/')) {
+    return editionFeatures(normalizeEdition(tenant?.edition)).zatca;
+  }
+  return true;
+}
+
 export function getLandingPage(tenant?: Tenant | null): string {
   return (
-    LANDING_PAGE_CANDIDATES.find(([permission]) => tenantCan(tenant, permission))?.[1] ??
-    '/auth/login'
+    LANDING_PAGE_CANDIDATES.find(
+      ([permission, path]) => tenantCan(tenant, permission) && editionAllowsPath(tenant, path),
+    )?.[1] ?? '/auth/login'
   );
 }
 
@@ -251,7 +261,8 @@ export default function AuthGuard({ children }: { children: React.ReactNode }) {
       if (
         (pagePermission && !tenantCan(currentTenant, pagePermission[1])) ||
         (pathname === '/staff' && !canOpenStaff) ||
-        (pathname === '/settings' && !canOpenSettings)
+        (pathname === '/settings' && !canOpenSettings) ||
+        !editionAllowsPath(currentTenant, pathname)
       ) {
         router.replace(getLandingPage(currentTenant));
       }

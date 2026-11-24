@@ -28,6 +28,11 @@ import {
 } from '../services/zatca/fatoora';
 import { onboardingState, OnboardingError, runOnboarding } from '../services/zatca/onboarding';
 import { CsrFieldError } from '../services/zatca/csr';
+import {
+  getActiveCountryPack,
+  isTaxModuleActiveForCountry,
+  previewCategoryRate,
+} from '../services/tax';
 import { documentsForDay, markDayReviewed, reportingSummary } from '../services/zatca/reporting';
 import { zatcaReporting } from '../services/zatca/reporting-worker';
 import { currentEdition } from '../edition';
@@ -71,6 +76,27 @@ function sellerCheck(db: ReturnType<typeof getDatabase>): {
   }
 }
 
+/**
+ * ZATCA invoices need Saudi VAT at 15% on every sale: the official Saudi Arabia tax pack
+ * must be on. Without it bills carry no VAT breakdown and cannot be issued.
+ */
+function vatCheck(db: ReturnType<typeof getDatabase>): { ok: boolean; problem: string | null } {
+  const problem =
+    'Switch on Saudi VAT first: Settings → Tax → Official Tax Pack. ZATCA invoices need 15% VAT on every sale.';
+  try {
+    const country = setting(db, 'country') || 'SA';
+    if (country !== 'SA' || !isTaxModuleActiveForCountry(country)) return { ok: false, problem };
+    const rate = previewCategoryRate(
+      getActiveCountryPack(country),
+      setting(db, 'business_type') || 'restaurant',
+      'standard',
+    );
+    return rate?.percent === 15 ? { ok: true, problem: null } : { ok: false, problem };
+  } catch {
+    return { ok: false, problem };
+  }
+}
+
 function overview(db: ReturnType<typeof getDatabase>) {
   const snapshot = sellerSnapshot(db);
   const environment = setting(db, 'zatca_environment') || 'disabled';
@@ -84,6 +110,7 @@ function overview(db: ReturnType<typeof getDatabase>) {
       ),
     },
     seller_check: sellerCheck(db),
+    vat_check: vatCheck(db),
     onboarding: onboardingState(db, 'simulation'),
     certificate: credentialSummary(db, 'simulation'),
     reporting: reportingSummary(db),
@@ -196,6 +223,10 @@ router.put(
         });
       }
       if (target === 'simulation') {
+        const vat = vatCheck(db);
+        if (!vat.ok) {
+          return res.status(409).json({ error: vat.problem, code: 'zatca_vat_not_configured' });
+        }
         const check = sellerCheck(db);
         if (!check.complete) {
           return res.status(409).json({ error: check.problem, code: 'zatca_seller_incomplete' });

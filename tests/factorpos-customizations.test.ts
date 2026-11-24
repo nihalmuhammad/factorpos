@@ -281,6 +281,9 @@ test('editions: KOT by default; the ZATCA installer has its own identity and fee
   ]) {
     assert.match(read(file), /showsOrderToken && order\.token_number != null/, file);
   }
+  const guard = read('frontend/src/components/layout/AuthGuard.tsx');
+  assert.match(guard, /!editionAllowsPath\(currentTenant, pathname\)/, 'KOT cannot open /zatca');
+  assert.match(guard, /editionAllowsPath\(tenant, path\)/, 'KOT never lands on /zatca');
   const workflow = read('.github/workflows/factorpos-release.yml');
   assert.match(workflow, /edition: zatca/, 'the release builds the ZATCA installer');
   assert.match(workflow, /gh release upload zatca-updates/, 'and refreshes its feed');

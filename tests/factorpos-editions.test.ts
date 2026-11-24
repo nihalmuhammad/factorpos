@@ -162,6 +162,19 @@ async function main() {
       assertEqualOrThrow(JSON.parse(await template()).id, 'saudi', 'Saudi invoice is printed');
       const zatca = await api(baseUrl, '/api/zatca', { headers: authHeader });
       assertEqualOrThrow(zatca.status, 200, 'ZATCA routes are there');
+      assertEqualOrThrow(zatca.data.vat_check?.ok, false, 'VAT is not set up in this test shop');
+      assertOrThrow(
+        /CR number/.test(zatca.data.seller_check.problem) &&
+          !/\bcrn\b|buildingNumber|postalCode/.test(zatca.data.seller_check.problem),
+        'missing seller details are named in words, not field codes',
+      );
+      const noVat = await api(baseUrl, '/api/zatca/environment', {
+        method: 'PUT',
+        body: { environment: 'simulation' },
+        headers: authHeader,
+      });
+      assertEqualOrThrow(noVat.status, 409, 'ZATCA invoices cannot switch on without Saudi VAT');
+      assertEqualOrThrow(noVat.data.code, 'zatca_vat_not_configured', 'refusal code');
       setSetting(db, 'zatca_environment', 'simulation');
       assertEqualOrThrow(
         activeZatcaEnvironment(db),

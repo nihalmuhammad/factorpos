@@ -13,6 +13,7 @@ import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Ltr } from '@/components/layout/Ltr';
 import { useZatcaText } from '@/components/settings/zatca-text';
+import { useEdition } from '@/hooks/useEdition';
 import { useFormatCurrency } from '@/hooks/useFormatCurrency';
 import { useFormatDate } from '@/hooks/useFormatDate';
 import api from '@/lib/api';
@@ -65,6 +66,13 @@ function localToday(timeZone: string): string {
 const utcDate = (sql: string) => new Date(sql.includes('T') ? sql : `${sql.replace(' ', 'T')}Z`);
 
 export default function ZatcaReviewPage() {
+  const { zatca } = useEdition();
+  // The KOT edition has no ZATCA: AuthGuard sends people away; render nothing meanwhile.
+  if (!zatca) return null;
+  return <ZatcaReview />;
+}
+
+function ZatcaReview() {
   const zt = useZatcaText();
   const formatCurrency = useFormatCurrency();
   const { formatDateTime } = useFormatDate();
@@ -250,7 +258,7 @@ export default function ZatcaReviewPage() {
                         )}
                         {doc.status === 'pending' && doc.attempts > 0 && (
                           <div className="mt-1 text-xs text-muted-foreground">
-                            {zt('review.attempts', {
+                            {zt(doc.attempts === 1 ? 'review.attemptsOne' : 'review.attempts', {
                               count: doc.attempts,
                               at: doc.nextAttemptAt
                                 ? formatDateTime(utcDate(doc.nextAttemptAt))

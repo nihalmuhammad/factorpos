@@ -49,12 +49,22 @@ export function zatcaSeller(seller: SellerSnapshot): ZatcaSeller {
     city: String(seller.city ?? '').trim(),
     postalCode: String(seller.postal_code ?? '').trim(),
   };
-  const missing = Object.entries(out)
-    .filter(([, value]) => !value)
-    .map(([key]) => key);
+  const labels: Record<keyof ZatcaSeller, string> = {
+    name: 'seller name',
+    vatNumber: 'VAT number',
+    crn: 'CR number',
+    street: 'street',
+    buildingNumber: 'building number',
+    district: 'district',
+    city: 'city',
+    postalCode: 'postal code',
+  };
+  const missing = (Object.keys(out) as Array<keyof ZatcaSeller>)
+    .filter((key) => !out[key])
+    .map((key) => labels[key]);
   if (missing.length > 0) {
     throw new ZatcaDocumentError(
-      `The ZATCA seller details are incomplete (${missing.join(', ')}). Fill them in Settings before issuing invoices.`,
+      `The ZATCA seller details are incomplete (missing: ${missing.join(', ')}). Fill them in Settings → Tax before issuing invoices.`,
       'zatca_seller_incomplete',
     );
   }

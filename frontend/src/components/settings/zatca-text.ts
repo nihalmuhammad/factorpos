@@ -57,8 +57,9 @@ export const ZATCA_TEXT_EN = {
   switchOff: 'Switch off',
   issuingOn: 'ZATCA invoices are on (simulation)',
   issuingOff: 'ZATCA invoices are off',
-  productionNote:
-    'Production comes after automatic reporting to ZATCA is built and the pilot is signed off.',
+  productionNote: 'Production comes after the simulation pilot is signed off.',
+  vatRequired:
+    'Switch on Saudi VAT first: Settings → Tax → Official Tax Pack. ZATCA invoices need 15% VAT on every sale.',
   errors: {
     zatca_otp_required: 'Enter the OTP from the FATOORA portal.',
     zatca_otp_invalid: 'The OTP is 6 digits.',
@@ -102,6 +103,7 @@ export const ZATCA_TEXT_EN = {
     markReviewed: 'Mark day reviewed',
     reviewed: 'Reviewed by {by} at {at}',
     reviewedToast: 'Day marked reviewed',
+    attemptsOne: '1 try; next try {at}',
     attempts: '{count} tries; next try {at}',
     correctionHint:
       'To correct a reported invoice, refund it from Orders: FactorPOS issues and reports the credit note. A rejected document stays issued; correct it the same way after checking the errors.',
@@ -170,7 +172,9 @@ export const ZATCA_TEXT_AR: Shape<typeof ZATCA_TEXT_EN> = {
   switchOff: 'إيقاف',
   issuingOn: 'فواتير زاتكا مفعّلة (محاكاة)',
   issuingOff: 'فواتير زاتكا متوقفة',
-  productionNote: 'بيئة الإنتاج تأتي بعد بناء الإبلاغ التلقائي إلى زاتكا واعتماد التجربة.',
+  productionNote: 'بيئة الإنتاج تأتي بعد اعتماد تجربة المحاكاة.',
+  vatRequired:
+    'فعّل ضريبة القيمة المضافة السعودية أولًا: الإعدادات ← الضريبة ← حزمة الضريبة الرسمية. تحتاج فواتير زاتكا إلى ضريبة 15% على كل عملية بيع.',
   errors: {
     zatca_otp_required: 'أدخل رمز التحقق من بوابة فاتورة.',
     zatca_otp_invalid: 'رمز التحقق مكوّن من 6 أرقام.',
@@ -214,6 +218,7 @@ export const ZATCA_TEXT_AR: Shape<typeof ZATCA_TEXT_EN> = {
     markReviewed: 'تعليم اليوم كمراجَع',
     reviewed: 'راجعه {by} في {at}',
     reviewedToast: 'تم تعليم اليوم كمراجَع',
+    attemptsOne: 'محاولة واحدة؛ المحاولة التالية {at}',
     attempts: '{count} محاولات؛ المحاولة التالية {at}',
     correctionHint:
       'لتصحيح فاتورة مُبلَّغة، استردّها من الطلبات: يُصدر FactorPOS إشعار الدائن ويبلّغ عنه. المستند المرفوض يبقى صادرًا؛ صحّحه بالطريقة نفسها بعد مراجعة الأخطاء.',
