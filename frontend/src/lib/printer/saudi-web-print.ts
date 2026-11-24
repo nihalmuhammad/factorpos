@@ -61,6 +61,11 @@ function issueDate(timestamp: string, timezone: string): string {
   return `${get('day')}/${get('month')}/${get('year')} ${get('hour')}:${get('minute')}:${get('second')}`;
 }
 
+/** Meta row: English label with the Arabic label beneath, value kept on one line. */
+function meta(en: string, ar: string, value: unknown): string {
+  return `<tr><td class="label">${esc(en)}<div class="ar" dir="rtl">${esc(ar)}</div></td><td class="value" dir="ltr">${esc(value)}</td></tr>`;
+}
+
 /** Two-language label: English left, Arabic right. */
 function pair(en: string, ar: string, amount: string, cls = ''): string {
   return `<tr class="${cls}"><td>${esc(en)}<div class="ar" dir="rtl">${esc(ar)}</div></td><td class="num">${esc(amount)}</td></tr>`;
@@ -132,7 +137,6 @@ export function generateSaudiBillHtml(bill: Bill, opts: SaudiWebInvoiceOptions):
   .center { text-align: center; }
   h1 { font-size: 1.35em; font-weight: 800; }
   .title { border-top: 1px solid #000; border-bottom: 1px solid #000; margin: 6px 0; padding: 4px 0; font-weight: 800; }
-  .title .ar { font-size: 1.25em; }
   .reprint { border: 2px solid #000; text-align: center; font-weight: 800; padding: 3px; margin-bottom: 6px; }
   table { width: 100%; border-collapse: collapse; }
   td, th { padding: 2px 0; vertical-align: top; }
@@ -140,10 +144,14 @@ export function generateSaudiBillHtml(bill: Bill, opts: SaudiWebInvoiceOptions):
   .num { text-align: end; white-space: nowrap; padding-inline-start: 6px; }
   .items td { border-bottom: 1px dashed #000; }
   .addon { font-size: 0.9em; padding-inline-start: 8px; }
-  .ar { font-family: 'Noto Naskh Arabic', Tahoma, 'Segoe UI', sans-serif; }
+  .ar { font-family: 'Noto Naskh Arabic', Tahoma, 'Segoe UI', sans-serif; font-size: 0.85em; font-weight: 600; text-align: start; }
+  .title .ar { font-size: 1.25em; font-weight: 800; text-align: center; }
+  .meta td.value { text-align: end; white-space: nowrap; vertical-align: top; }
+  .meta td.label, .totals td:first-child { width: 100%; }
+  .vat-no { white-space: nowrap; }
+  .meta .ar, .totals .ar { text-align: left; }
   .totals { margin-top: 6px; }
   .grand td { border-top: 2px solid #000; font-size: 1.2em; font-weight: 800; padding-top: 4px; }
-  .meta td:last-child { text-align: end; }
   .qr { display: block; width: 38mm; height: 38mm; margin: 8px auto 4px; image-rendering: pixelated; }
   .note { font-size: 0.9em; margin-top: 6px; }
 </style>
@@ -155,14 +163,14 @@ export function generateSaudiBillHtml(bill: Bill, opts: SaudiWebInvoiceOptions):
     ${opts.businessName ? `<h1>${esc(opts.businessName)}</h1>` : ''}
     ${opts.address ? `<div>${esc(opts.address).replace(/\n/g, '<br>')}</div>` : ''}
     ${opts.phone ? `<div>Tel: <span dir="ltr">${esc(opts.phone)}</span></div>` : ''}
-    ${vatNumber ? `<div><strong>VAT No / الرقم الضريبي:</strong> <span dir="ltr">${esc(vatNumber)}</span></div>` : ''}
+    ${vatNumber ? `<div class="vat-no"><strong>VAT No:</strong> <span dir="ltr">${esc(vatNumber)}</span></div><div class="ar" dir="rtl" style="text-align:center">الرقم الضريبي: <span dir="ltr">${esc(vatNumber)}</span></div>` : ''}
   </div>
   <div class="title center"><div class="ar" dir="rtl">${SAUDI_TITLE_AR}</div><div>${SAUDI_TITLE_EN.toUpperCase()}</div></div>
   <table class="meta">
-    <tr><td>Invoice No / رقم الفاتورة</td><td dir="ltr">${esc(bill.bill_number)}</td></tr>
-    <tr><td>Date / التاريخ</td><td dir="ltr">${esc(issueDate(issuedAt, opts.timezone ?? ''))}</td></tr>
-    ${order?.order_number ? `<tr><td>Order No / رقم الطلب</td><td dir="ltr">${esc(order.order_number)}</td></tr>` : ''}
-    ${opts.showTableNumber !== false && order?.table?.name ? `<tr><td>Table / الطاولة</td><td>${esc(order.table.name)}</td></tr>` : ''}
+    ${meta('Invoice No', 'رقم الفاتورة', bill.bill_number)}
+    ${meta('Date', 'التاريخ', issueDate(issuedAt, opts.timezone ?? ''))}
+    ${order?.order_number ? meta('Order No', 'رقم الطلب', order.order_number) : ''}
+    ${opts.showTableNumber !== false && order?.table?.name ? meta('Table', 'الطاولة', order.table.name) : ''}
   </table>
   <table class="items" style="margin-top:6px">
     <tr><th>Item / الصنف</th><th class="num">Qty</th><th class="num">Price</th><th class="num">Total</th></tr>

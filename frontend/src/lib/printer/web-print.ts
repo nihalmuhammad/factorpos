@@ -130,6 +130,25 @@ export async function ensureReceiptMessagesLoaded(lang: Language): Promise<Langu
   }
 }
 
+const PRINT_IMAGE_WAIT_MS = 3000;
+
+/** Resolves once every image in the document has loaded or failed, or after `timeoutMs`. */
+export function waitForPrintImages(doc: Document, timeoutMs: number): Promise<void> {
+  const pending = Array.from(doc.images ?? []).filter((img) => !img.complete);
+  if (pending.length === 0) return Promise.resolve();
+  const loads = pending.map(
+    (img) =>
+      new Promise<void>((resolve) => {
+        img.addEventListener('load', () => resolve(), { once: true });
+        img.addEventListener('error', () => resolve(), { once: true });
+      }),
+  );
+  return Promise.race([
+    Promise.all(loads).then(() => undefined),
+    new Promise<void>((resolve) => setTimeout(resolve, timeoutMs)),
+  ]);
+}
+
 /** Generate HTML for A4/A5 printing and open print dialog. */
 export async function printWebBill(
   bill: Bill,
@@ -195,7 +214,17 @@ export async function printWebBill(
       }
     };
 
+    // FactorPOS: a data: image (logo, ZATCA QR) written into the print window may
+    // still be decoding when the document reports complete; wait for it so the
+    // printed bill is not missing the QR.
+    let waitingForImages = false;
     const triggerPrint = () => {
+      if (settled || waitingForImages) return;
+      waitingForImages = true;
+      void waitForPrintImages(printWindow.document, PRINT_IMAGE_WAIT_MS).then(printNow);
+    };
+
+    const printNow = () => {
       if (settled) return;
       try {
         if (printWindow.closed) {
