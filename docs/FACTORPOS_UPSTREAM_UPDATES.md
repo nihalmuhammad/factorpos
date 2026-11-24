@@ -80,6 +80,7 @@ How to resolve the usual conflicts:
 | `main/routes/settings.ts`, `main/routes/auth.ts`, `main/countries.ts` | Saudi defaults and Western digits. |
 | `main/services/google-drive.ts` | `DRIVE_BACKUP_FOLDER_NAME = 'FactorPOS Backups'`: shop backups already live in that Drive folder. |
 | `main/routes/orders.ts` | The `token_number` column and `generateTokenNumber()` in order creation. |
+| `main/routes/index.ts`, `frontend/src/app/(dashboard)/settings/page.tsx` | The `/api/zatca` mount and the `ZatcaSettingsCard` on the Tax tab. |
 | `main/db.ts` `MIGRATIONS` | FloCafe's numbered list exactly as upstream has it. FactorPOS schema changes live only in `FACTORPOS_MIGRATIONS` (tracked by id); never add or renumber a numbered migration for FactorPOS. |
 | `AGENTS.md`, `CLAUDE.md`, `frontend/AGENTS.md` | Keep them deleted (local files, not tracked in FactorPOS): `git rm` them. |
 | `.github/workflows/full-cross-platform-matrix.yml` | The FactorPOS manual-only trigger. |

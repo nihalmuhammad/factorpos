@@ -32,7 +32,7 @@ export interface ZatcaLine {
 }
 
 export interface ZatcaDocumentInput {
-  type: 'invoice' | 'credit_note';
+  type: 'invoice' | 'credit_note' | 'debit_note';
   /** cbc:ID — the bill number (invoices) or a credit note number. */
   number: string;
   uuid: string;
@@ -45,7 +45,7 @@ export interface ZatcaDocumentInput {
   lines: ZatcaLine[];
   /** UNTDID 4461 payment means code: 10 cash, 48 bank card, 1 not defined. */
   paymentMeansCode: string;
-  /** Credit notes: the original invoice number and the reason. */
+  /** Credit and debit notes: the original invoice number and the reason. */
   originalInvoiceNumber?: string;
   reason?: string;
 }
@@ -124,7 +124,8 @@ export function buildZatcaXml(input: ZatcaDocumentInput, signature?: ZatcaSignat
   const s = input.seller;
   const totals = documentTotals(input.lines);
   const rate = input.lines[0].ratePercent;
-  const isCredit = input.type === 'credit_note';
+  const isNote = input.type !== 'invoice';
+  const typeCode = { invoice: '388', credit_note: '381', debit_note: '383' }[input.type];
   const parts: string[] = [
     '<?xml version="1.0" encoding="UTF-8"?>',
     `<Invoice ${ROOT_NAMESPACES}>`,
@@ -136,11 +137,11 @@ export function buildZatcaXml(input: ZatcaDocumentInput, signature?: ZatcaSignat
     `<cbc:UUID>${input.uuid}</cbc:UUID>`,
     `<cbc:IssueDate>${input.issueDate}</cbc:IssueDate>`,
     `<cbc:IssueTime>${input.issueTime}</cbc:IssueTime>`,
-    `<cbc:InvoiceTypeCode name="0200000">${isCredit ? '381' : '388'}</cbc:InvoiceTypeCode>`,
+    `<cbc:InvoiceTypeCode name="0200000">${typeCode}</cbc:InvoiceTypeCode>`,
     '<cbc:DocumentCurrencyCode>SAR</cbc:DocumentCurrencyCode>',
     '<cbc:TaxCurrencyCode>SAR</cbc:TaxCurrencyCode>',
   );
-  if (isCredit) {
+  if (isNote) {
     parts.push(
       '<cac:BillingReference><cac:InvoiceDocumentReference>' +
         `<cbc:ID>${xmlText(input.originalInvoiceNumber ?? '')}</cbc:ID>` +
@@ -171,8 +172,8 @@ export function buildZatcaXml(input: ZatcaDocumentInput, signature?: ZatcaSignat
     '<cac:AccountingCustomerParty></cac:AccountingCustomerParty>',
     '<cac:PaymentMeans>' +
       `<cbc:PaymentMeansCode>${input.paymentMeansCode}</cbc:PaymentMeansCode>` +
-      (isCredit
-        ? `<cbc:InstructionNote>${xmlText(input.reason || 'Refund')}</cbc:InstructionNote>`
+      (isNote
+        ? `<cbc:InstructionNote>${xmlText(input.reason || (input.type === 'credit_note' ? 'Refund' : 'Adjustment'))}</cbc:InstructionNote>`
         : '') +
       '</cac:PaymentMeans>',
     `<cac:TaxTotal>${amount('TaxAmount', totals.vat)}</cac:TaxTotal>`,

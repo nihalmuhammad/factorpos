@@ -84,6 +84,7 @@ import { InitializeDatabaseDialog } from '@/components/settings/InitializeDataba
 import { CurrencyResetDialog } from '@/components/settings/CurrencyResetDialog';
 import { WhatsAppEnableCard } from '@/components/settings/WhatsAppEnableCard';
 import { TaxConfigurationPanel } from '@/components/settings/TaxConfigurationPanel';
+import { ZatcaSettingsCard } from '@/components/settings/ZatcaSettingsCard';
 import { PaymentMethodsSettings } from '@/components/settings/PaymentMethodsSettings';
 import { ChargesSettingsCard } from '@/components/settings/ChargesSettingsCard';
 import {
@@ -5055,6 +5056,12 @@ export default function SettingsPage() {
                 canManageSettings={isAdmin}
                 canManageTaxConfiguration={canManageTaxConfiguration}
               />
+              {/* FactorPOS: ZATCA e-invoicing for Saudi shops. */}
+              {currentTenant?.country === 'SA' && (
+                <div className="mt-6">
+                  <ZatcaSettingsCard canManage={canManageTaxConfiguration} />
+                </div>
+              )}
             </TabsContent>
           )}
 
