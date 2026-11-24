@@ -92,12 +92,20 @@ Details: [monthly VAT invoice report](reference/daily-sales-export.md#monthly-va
 - Tests: rounding against bill totals, month boundaries in Asia/Riyadh,
   business day vs calendar day, refunds in a later month.
 
-### 3. Fiscal records (port from the fork)
+### 3. Fiscal records — built on branch `feat/zatca-fiscal-records`
 
-- Port the fiscal reservation, frozen snapshot and bill status commits as
-  FactorPOS migrations.
-- Fit the fork's driver-collection work around FloCafe's own delivery features
-  rather than adding a second delivery model.
+- Done: `zatca_environment` setting (`disabled` by default, `simulation`;
+  `production` refused until signing and reporting exist). Each bill that becomes
+  fully paid gets one frozen, numbered simplified-invoice record in the same
+  transaction as the payment (normal payment, exact-balance settlement, zero-total
+  and split recalculation). Each refund gets a credit note linked to that invoice;
+  a refund on a bill with no invoice record is refused while issuance is on.
+  Records cannot be edited or deleted (database triggers), the counter only moves
+  forward, and an issued zero-total bill cannot be recalculated. Bill responses
+  carry a read-only `fiscal` status once issuance has been on.
+- Left: the fork's driver-collection work, to be fitted around FloCafe's own
+  delivery features rather than added as a second delivery model. Payment-method
+  corrections on issued bills are decided with signing (phase 4).
 
 ### 4. ZATCA engine (port from the prototype)
 
@@ -115,6 +123,10 @@ Details: [monthly VAT invoice report](reference/daily-sales-export.md#monthly-va
 
 ### 6. Reporting worker
 
+- Decided 2026-11-24: reporting is automatic and cannot be switched off; the
+  accountant reviews the day's invoices afterwards on a review screen (mark the day
+  reviewed, raise credit notes for mistakes) and can send waiting invoices or retry
+  failed ones by hand.
 - Durable queue in SQLite; reports each invoice right after signing; retries
   with backoff when offline.
 - Alerts before the 24-hour limit (BR-KSA-98); manager screen for warnings and

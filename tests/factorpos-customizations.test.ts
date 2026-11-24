@@ -212,6 +212,19 @@ test('Saudi simplified tax invoice with the ZATCA QR is a core bill format', () 
   assert.match(read('shared/print/zatca-qr.ts'), /export const ZATCA_PREVIEW_ONLY = true;/);
 });
 
+test('ZATCA fiscal records stay wired into payments and refunds, off by default', () => {
+  const bills = read('main/routes/bills.ts');
+  assert.ok(
+    (bills.match(/recordFiscalInvoiceIfPaid\(db, /g) ?? []).length >= 4,
+    'every paid path records',
+  );
+  assert.match(read('main/services/refund.ts'), /recordRefundCreditNote\(db, req\.billId/);
+  const db = read('main/db.ts');
+  assert.match(db, /'2026-11-24-zatca-fiscal-records'/);
+  assert.match(db, /VALUES \('zatca_environment', 'disabled', \?\)/);
+  assert.match(db, /zatca_fiscal_documents_no_delete/);
+});
+
 test('orders carry the day token and setup preselects Saudi Arabia', () => {
   const orders = read('main/routes/orders.ts');
   assert.match(
@@ -278,6 +291,7 @@ test('FactorPOS regression suites stay in npm test', () => {
     'test:shutdown-lifecycle',
     'test:factorpos-migrations',
     'test:factorpos-saudi-invoice',
+    'test:factorpos-zatca-fiscal-records',
     'test:monthly-vat-export',
     'test:cash-closures',
     'test:country-localization',

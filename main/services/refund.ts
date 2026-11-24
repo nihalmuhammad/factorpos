@@ -11,6 +11,7 @@ import {
   recordOrderAudit,
 } from '../db';
 import { invertTaxBreakdown, invertTaxSnapshot } from './tax';
+import { recordRefundCreditNote } from './zatca-fiscal';
 import { adjustProductStock } from './inventory';
 import { reconcileActiveOrderStatusFromItems } from './orders';
 import {
@@ -556,6 +557,8 @@ export function createRefund(db: Database, req: RefundRequest): RefundResult {
     timestamp,
     req.billId,
   );
+  // FactorPOS: the refund's ZATCA credit note, linked to the bill's invoice (no-op while off).
+  recordRefundCreditNote(db, req.billId, Number(insertResult.lastInsertRowid));
 
   if (isStoreCreditRefund) {
     // A plain 'credit' row — wallet-funded spend is already excluded from the cashback base.
