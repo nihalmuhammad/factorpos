@@ -13,7 +13,7 @@
 import type { getDatabase } from '../../db';
 import { loadSigningCredential, loadReportingAuth } from './credentials';
 import { localIssueDateTime } from './document';
-import { FatooraError, type FatooraClient, type ReportingResult } from './fatoora';
+import { errorMessage, FatooraError, type FatooraClient, type ReportingResult } from './fatoora';
 
 type Database = ReturnType<typeof getDatabase>;
 
@@ -165,8 +165,8 @@ export async function reportDueDocuments(
       if (status === 'reported') result.reported += 1;
       else if (status === 'warning') result.warnings += 1;
       else result.rejected += 1;
-    } catch (error: any) {
-      const message = String(error?.message || error);
+    } catch (error: unknown) {
+      const message = errorMessage(error);
       const httpStatus = error instanceof FatooraError ? error.status : null;
       const retryAt = new Date(now.getTime() + backoffMs(job.attempt_count + 1));
       update.run(
@@ -210,8 +210,30 @@ function documentNumber(xml: string): string {
   return /<cbc:ID>([^<]*)<\/cbc:ID>/.exec(xml.slice(afterProfile))?.[1] ?? '';
 }
 
-function toDocument(row: any, timezone: string, now: Date): ReportingDocument {
-  const response = row.response_json ? JSON.parse(row.response_json) : {};
+interface DocumentRow {
+  id: string;
+  counter: number;
+  document_type: ReportingDocument['type'];
+  bill_id: number | null;
+  environment: string;
+  issued_at: string;
+  total_with_vat_minor: number;
+  vat_minor: number;
+  signed_xml: string | null;
+  status: ReportingStatus | null;
+  attempt_count: number | null;
+  next_attempt_at: string | null;
+  response_json: string | null;
+  reviewed_at: string | null;
+  reviewed_by: string | null;
+}
+
+function toDocument(row: DocumentRow, timezone: string, now: Date): ReportingDocument {
+  const response = (row.response_json ? JSON.parse(row.response_json) : {}) as {
+    errors?: unknown;
+    warnings?: unknown;
+    error?: unknown;
+  };
   const local = localIssueDateTime(row.issued_at, timezone);
   return {
     id: row.id,
@@ -259,7 +281,7 @@ export function documentsForDay(
        LEFT JOIN zatca_reporting_jobs j ON j.document_id = d.id
        WHERE d.issued_at >= ? AND d.issued_at < ? ORDER BY d.counter`,
     )
-    .all(from, to);
+    .all(from, to) as DocumentRow[];
   return rows.map((row) => toDocument(row, timezone, now)).filter((doc) => doc.issueDate === date);
 }
 

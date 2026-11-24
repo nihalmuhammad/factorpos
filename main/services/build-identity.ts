@@ -8,6 +8,8 @@ type BuildIdentity = {
   official_release?: boolean;
   posthog_project_token?: string | null;
   posthog_host?: string | null;
+  support_ticket_url?: string | null;
+  support_ticket_secret?: string | null;
 };
 
 export function resolveBuildIdentity(metadata: unknown, packaged: boolean): string {
@@ -76,5 +78,27 @@ export function getBuildIdentity(): string {
     return resolveBuildIdentity(readMetadata(), true);
   } catch {
     return 'unknown';
+  }
+}
+
+export interface BuildSupportTicketSettings {
+  url?: string;
+  secret?: string;
+}
+
+/** FactorPOS: the Submit Ticket endpoint a release workflow stamped into the build, if any. */
+export function resolveBuildSupportTicketSettings(metadata: unknown): BuildSupportTicketSettings {
+  if (!metadata || typeof metadata !== 'object' || Array.isArray(metadata)) return {};
+  const value = metadata as Partial<BuildIdentity>;
+  const text = (field: unknown) =>
+    typeof field === 'string' && field.trim() ? field.trim() : undefined;
+  return { url: text(value.support_ticket_url), secret: text(value.support_ticket_secret) };
+}
+
+export function readBuildSupportTicketSettings(): BuildSupportTicketSettings {
+  try {
+    return resolveBuildSupportTicketSettings(readMetadata());
+  } catch {
+    return {};
   }
 }
