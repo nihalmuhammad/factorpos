@@ -59,9 +59,22 @@ export function paymentMethodBreakdown(
   return db
     .prepare(
       `
-    WITH payment_lines AS (
-      SELECT b.paid_at, b.created_at, je.value AS line
+    WITH window_bills AS (
+      -- The filter created_at < end AND (paid_at IS NULL OR paid_at >= start), split into its two
+      -- disjoint halves so each one is an index lookup on paid_at. As a single OR, SQLite
+      -- walked idx_bills_created_at from the first bill ever, so every dashboard load
+      -- parsed the payment JSON of the store's whole history. The unary + keeps the
+      -- planner off the created_at index, whose range is open towards the past.
+      SELECT b.id, b.order_id, b.paid_at, b.created_at, b.payment_details
       FROM bills b
+      WHERE b.paid_at >= ? AND +b.created_at < ?
+      UNION ALL
+      SELECT b.id, b.order_id, b.paid_at, b.created_at, b.payment_details
+      FROM bills b
+      WHERE b.paid_at IS NULL AND +b.created_at < ? AND ? = 0
+    ), payment_lines AS (
+      SELECT b.paid_at, b.created_at, je.value AS line
+      FROM window_bills b
       LEFT JOIN orders o ON o.id = b.order_id
       JOIN json_each(CASE
         WHEN json_valid(b.payment_details) AND json_type(b.payment_details) = 'array'
@@ -71,9 +84,6 @@ export function paymentMethodBreakdown(
         ELSE '[]'
       END) je
       WHERE b.payment_details IS NOT NULL
-        AND b.created_at < ?
-        AND (b.paid_at IS NULL OR b.paid_at >= ?)
-        AND (? = 0 OR b.paid_at IS NOT NULL)
         AND (? = 0 OR COALESCE(o.status, '') != 'cancelled')
         AND json_type(je.value) = 'object'
     ), normalized AS (
@@ -90,8 +100,10 @@ export function paymentMethodBreakdown(
       UNION ALL
       SELECT r.method, NULL, -(CAST(r.amount_cents AS REAL) / ?),
         datetime(CASE WHEN ? = 1 THEN b.paid_at ELSE r.created_at END)
+      -- CROSS JOIN pins refunds as the outer loop: once PRAGMA optimize has row counts, a shop
+      -- with no refunds yet otherwise had SQLite scan every bill looking for one.
       FROM refunds r
-      JOIN bills b ON b.id = r.bill_id
+      CROSS JOIN bills b ON b.id = r.bill_id
       LEFT JOIN orders o ON o.id = b.order_id
       WHERE (? = 0 OR COALESCE(o.status, '') != 'cancelled')
     )
@@ -104,8 +116,9 @@ export function paymentMethodBreakdown(
   `,
     )
     .all(
-      end,
       start,
+      end,
+      end,
       paidOnly ? 1 : 0,
       excludeCancelledOrders ? 1 : 0,
       keyByPaidAt ? 1 : 0,
