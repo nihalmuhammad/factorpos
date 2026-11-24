@@ -5267,6 +5267,7 @@ router.get(
     res.json({
       payload: qr.payload,
       fields: qr.fields,
+      signed: qr.signed,
       qr_data_url: await zatcaQrDataUrl(qr.payload),
     });
   }),

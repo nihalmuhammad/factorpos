@@ -255,3 +255,118 @@ test('browser bill shows both titles, VAT split and the QR image', () => {
   assert.ok(escaped.includes('&lt;b&gt;x&lt;/b&gt;'), 'item names are escaped');
   assert.ok(escaped.includes('Add the VAT number in Settings'));
 });
+
+// ─── Signed ZATCA invoice behind the bill (Saudi format only) ───
+
+const { saudiQrModuleSize } = require('../main/printers/document-saudi');
+const { zatcaReceiptBanner } = require('../shared/print/zatca-qr');
+
+// A 9-tag QR is far longer than the preview one; the content here only needs the size.
+const SIGNED_QR = Buffer.from('signed-zatca-qr-'.repeat(33)).toString('base64');
+const signed = (environment: 'simulation' | 'production') => ({
+  qrPayload: SIGNED_QR,
+  environment,
+  issueDate: '2026-11-24',
+  issueTime: '07:00:09',
+});
+
+const qrModuleByte = (data: Buffer) => {
+  const at = data.indexOf(Buffer.from([0x1d, 0x28, 0x6b, 0x03, 0x00, 0x31, 0x43]));
+  return data[at + 7];
+};
+
+test('a signed simulation invoice prints its own QR, issue time and a simulation banner', () => {
+  const result = renderSaudiReceiptViaDocument(order(), bill(), business(), {
+    columns: 48,
+    isReprint: false,
+    useUnicode: false,
+    arabicShaping: false,
+    cutMode: 'partial',
+    zatcaSigned: signed('simulation'),
+  });
+  const text = escPosToText(result.data);
+  assert.equal(result.qrPayload, SIGNED_QR, 'the signed QR is printed');
+  assert.ok(result.data.includes(Buffer.from(SIGNED_QR)), 'QR bytes carry the signed payload');
+  assert.ok(!result.data.includes(Buffer.from(EXPECTED_QR)), 'not the preview QR');
+  assert.ok(text.includes('SIMULATION - NOT A TAX INVOICE'), 'simulation banner');
+  assert.ok(!text.includes('PREVIEW'), 'no preview banner');
+  assert.ok(text.includes('24/11/2026 07:00:09'), "the signed invoice's issue time");
+  assert.ok(!text.includes('24/11/2026 07:00:04'), 'not the payment time');
+});
+
+test('a production-signed invoice prints no banner', () => {
+  const { lines } = renderSaudiReceiptLines(order(), bill(), business(), {
+    columns: 48,
+    isReprint: false,
+    useUnicode: false,
+    arabicShaping: false,
+    cutMode: 'partial',
+    zatcaSigned: signed('production'),
+  });
+  assert.ok(!lines.join('\n').includes('NOT A TAX INVOICE'));
+  assert.equal(zatcaReceiptBanner(null)?.en, 'NOT A TAX INVOICE - PREVIEW');
+  assert.equal(zatcaReceiptBanner(signed('simulation'))?.en, 'SIMULATION - NOT A TAX INVOICE');
+});
+
+test('the QR shrinks only when it would not fit the paper', () => {
+  const preview = formatReceipt(order(), bill(), business(), 'saudi', 32);
+  assert.equal(qrModuleByte(preview), 6, 'preview QR keeps module size 6 on 58 mm');
+  const narrow = renderSaudiReceiptViaDocument(order(), bill(), business(), {
+    columns: 32,
+    isReprint: false,
+    useUnicode: false,
+    arabicShaping: false,
+    cutMode: 'partial',
+    zatcaSigned: signed('simulation'),
+  });
+  const module = qrModuleByte(narrow.data);
+  assert.ok(module >= 3 && module < 6, `signed QR fits 58 mm (module ${module})`);
+  assert.equal(saudiQrModuleSize(EXPECTED_QR.length, 576), 6);
+  assert.ok(saudiQrModuleSize(SIGNED_QR.length, 384) * (17 + 4 * 18 + 8) <= 384);
+});
+
+const webBill = () =>
+  bill({ order: order(), payment_details: [{ method: 'cash', amount: 400, timestamp: '' }] });
+
+test('browser bill: signed invoice shows its issue time and the simulation banner', () => {
+  const html: string = generateSaudiBillHtml(webBill(), {
+    businessName: 'nihal cafe',
+    vatNumber: '300000000000003',
+    timezone: 'Asia/Riyadh',
+    qrDataUrl: 'data:image/png;base64,AAAA',
+    signed: signed('simulation'),
+  });
+  assert.ok(html.includes('SIMULATION - NOT A TAX INVOICE'));
+  assert.ok(!html.includes('PREVIEW'));
+  assert.ok(html.includes('24/11/2026 07:00:09'));
+  const unsigned: string = generateSaudiBillHtml(webBill(), {
+    businessName: 'nihal cafe',
+    vatNumber: '300000000000003',
+    timezone: 'Asia/Riyadh',
+    qrDataUrl: 'data:image/png;base64,AAAA',
+  });
+  assert.ok(unsigned.includes('NOT A TAX INVOICE - PREVIEW'), 'unsigned bills keep the preview');
+});
+
+test('classic and compact bills never look up or print ZATCA signing data', () => {
+  const fs = require('fs');
+  const path = require('path');
+  const root = path.join(__dirname, '..');
+  const users = [
+    'main/printers/thermal.ts',
+    'main/printers/document-compact.ts',
+    'frontend/src/lib/printer/web-print.ts',
+    'shared/print/document.ts',
+  ].filter((file) =>
+    /signedReceiptForBill|zatcaReceiptBanner|signedIssueText/.test(
+      fs.readFileSync(path.join(root, file), 'utf8'),
+    ),
+  );
+  assert.deepEqual(users, [], 'only the Saudi renderers read the signed invoice');
+  const classic = escPosToText(formatReceipt(order(), bill(), business(), 'classic', 48));
+  const compact = escPosToText(formatReceipt(order(), bill(), business(), 'compact', 48));
+  for (const text of [classic, compact]) {
+    assert.ok(!text.includes('NOT A TAX INVOICE'), 'no ZATCA banner on other formats');
+    assert.ok(!text.includes('SIMULATION'), 'no simulation banner on other formats');
+  }
+});

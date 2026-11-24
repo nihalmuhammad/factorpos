@@ -51,6 +51,7 @@ import {
   type PrinterTextSize,
 } from '@print/text-size';
 import { columnsForConfiguredPrinter } from '@print/width';
+import type { ZatcaSignedReceipt } from '@print/zatca-qr';
 import {
   ensureReceiptSettingsLoaded,
   PrintCancelledOnTenantChangeError,
@@ -370,11 +371,16 @@ export const usePrinterStore = create<PrinterState>()(
             const { printWebBill } = await import('@/lib/printer/web-print');
             throwIfTenantChanged();
             let saudiQrDataUrl: string | null = null;
+            let saudiSigned: ZatcaSignedReceipt | null = null;
             const saudiWarnings: PrintWarning[] = [];
             if (saudiInvoice) {
               try {
-                const qr = await api.get<{ qr_data_url: string }>(`/bills/${bill.id}/zatca-qr`);
+                const qr = await api.get<{
+                  qr_data_url: string;
+                  signed?: ZatcaSignedReceipt | null;
+                }>(`/bills/${bill.id}/zatca-qr`);
                 saudiQrDataUrl = qr.data.qr_data_url ?? null;
+                saudiSigned = qr.data.signed ?? null;
               } catch (err: unknown) {
                 const e = err as { response?: { data?: { error?: string } }; message?: string };
                 saudiWarnings.push({
@@ -404,6 +410,7 @@ export const usePrinterStore = create<PrinterState>()(
                       saudiInvoice: {
                         qrDataUrl: saudiQrDataUrl,
                         vatNumber: billTaxRegistrationNumber || undefined,
+                        signed: saudiSigned,
                       },
                     }
                   : {}),
