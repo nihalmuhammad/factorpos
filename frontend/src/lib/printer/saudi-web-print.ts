@@ -71,9 +71,16 @@ function meta(en: string, ar: string, value: unknown): string {
   return `<tr><td class="label">${esc(en)}<div class="ar" dir="rtl">${esc(ar)}</div></td><td class="value" dir="ltr">${esc(value)}</td></tr>`;
 }
 
-/** Two-language label: English left, Arabic right. */
+/**
+ * Two-language total: English label and amount on one line, the Arabic label on its own
+ * line across the full width, so long labels do not wrap beside the amount on 58 mm paper.
+ */
 function pair(en: string, ar: string, amount: string, cls = ''): string {
-  return `<tr class="${cls}"><td>${esc(en)}<div class="ar" dir="rtl">${esc(ar)}</div></td><td class="num">${esc(amount)}</td></tr>`;
+  const arClass = cls ? `ar-row ${cls}-ar` : 'ar-row';
+  return (
+    `<tr class="${cls}"><td>${esc(en)}</td><td class="num">${esc(amount)}</td></tr>` +
+    `<tr class="${arClass}"><td colspan="2"><div class="ar" dir="rtl">${esc(ar)}</div></td></tr>`
+  );
 }
 
 export function generateSaudiBillHtml(bill: Bill, opts: SaudiWebInvoiceOptions): string {
@@ -159,6 +166,8 @@ export function generateSaudiBillHtml(bill: Bill, opts: SaudiWebInvoiceOptions):
   .meta .ar, .totals .ar { text-align: left; }
   .totals { margin-top: 6px; }
   .grand td { border-top: 2px solid #000; font-size: 1.2em; font-weight: 800; padding-top: 4px; }
+  .ar-row td { padding-top: 0; }
+  .grand-ar td { font-size: 1.2em; font-weight: 800; }
   .qr { display: block; width: 38mm; height: 38mm; margin: 8px auto 4px; image-rendering: pixelated; }
   .note { font-size: 0.9em; margin-top: 6px; }
 </style>
