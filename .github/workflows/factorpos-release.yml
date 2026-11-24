@@ -130,8 +130,28 @@ jobs:
         env:
           NEXT_TELEMETRY_DISABLED: 1
 
+      - name: Check the Submit Ticket endpoint is configured
+        # FactorPOS: shop tickets reach the owner only through this Apps Script endpoint
+        # (scripts/support-ticket-apps-script/README.md). Refuse to ship a build without it.
+        shell: bash
+        env:
+          FACTORPOS_SUPPORT_TICKET_URL: ${{ secrets.FACTORPOS_SUPPORT_TICKET_URL }}
+          FACTORPOS_SUPPORT_TICKET_SECRET: ${{ secrets.FACTORPOS_SUPPORT_TICKET_SECRET }}
+        run: |
+          if [ -z "$FACTORPOS_SUPPORT_TICKET_URL" ] || [ -z "$FACTORPOS_SUPPORT_TICKET_SECRET" ]; then
+            echo "::error::Set the FACTORPOS_SUPPORT_TICKET_URL and FACTORPOS_SUPPORT_TICKET_SECRET repository secrets."
+            exit 1
+          fi
+          case "$FACTORPOS_SUPPORT_TICKET_URL" in
+            https://script.google.com/macros/s/*/exec) ;;
+            *) echo "::error::FACTORPOS_SUPPORT_TICKET_URL must be an Apps Script web app URL ending in /exec."; exit 1 ;;
+          esac
+
       - name: Compile backend
         run: npm run build
+        env:
+          FACTORPOS_SUPPORT_TICKET_URL: ${{ secrets.FACTORPOS_SUPPORT_TICKET_URL }}
+          FACTORPOS_SUPPORT_TICKET_SECRET: ${{ secrets.FACTORPOS_SUPPORT_TICKET_SECRET }}
 
       - name: Build unsigned NSIS installer
         # bash: pwsh mangles the -c.publish.channel=... argument.

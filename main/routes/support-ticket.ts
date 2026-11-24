@@ -5,6 +5,7 @@ import { rateLimit } from '../middleware/security';
 import { requirePermission } from '../services/authorization';
 import { asyncHandler } from '../middleware/async-handler';
 import { cloudSync } from '../services/cloud-sync';
+import { factorposTicketRelay } from '../services/factorpos-ticket-relay';
 import { getDatabase } from '../db';
 import { getHttpRequestSignal } from '../shutdown';
 import { normalizeOptionalPhone } from '../lib/phone';
@@ -258,11 +259,12 @@ async function submitTicketHandler(req: Request, res: Response) {
     },
     getHttpRequestSignal(req),
   );
+  if (queued.queued) factorposTicketRelay.flushSoon();
   res.status(queued.queued ? 202 : 503).json({
     ...queued,
     status: queued.queued ? 'queued' : 'unavailable',
     message: queued.queued
-      ? 'Your request is queued and will be sent when FloCafe is online.'
+      ? 'Your request is queued and will be sent when this PC is online.'
       : 'Cloud data deletion is in progress; please try again later.',
   });
 }

@@ -42,6 +42,7 @@ import {
 import { computeTaxPackUpdates, fetchRemoteTaxPackCatalog } from './tax-packs/catalog';
 import { startServer, stopServer, getLocalIP, isServerRunning, getServerPort } from './server';
 import { cloudSync } from './services/cloud-sync';
+import { factorposTicketRelay } from './services/factorpos-ticket-relay';
 import { isOfflineMode, onOfflineModeEnabled } from './services/offline-mode';
 import { telemetry } from './services/telemetry';
 import { capturePostHogException, startPostHog, stopPostHog } from './services/posthog';
@@ -1591,6 +1592,7 @@ async function initialize(): Promise<void> {
       if (isShutdownRequested()) return;
 
       cloudSync.start();
+      factorposTicketRelay.start();
       telemetry.start();
       startPostHog();
       googleDrive.start();
@@ -1922,6 +1924,7 @@ const cleanupCoordinator = createShutdownCoordinator(
     { name: 'Main server', run: () => stopServer(), blocksDatabase: true },
     { name: 'KDS server', run: () => stopKdsServer(), blocksDatabase: true },
     { name: 'cloud sync', run: () => cloudSync.shutdown(), blocksDatabase: true },
+    { name: 'support tickets', run: () => factorposTicketRelay.stop(), blocksDatabase: true },
     { name: 'telemetry', run: () => telemetry.stop(), blocksDatabase: true },
     { name: 'posthog', run: () => stopPostHog(), blocksDatabase: true },
     { name: 'Google Drive', run: () => googleDrive.stop(), blocksDatabase: true },
