@@ -145,7 +145,7 @@ export function invoiceLines(
     const netMinor = minor(line.taxableBase);
     const vatMinor = minor(line.taxAmount);
     const components = Array.isArray(line.components) ? line.components : [];
-    const rates = components.map((c: any) => Number(c?.rate));
+    const rates = components.map((c: unknown) => Number((c as { rate?: unknown } | null)?.rate));
     if (netMinor <= 0 || rates.length !== 1 || rates[0] !== 15) {
       throw new ZatcaDocumentError(
         'Only standard-rated (15% VAT) sales can be issued as ZATCA invoices for now',
