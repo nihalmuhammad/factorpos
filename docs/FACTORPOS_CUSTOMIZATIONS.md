@@ -100,6 +100,11 @@ Covered by `npm run test:factorpos-migrations`.
   with invoice signing (roadmap phase 4). Until then `ZATCA_PREVIEW_ONLY` prints a
   "NOT A TAX INVOICE - PREVIEW" banner: shops already on ZATCA integration e-invoicing must keep issuing
   tax invoices from their compliant system.
+- ZATCA fiscal records (`main/services/zatca-fiscal.ts`, FactorPOS migration
+  `2026-11-24-zatca-fiscal-records`): off unless `zatca_environment` is `simulation`.
+  Hooks: `recordFiscalInvoiceIfPaid` in `main/routes/bills.ts` (four paid paths) and
+  `recordRefundCreditNote` in `main/services/refund.ts`. Keep these hooks when merging
+  FloCafe changes to payments, settlement, split recalculation or refunds.
 - First-run setup preselects Saudi Arabia, SAR and Asia/Riyadh, and lists the selected
   country first (`frontend/src/lib/factorpos-setup.ts`); FloCafe pins India and Argentina
   to the top, which hid the Saudi tick and made India a one-click mistake. FloCafe 3.14 no

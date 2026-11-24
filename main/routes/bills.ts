@@ -21,6 +21,13 @@ import {
 } from '../db';
 import { asyncHandler } from '../middleware/async-handler';
 import { buildBillZatcaQr, zatcaQrDataUrl } from '../services/zatca-qr';
+import {
+  assertBillNotFiscallyIssued,
+  billHasFiscalInvoice,
+  fiscalStatusesForBills,
+  recordPaidBillInvoice,
+  zatcaFiscalStatusVisible,
+} from '../services/zatca-fiscal';
 import { notifyKdsUpdate, notifyOrderUpdated } from '../services/kds';
 import { printReceipt } from '../services/receipt';
 import { cloudSync } from '../services/cloud-sync';
@@ -595,8 +602,15 @@ router.get('/', requirePermission('bills.read'), (req: Request, res: Response) =
       .all(...pageParams)
       .map(parseRowJson);
     const total = Number((db.prepare(countQuery).get(...params) as any)?.count || 0);
+    // FactorPOS: read-only ZATCA status per bill, once issuance has ever been on.
+    const fiscalStatuses = zatcaFiscalStatusVisible(db) ? fiscalStatusesForBills(db, bills) : null;
     res.json({
-      bills,
+      bills: fiscalStatuses
+        ? bills.map((bill: any) => ({
+            ...bill,
+            fiscal: fiscalStatuses.get(Number(bill.id)) ?? null,
+          }))
+        : bills,
       pagination: {
         limit,
         per_page: limit,
@@ -638,6 +652,7 @@ router.get('/:id', requirePermission('bills.read'), (req: Request, res: Response
           db,
           bill as unknown as CorrectionBill,
         ),
+        ...fiscalFieldFor(db, bill),
       },
     });
   } catch (error: any) {
@@ -677,6 +692,7 @@ router.get('/order/:orderId', requirePermission('bills.read'), (req: Request, re
           db,
           bill as unknown as CorrectionBill,
         ),
+        ...fiscalFieldFor(db, bill),
       },
     });
   } catch (error: any) {
@@ -1935,6 +1951,12 @@ export function syncUnpaidBillsForOrder(
     const zeroClosed = bill.payment_status === 'paid' && Number(bill.paid_amount || 0) === 0;
     if (!['unpaid', 'partial', 'partially_paid'].includes(bill.payment_status) && !zeroClosed)
       return;
+    // FactorPOS: a zero-total bill already issued as a tax invoice cannot change.
+    if (zeroClosed && billHasFiscalInvoice(db, bill.id)) {
+      if (Math.round(Number(total) * 100) !== Math.round(Number(bill.total || 0) * 100))
+        assertBillNotFiscallyIssued(db, bill.id);
+      return;
+    }
     update.run(
       allocations.subtotal[index],
       allocations.taxAmount[index],
@@ -1959,6 +1981,7 @@ export function syncUnpaidBillsForOrder(
         db.prepare(
           `UPDATE bills SET payment_status = 'paid', paid_at = ?, updated_at = ? WHERE id = ?`,
         ).run(now(), now(), bill.id);
+        recordFiscalInvoiceIfPaid(db, bill.id);
       }
     } else if (zeroClosed) {
       db.prepare(
@@ -3078,6 +3101,21 @@ export function reconcileOrderSettlement(
   return { orderFullyPaid, orderRow };
 }
 
+/** FactorPOS: records the ZATCA invoice once the bill is fully paid (no-op while off). */
+function recordFiscalInvoiceIfPaid(db: ReturnType<typeof getDatabase>, billId: string | number) {
+  const row = db.prepare('SELECT payment_status FROM bills WHERE id = ?').get(billId) as
+    | { payment_status?: string }
+    | undefined;
+  if (row?.payment_status !== 'paid') return;
+  recordPaidBillInvoice(db, billId, (orderId, id) => getOrderWithItems(db, orderId, id));
+}
+
+/** FactorPOS: read-only ZATCA status for one bill, or nothing while issuance was never on. */
+function fiscalFieldFor(db: ReturnType<typeof getDatabase>, bill: any): { fiscal?: unknown } {
+  if (!bill || !zatcaFiscalStatusVisible(db)) return {};
+  return { fiscal: fiscalStatusesForBills(db, [bill]).get(Number(bill.id)) ?? null };
+}
+
 export function completeExactBalanceSettlement(
   db: ReturnType<typeof getDatabase>,
   billId: string | number,
@@ -3113,6 +3151,7 @@ export function completeExactBalanceSettlement(
   db.prepare(
     `UPDATE bills SET payment_status = 'paid', paid_at = COALESCE(paid_at, ?), balance = 0, updated_at = ? WHERE id = ?`,
   ).run(changedAt, changedAt, billId);
+  recordFiscalInvoiceIfPaid(db, billId);
 
   const updatedBill = db.prepare('SELECT * FROM bills WHERE id = ?').get(billId) as any;
   if (!updatedBill) return null;
@@ -3293,6 +3332,7 @@ function applyPaymentBatch(
         `UPDATE bills SET payment_status = 'paid', paid_at = COALESCE(paid_at, ?), balance = 0, updated_at = ? WHERE id = ?`,
       ).run(changedAt, changedAt, billId);
     }
+    recordFiscalInvoiceIfPaid(db, billId);
     const settlementResult = reconcileOrderSettlement(
       db,
       bill.order_id,
@@ -3343,6 +3383,7 @@ function applyPaymentBatch(
       loyaltyPointsEarned,
       orderFullyPaid,
       ...(kitchenStatus.overridden ? { kitchenDeliveryOverridden: true } : {}),
+      ...fiscalFieldFor(db, freshBill),
     };
     if (idempotencyKey && requestHash && idempotencyUserId) {
       db.prepare(
@@ -3439,6 +3480,7 @@ function applyPaymentBatch(
   let loyaltyPointsEarned = 0;
   let orderFullyPaid = false;
   if (paymentStatus === 'paid') {
+    recordFiscalInvoiceIfPaid(db, billId);
     const settlementResult = reconcileOrderSettlement(
       db,
       bill.order_id,
@@ -3472,12 +3514,14 @@ function applyPaymentBatch(
       }
     }
   }
+  const paidBill = db.prepare('SELECT * FROM bills WHERE id = ?').get(billId) as any;
   const result = {
-    bill: parseRowJson(db.prepare('SELECT * FROM bills WHERE id = ?').get(billId)),
+    bill: parseRowJson(paidBill),
     walletDebited,
     loyaltyPointsEarned,
     orderFullyPaid,
     ...(kitchenStatus.overridden ? { kitchenDeliveryOverridden: true } : {}),
+    ...fiscalFieldFor(db, paidBill),
   };
   if (idempotencyKey && requestHash && idempotencyUserId) {
     db.prepare(

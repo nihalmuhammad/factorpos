@@ -10446,6 +10446,95 @@ export const FACTORPOS_MIGRATIONS: { id: string; up: () => void }[] = [
       ).run(JSON.stringify({ source: 'core', id: 'compact' }), now());
     },
   },
+  {
+    // ZATCA fiscal records (roadmap phase 3). A paid bill or a refund gets one frozen,
+    // numbered fiscal document; signing and reporting (phases 4–6) fill in the rest.
+    // Switched off by default (zatca_environment = 'disabled').
+    id: '2026-11-24-zatca-fiscal-records',
+    up: () => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS zatca_fiscal_sequence (
+          id INTEGER PRIMARY KEY CHECK (id = 1),
+          last_counter INTEGER NOT NULL DEFAULT 0 CHECK (last_counter >= 0)
+        );
+        INSERT OR IGNORE INTO zatca_fiscal_sequence (id, last_counter) VALUES (1, 0);
+
+        CREATE TABLE IF NOT EXISTS zatca_fiscal_documents (
+          id TEXT PRIMARY KEY,
+          document_type TEXT NOT NULL
+            CHECK (document_type IN ('simplified_invoice', 'simplified_credit_note')),
+          bill_id INTEGER NOT NULL REFERENCES bills(id),
+          refund_id INTEGER UNIQUE REFERENCES refunds(id),
+          original_document_id TEXT REFERENCES zatca_fiscal_documents(id),
+          counter INTEGER NOT NULL UNIQUE CHECK (counter > 0),
+          environment TEXT NOT NULL CHECK (environment IN ('simulation', 'production')),
+          status TEXT NOT NULL DEFAULT 'recorded'
+            CHECK (status IN ('recorded', 'signed', 'review')),
+          total_with_vat_minor INTEGER NOT NULL,
+          vat_minor INTEGER NOT NULL,
+          currency TEXT NOT NULL,
+          issued_at TEXT NOT NULL,
+          snapshot_json TEXT NOT NULL,
+          signed_xml TEXT,
+          invoice_hash TEXT,
+          previous_invoice_hash TEXT,
+          qr_payload TEXT,
+          created_at TEXT NOT NULL,
+          signed_at TEXT,
+          CHECK ((document_type = 'simplified_invoice' AND refund_id IS NULL AND original_document_id IS NULL)
+            OR (document_type = 'simplified_credit_note' AND refund_id IS NOT NULL AND original_document_id IS NOT NULL))
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS zatca_one_invoice_per_bill
+          ON zatca_fiscal_documents(bill_id) WHERE document_type = 'simplified_invoice';
+        CREATE INDEX IF NOT EXISTS idx_zatca_fiscal_documents_bill ON zatca_fiscal_documents(bill_id);
+
+        -- A fiscal document is never deleted, and what it records never changes.
+        -- Signing may fill the signature fields once, while they are still empty.
+        CREATE TRIGGER IF NOT EXISTS zatca_fiscal_documents_no_delete
+          BEFORE DELETE ON zatca_fiscal_documents
+          BEGIN SELECT RAISE(ABORT, 'ZATCA fiscal documents cannot be deleted'); END;
+        CREATE TRIGGER IF NOT EXISTS zatca_fiscal_documents_frozen
+          BEFORE UPDATE ON zatca_fiscal_documents
+          WHEN NEW.id IS NOT OLD.id
+            OR NEW.document_type IS NOT OLD.document_type
+            OR NEW.bill_id IS NOT OLD.bill_id
+            OR NEW.refund_id IS NOT OLD.refund_id
+            OR NEW.original_document_id IS NOT OLD.original_document_id
+            OR NEW.counter IS NOT OLD.counter
+            OR NEW.environment IS NOT OLD.environment
+            OR NEW.total_with_vat_minor IS NOT OLD.total_with_vat_minor
+            OR NEW.vat_minor IS NOT OLD.vat_minor
+            OR NEW.currency IS NOT OLD.currency
+            OR NEW.issued_at IS NOT OLD.issued_at
+            OR NEW.snapshot_json IS NOT OLD.snapshot_json
+            OR NEW.created_at IS NOT OLD.created_at
+            OR (OLD.signed_xml IS NOT NULL AND NEW.signed_xml IS NOT OLD.signed_xml)
+            OR (OLD.invoice_hash IS NOT NULL AND NEW.invoice_hash IS NOT OLD.invoice_hash)
+            OR (OLD.previous_invoice_hash IS NOT NULL AND NEW.previous_invoice_hash IS NOT OLD.previous_invoice_hash)
+            OR (OLD.qr_payload IS NOT NULL AND NEW.qr_payload IS NOT OLD.qr_payload)
+          BEGIN SELECT RAISE(ABORT, 'ZATCA fiscal documents are frozen'); END;
+        CREATE TRIGGER IF NOT EXISTS zatca_fiscal_sequence_forward_only
+          BEFORE UPDATE ON zatca_fiscal_sequence
+          WHEN NEW.last_counter < OLD.last_counter
+          BEGIN SELECT RAISE(ABORT, 'ZATCA invoice counter cannot go backwards'); END;
+
+        CREATE TABLE IF NOT EXISTS zatca_reporting_jobs (
+          document_id TEXT PRIMARY KEY REFERENCES zatca_fiscal_documents(id),
+          status TEXT NOT NULL
+            CHECK (status IN ('pending', 'reported', 'warning', 'rejected', 'review')),
+          attempt_count INTEGER NOT NULL DEFAULT 0,
+          next_attempt_at TEXT,
+          response_json TEXT,
+          reviewed_at TEXT,
+          reviewed_by TEXT,
+          updated_at TEXT NOT NULL
+        );
+      `);
+      db.prepare(
+        `INSERT OR IGNORE INTO settings (key, value, updated_at) VALUES ('zatca_environment', 'disabled', ?)`,
+      ).run(now());
+    },
+  },
 ];
 
 /**
