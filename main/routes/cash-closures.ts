@@ -476,7 +476,16 @@ export function cashDrawerSalesAndRefunds(
         COALESCE(NULLIF(json_extract(je.value, '$.method'), ''), '') AS method,
         CAST(json_extract(je.value, '$.payment_method_id') AS INTEGER) AS payment_method_id,
         ${LEGACY_STABLE_PAYMENT_LINE_TIME_SQL} AS line_time
-      FROM bills b
+      FROM (
+        -- created_at < end AND (paid_at IS NULL OR paid_at >= start - 1 day), split into its
+        -- two disjoint halves so both are paid_at index lookups instead of a walk from the
+        -- shop's first bill. The unary + keeps the planner off the created_at index.
+        SELECT id, payment_details, created_at, paid_at FROM bills
+        WHERE paid_at >= datetime(?, '-1 day') AND +created_at < datetime(?)
+        UNION ALL
+        SELECT id, payment_details, created_at, paid_at FROM bills
+        WHERE paid_at IS NULL AND +created_at < datetime(?)
+      ) b
       JOIN json_each(
         CASE
           WHEN json_valid(b.payment_details) AND json_type(b.payment_details) = 'array'
@@ -486,9 +495,7 @@ export function cashDrawerSalesAndRefunds(
           ELSE '[]'
         END
       ) je
-      WHERE b.created_at < datetime(?)
-        AND (b.paid_at IS NULL OR b.paid_at >= datetime(?, '-1 day'))
-        AND json_type(je.value) = 'object'
+      WHERE json_type(je.value) = 'object'
     ),
     cash_sales AS (
       SELECT COALESCE(SUM(pl.amount * ?), 0) AS sales_cents
@@ -507,7 +514,7 @@ export function cashDrawerSalesAndRefunds(
       (SELECT refunds_cents FROM cash_refunds) AS refunds_cents
   `,
     )
-    .get(end, start, minorFactor, start, end, start, end) as {
+    .get(start, end, end, minorFactor, start, end, start, end) as {
     sales_cents: number;
     refunds_cents: number;
   };
@@ -560,6 +567,29 @@ export function sumCashMovements(
  * payment_method_id). The JSON scan is correctness-first; use an event ledger
  * if bill volume makes session polling hot.
  */
+/**
+ * Bills a shift's payment lines can sit on: still unpaid, or paid no earlier than
+ * SESSION_BILL_LOOKBACK before the shift opened. A line joins a shift only while that shift is
+ * open (a payment) or through a same-business-day tender correction, and a bill's paid_at is
+ * never earlier than its lines, so older bills cannot hold this shift's lines. Both halves are
+ * paid_at index lookups; before this, every status-bar poll parsed every bill ever made.
+ * The week of slack covers the business-day offset and timestamp formats; only a PC clock that
+ * jumped back more than a week mid-shift could put a shift's line on an older bill.
+ */
+const SESSION_BILL_LOOKBACK = '-7 days';
+// The third half keeps blank or malformed paid_at values (they sort below '0'), and an
+// unparsable opened_at falls back to every paid bill, so nothing the full scan saw is lost.
+const SESSION_CANDIDATE_BILLS_SQL = `(
+  SELECT * FROM bills
+  WHERE paid_at >= COALESCE(datetime(?, '${SESSION_BILL_LOOKBACK}'), '')
+  UNION ALL
+  SELECT * FROM bills
+  WHERE paid_at IS NULL
+  UNION ALL
+  SELECT * FROM bills
+  WHERE paid_at < '0'
+)`;
+
 export function sessionExpectedCash(
   db: ReturnType<typeof getDatabase>,
   session: { id: number; opening_float_cents: number; opened_at?: string },
@@ -582,7 +612,7 @@ export function sessionExpectedCash(
         CAST(json_extract(je.value, '$.payment_method_id') AS INTEGER) AS payment_method_id,
         CAST(json_extract(je.value, '$.cash_session_id') AS INTEGER) AS line_session,
         ${LEGACY_STABLE_PAYMENT_LINE_TIME_SQL} AS line_time
-      FROM bills b
+      FROM ${SESSION_CANDIDATE_BILLS_SQL} b
       JOIN json_each(
         CASE
           WHEN json_valid(b.payment_details) AND json_type(b.payment_details) = 'array'
@@ -618,7 +648,7 @@ export function sessionExpectedCash(
       (SELECT refunds_cents FROM cash_refunds) AS refunds_cents
   `,
     )
-    .get(minorFactor, session.id, start, end, session.id, start, end) as {
+    .get(start, minorFactor, session.id, start, end, session.id, start, end) as {
     sales_cents: number;
     refunds_cents: number;
   };
@@ -656,7 +686,7 @@ export function sessionFinancialTotals(
         COALESCE(NULLIF(json_extract(je.value, '$.method'), ''), 'unknown') AS method,
         CAST(json_extract(je.value, '$.cash_session_id') AS INTEGER) AS line_session,
         ${LEGACY_STABLE_PAYMENT_LINE_TIME_SQL} AS line_time
-      FROM bills b
+      FROM ${SESSION_CANDIDATE_BILLS_SQL} b
       JOIN json_each(CASE
         WHEN json_valid(b.payment_details) AND json_type(b.payment_details) = 'array' THEN b.payment_details
         WHEN json_valid(b.payment_details) THEN json_array(b.payment_details)
@@ -691,7 +721,16 @@ export function sessionFinancialTotals(
         FROM method_totals) AS methods_json
   `,
     )
-    .get(minorFactor, session.id, session.opened_at, end, session.id, session.opened_at, end) as {
+    .get(
+      minorFactor,
+      session.opened_at,
+      session.id,
+      session.opened_at,
+      end,
+      session.id,
+      session.opened_at,
+      end,
+    ) as {
     bill_count: number;
     refund_count: number;
     gross_cents: number;
@@ -862,7 +901,7 @@ export function computePeriodAggregates(
         CAST(json_extract(je.value, '$.amount') AS REAL) AS amount,
         CAST(json_extract(je.value, '$.cash_session_id') AS INTEGER) AS line_session,
         ${LEGACY_STABLE_PAYMENT_LINE_TIME_SQL} AS line_time
-      FROM bills b
+      FROM ${SESSION_CANDIDATE_BILLS_SQL} b
       JOIN json_each(CASE
         WHEN json_valid(b.payment_details) AND json_type(b.payment_details) = 'array' THEN b.payment_details
         WHEN json_valid(b.payment_details) THEN json_array(b.payment_details)
@@ -888,7 +927,7 @@ export function computePeriodAggregates(
     LIMIT 20
   `,
         )
-        .all(session.id, session.opened_at, end) as StaffSalesRow[])
+        .all(session.opened_at, session.id, session.opened_at, end) as StaffSalesRow[])
     : (db
         .prepare(
           `
@@ -923,7 +962,7 @@ export function computePeriodAggregates(
         .prepare(
           `
     SELECT b.id, b.order_id, b.split_group_id, b.total, b.paid_at, b.tax_amount, b.tax_snapshot, b.tax_breakdown
-    FROM bills b
+    FROM ${SESSION_CANDIDATE_BILLS_SQL} b
     LEFT JOIN orders o ON o.id = b.order_id
     WHERE b.payment_details IS NOT NULL
       AND (
@@ -966,7 +1005,14 @@ export function computePeriodAggregates(
     ORDER BY COALESCE(b.paid_at, b.created_at), b.id
   `,
         )
-        .all(session.id, session.opened_at, end, NO_CASH_SESSION_ID, session.id) as TaxBillRow[])
+        .all(
+          session.opened_at,
+          session.id,
+          session.opened_at,
+          end,
+          NO_CASH_SESSION_ID,
+          session.id,
+        ) as TaxBillRow[])
     : (db
         .prepare(
           `
