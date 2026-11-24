@@ -40,6 +40,7 @@ import { businessDateForInstant } from '../../shared/business-date';
 import { buildDailySalesExportDataset, type DailySalesExportItemRow } from './daily-sales-export';
 import { assertOnlineAllowed, isOfflineMode } from './offline-mode';
 import { normalizeSupportedCurrencyCode } from '../../shared/currencies';
+import { isTicketRelayConfigured } from './factorpos-ticket-relay';
 
 export const DEFAULT_CLOUD_SERVER_URL = 'https://blue.flopos.com/';
 
@@ -2492,6 +2493,8 @@ export class CloudSyncService {
 
   private flushSupportTicketOutbox(): Promise<void> {
     if (this.cloudDeletionInProgress || this.shutdownRequested) return Promise.resolve();
+    // FactorPOS: tickets go to the owner's Apps Script relay, never to FloCafe's cloud.
+    if (isTicketRelayConfigured()) return Promise.resolve();
     if (this.supportFlushPromise) return this.supportFlushPromise;
     const run = this.withDatabaseRequest(async () => {
       if (this.cloudDeletionInProgress || this.shutdownRequested) return;
