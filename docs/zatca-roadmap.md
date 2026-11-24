@@ -107,11 +107,25 @@ Details: [monthly VAT invoice report](reference/daily-sales-export.md#monthly-va
   delivery features rather than added as a second delivery model. Payment-method
   corrections on issued bills are decided with signing (phase 4).
 
-### 4. ZATCA engine (port from the prototype)
+### 4. ZATCA engine — built on branch `feat/zatca-engine`
 
-- Bill snapshot → UBL 2.1 simplified invoice XML; credit and debit notes.
-- ICV/PIH chain, invoice hash, ECDSA stamp, 9-tag QR.
-- Validate every document type with the current official SDK in CI.
+- Done: frozen fiscal record → UBL 2.1 simplified invoice or credit note
+  (`main/services/zatca/xml.ts`, `document.ts`); invoice hash, ECDSA (secp256k1)
+  signature, XAdES signed properties and the 9-tag QR (`signing.ts`), all computed in
+  FactorPOS with no Java. Each paid bill or refund is signed in the same transaction;
+  the ICV is the fiscal counter and the PIH the previous document's hash. Issuance is
+  refused without a signing credential (`zatca_credentials`, key encrypted with
+  Electron safeStorage), with incomplete seller details (`zatca_seller_*` settings), or
+  while an earlier document is unsigned.
+- Electron's BoringSSL has no secp256k1, so the curve maths uses `@noble/curves`
+  1.9.7 (MIT); hashing and certificate parsing use Node's crypto.
+- Checked with ZATCA's SDK 3.4.8 (built 2025-12-21; the public download page still
+  serves 3.0.8, so get 3.4.8 or newer from the FATOORA developer portal): XSD, EN,
+  KSA, QR, signature and PIH pass for invoices, credit notes and chains, including
+  documents produced through the POS. The SDK runs on development machines only
+  (`.local-tools/zatca-sdk`); CI runs the same tests with a throwaway credential.
+- Left: debit notes; non-standard-rated lines (refused for now); payment-method
+  corrections on issued bills; the onboarding that creates real credentials (phase 5).
 
 ### 5. Onboarding and keys
 

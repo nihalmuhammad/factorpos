@@ -105,6 +105,11 @@ Covered by `npm run test:factorpos-migrations`.
   Hooks: `recordFiscalInvoiceIfPaid` in `main/routes/bills.ts` (four paid paths) and
   `recordRefundCreditNote` in `main/services/refund.ts`. Keep these hooks when merging
   FloCafe changes to payments, settlement, split recalculation or refunds.
+- ZATCA engine (`main/services/zatca/`): invoice and credit note XML, hash, signature,
+  XAdES and QR; signing happens inside `recordPaidBillInvoice` and
+  `recordRefundCreditNote`. Depends on `@noble/curves` 1.9.7 because Electron's
+  BoringSSL has no secp256k1 (pinned; 2.x is ESM-only). FactorPOS migration
+  `2026-11-24-zatca-credentials` adds the till's signing credential table.
 - First-run setup preselects Saudi Arabia, SAR and Asia/Riyadh, and lists the selected
   country first (`frontend/src/lib/factorpos-setup.ts`); FloCafe pins India and Argentina
   to the top, which hid the Saudi tick and made India a one-click mistake. FloCafe 3.14 no
