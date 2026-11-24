@@ -204,7 +204,10 @@ function main() {
       ?.value;
   freshDir('bill-template-fresh');
   initDatabase();
-  assert(billTemplate() === COMPACT, 'fresh install defaults to the compact ORDER NOTE');
+  assert(
+    billTemplate() === JSON.stringify({ source: 'core', id: 'classic' }),
+    "a fresh install keeps FloCafe's default; the owner picks a format",
+  );
   closeDatabase();
   for (const [label, before, after] of [
     ['core-classic', JSON.stringify({ source: 'core', id: 'classic' }), COMPACT],
@@ -223,6 +226,12 @@ function main() {
     freshDir(`bill-template-${label}`);
     initDatabase();
     getDatabase().prepare(`UPDATE settings SET value = ? WHERE key = 'bill_template'`).run(before);
+    // An upgraded shop has orders; that is what marks it as an existing shop.
+    getDatabase()
+      .prepare(
+        `INSERT INTO orders (order_number, type, status, token_number) VALUES (?, 'takeaway', 'completed', 1)`,
+      )
+      .run(`ORD-${label}`);
     getDatabase()
       .prepare(
         `DELETE FROM _factorpos_migrations WHERE id = '2026-11-24-bill-template-compact-default'`,

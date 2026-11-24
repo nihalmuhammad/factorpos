@@ -115,4 +115,3 @@ FloCafe's version at a FloCafe merge in the pull request. FactorPOS's own edits 
 still checked. Keep "merge FloCafe" in the merge commit subject (the sync workflow and
 `Merge FloCafe X.Y.Z into FactorPOS` both do); otherwise the merge is not recognised.
 Do not reformat FloCafe's files: every later FloCafe change to them would conflict.
-

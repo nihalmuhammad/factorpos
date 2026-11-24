@@ -10423,10 +10423,13 @@ export const FACTORPOS_MIGRATIONS: { id: string; up: () => void }[] = [
     // Earlier FactorPOS builds printed every browser bill as the compact ORDER NOTE,
     // whatever bill_template said, so shops kept FloCafe's 'classic' default. Now that
     // the setting is honoured, move core 'classic' to 'compact' once so shops keep the
-    // bill they know. Pack and merchant selections are left alone.
+    // bill they know. Only shops that already have orders are upgrades; a fresh install
+    // keeps FloCafe's default and the owner picks a format. Pack and merchant
+    // selections are left alone.
     id: '2026-11-24-bill-template-compact-default',
     up: () => {
-      if (!getTables(db).includes('settings')) return;
+      if (!getTables(db).includes('settings') || !getTables(db).includes('orders')) return;
+      if (!db.prepare('SELECT 1 FROM orders LIMIT 1').get()) return;
       const row = db.prepare(`SELECT value FROM settings WHERE key = 'bill_template'`).get() as
         | { value: string }
         | undefined;
