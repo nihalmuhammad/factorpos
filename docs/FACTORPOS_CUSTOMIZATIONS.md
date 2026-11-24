@@ -134,7 +134,7 @@ Covered by `npm run test:factorpos-dashboard-performance`.
   compact bills are unchanged.
 - Editions (`shared/edition.ts`, `main/edition.ts`, `frontend/src/hooks/useEdition.ts`):
   `factorposEdition` in the packaged package.json, `kot` by default and `zatca` in the
-  installer built with `scripts/release/electron-builder-zatca.cjs`. The edition decides
+  installer built with `scripts/editions/electron-builder-zatca.cjs`. The edition decides
   the bill formats (`effectiveBillTemplateValue` / `isEditionBillTemplate` in
   `main/services/print-templates.ts`, read in `main/routes/settings.ts` and
   `main/routes/printers.ts`), the token on the order screens, and every ZATCA feature

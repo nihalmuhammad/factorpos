@@ -10,7 +10,7 @@
 #   - ZATCA edition ("FactorPOS ZATCA"): its installer is attached to the same
 #     release for download, and its update files go to the fixed prerelease
 #     `zatca-updates`, the only feed a ZATCA till reads
-#     (scripts/release/electron-builder-zatca.cjs).
+#     (scripts/editions/electron-builder-zatca.cjs).
 #
 # Tags start with "v" on purpose: upstream FloCafe's release.yml triggers on
 # tags starting with a digit and builds for platforms FactorPOS doesn't ship.
@@ -124,7 +124,7 @@ jobs:
             artifact: factorpos-release-files
             sums: SHA256SUMS.txt
           - edition: zatca
-            builder-config: --config scripts/release/electron-builder-zatca.cjs
+            builder-config: --config scripts/editions/electron-builder-zatca.cjs
             prefix: factorpos-zatca
             product: FactorPOS ZATCA
             artifact: factorpos-zatca-release-files

@@ -265,7 +265,7 @@ test('ZATCA reporting: queued with every signed document, worker runs with the a
 
 test('editions: KOT by default; the ZATCA installer has its own identity and feed', () => {
   assert.equal(pkg.factorposEdition, 'kot', 'the default build is the KOT edition');
-  const zatca = require('../scripts/release/electron-builder-zatca.cjs');
+  const zatca = require('../scripts/editions/electron-builder-zatca.cjs');
   assert.equal(zatca.extraMetadata.factorposEdition, 'zatca');
   assert.notEqual(zatca.appId, pkg.build.appId, 'own app ID: own install and data folder');
   assert.equal(zatca.productName, 'FactorPOS ZATCA');
@@ -299,7 +299,7 @@ test('editions: KOT by default; the ZATCA installer has its own identity and fee
     'both editions stamp the Submit Ticket endpoint',
   );
   assert.ok(
-    require('../scripts/release/electron-builder-zatca.cjs').files.includes('dist/**/*'),
+    require('../scripts/editions/electron-builder-zatca.cjs').files.includes('dist/**/*'),
     'the ZATCA installer ships the stamped build identity',
   );
 });
