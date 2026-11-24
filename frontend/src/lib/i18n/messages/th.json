@@ -675,7 +675,8 @@
     "uptimeLabel": "ทำงานมา: ",
     "user": "ผู้ใช้",
     "whatsapp": "WhatsApp",
-    "inventory": "สินค้าคงคลัง"
+    "inventory": "สินค้าคงคลัง",
+    "zatca": "ใบแจ้งหนี้ ZATCA"
   },
   "orders": {
     "active": "ดำเนินการอยู่",

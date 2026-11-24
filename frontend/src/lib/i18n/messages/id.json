@@ -675,7 +675,8 @@
     "user": "Pengguna",
     "whatsapp": "WhatsApp",
     "inventory": "Persediaan",
-    "tables": "Meja"
+    "tables": "Meja",
+    "zatca": "Faktur ZATCA"
   },
   "orders": {
     "active": "Aktif",

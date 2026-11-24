@@ -23,6 +23,7 @@ import {
   Monitor,
   Boxes,
   Receipt,
+  FileBadge,
   Lock,
   KeyRound,
   type LucideIcon,
@@ -120,6 +121,14 @@ const ALL_NAV_ITEMS: NavItem[] = [
     businessTypes: null,
   },
   {
+    // FactorPOS: ZATCA invoice review (Saudi shops).
+    href: '/zatca',
+    labelKey: 'zatca',
+    icon: FileBadge,
+    permission: 'reports.view',
+    businessTypes: null,
+  },
+  {
     href: '/tables',
     labelKey: 'tables',
     icon: Grid3X3,
@@ -199,6 +208,7 @@ export default function AppSidebar() {
     if (item.href === '/settings?tab=kds' && !kdsEnabled) return false;
     // WhatsApp integration not enabled on this tenant → hide the nav entry.
     if (item.href === '/whatsapp' && !whatsappEnabled) return false;
+    if (item.href === '/zatca' && currentTenant?.country !== 'SA') return false;
     const permitted =
       item.href === '/staff'
         ? tenantCan(currentTenant, 'staff.view') || tenantCan(currentTenant, 'authorization.manage')

@@ -11,6 +11,7 @@ import TitleBar from '@/components/layout/TitleBar';
 import UpdateAvailableDialog from '@/components/updates/UpdateAvailableDialog';
 import ProductAnalyticsDialog from '@/components/analytics/ProductAnalyticsDialog';
 import DiagnosticsPromptCard from '@/components/support/DiagnosticsPromptCard';
+import { ZatcaReportingAlert } from '@/components/settings/ZatcaReportingAlert';
 import { usePrinterStatusSync } from '@/hooks/usePrinter';
 import { useReceiptSettingsSync } from '@/hooks/useReceiptSettingsSync';
 import { normalizePathname } from '@/lib/utils';
@@ -102,6 +103,8 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
               <SidebarTrigger className="size-8" aria-label="Open navigation" />
             </div>
             {!isPos && <GlobalNotifications />}
+            {/* FactorPOS: ZATCA reporting deadline and rejection alerts. */}
+            {!isPos && <ZatcaReportingAlert />}
             <div
               className={
                 isPos

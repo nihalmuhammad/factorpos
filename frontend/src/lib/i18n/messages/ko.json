@@ -675,7 +675,8 @@
     "user": "사용자",
     "whatsapp": "WhatsApp",
     "inventory": "재고",
-    "tables": "테이블"
+    "tables": "테이블",
+    "zatca": "ZATCA 송장"
   },
   "orders": {
     "active": "진행 중",

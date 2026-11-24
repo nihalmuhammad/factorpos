@@ -153,6 +153,32 @@ function hasCredentialDetailColumns(db: Database): boolean {
   return columns.some((column) => column.name === 'api_secret');
 }
 
+/**
+ * The certificate and API secret that authenticate reporting for an environment, or
+ * null when the till has no onboarded credential (no API secret).
+ */
+export function loadReportingAuth(
+  db: Database,
+  environment: string,
+): { certificate: string; secret: string } | null {
+  if (!hasCredentialDetailColumns(db)) return null;
+  const row = db
+    .prepare(
+      `SELECT certificate, api_secret, key_protection FROM zatca_credentials
+       WHERE environment = ? AND active = 1 ORDER BY id DESC LIMIT 1`,
+    )
+    .get(environment) as
+    | { certificate: string; api_secret: string | null; key_protection: KeyProtection }
+    | undefined;
+  if (!row?.api_secret) return null;
+  return {
+    certificate: row.certificate
+      .replace(/-----(BEGIN|END) CERTIFICATE-----/g, '')
+      .replace(/\s+/g, ''),
+    secret: revealSecret(row.api_secret, row.key_protection),
+  };
+}
+
 export interface CredentialSummary {
   environment: string;
   egsUuid: string | null;

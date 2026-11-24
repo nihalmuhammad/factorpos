@@ -675,7 +675,8 @@
     "user": "Panganggo",
     "whatsapp": "WhatsApp",
     "inventory": "Pasokan",
-    "tables": "Meja"
+    "tables": "Meja",
+    "zatca": "Invoice ZATCA"
   },
   "orders": {
     "active": "Aktif",

@@ -675,7 +675,8 @@
     "uptimeLabel": "Uptime",
     "user": "Gumagamit",
     "whatsapp": "WhatsApp",
-    "inventory": "Imbentaryo"
+    "inventory": "Imbentaryo",
+    "zatca": "Mga invoice ng ZATCA"
   },
   "orders": {
     "active": "Aktibo",

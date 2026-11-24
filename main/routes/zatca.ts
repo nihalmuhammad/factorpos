@@ -5,6 +5,10 @@
  *   PUT  /api/zatca/seller       save the structured seller details
  *   POST /api/zatca/onboarding   run or resume onboarding (body: { otp })
  *   PUT  /api/zatca/environment  switch issuance: disabled | simulation
+ *   GET  /api/zatca/reporting           reporting summary (alerts)
+ *   GET  /api/zatca/reporting/day       one day's documents and their reporting status
+ *   POST /api/zatca/reporting/send      send waiting documents now (or the ones given)
+ *   POST /api/zatca/reporting/review    mark a day reviewed
  *
  * Only the simulation environment can be onboarded and switched on for now; production
  * waits for reporting (phase 6) and the pilot.
@@ -25,6 +29,8 @@ import {
 } from '../services/zatca/fatoora';
 import { onboardingState, OnboardingError, runOnboarding } from '../services/zatca/onboarding';
 import { CsrFieldError } from '../services/zatca/csr';
+import { documentsForDay, markDayReviewed, reportingSummary } from '../services/zatca/reporting';
+import { zatcaReporting } from '../services/zatca/reporting-worker';
 
 const router = Router();
 
@@ -73,6 +79,7 @@ function overview(db: ReturnType<typeof getDatabase>) {
     seller_check: sellerCheck(db),
     onboarding: onboardingState(db, 'simulation'),
     certificate: credentialSummary(db, 'simulation'),
+    reporting: reportingSummary(db),
   };
 }
 
@@ -198,6 +205,93 @@ router.put(
          ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
       ).run(target, now());
       res.json(overview(db));
+    } catch (error) {
+      sendError(res, error);
+    }
+  },
+);
+
+// ─── Reporting review (roadmap phase 6) ───
+
+const DATE = /^\d{4}-\d{2}-\d{2}$/;
+
+function dayView(db: ReturnType<typeof getDatabase>, date: string) {
+  const documents = documentsForDay(db, date, sellerSnapshot(db).timezone);
+  const reviewed = documents.length > 0 && documents.every((doc) => doc.reviewedAt);
+  return {
+    date,
+    documents,
+    reviewed: reviewed ? { at: documents[0].reviewedAt, by: documents[0].reviewedBy } : null,
+    summary: reportingSummary(db),
+  };
+}
+
+function reviewerName(db: ReturnType<typeof getDatabase>, req: Request): string {
+  const userId = String((req as Request & { user?: { userId?: string } }).user?.userId || '');
+  const row = db.prepare('SELECT name FROM users WHERE id = ?').get(userId) as
+    | { name: string }
+    | undefined;
+  return row?.name || userId || 'unknown';
+}
+
+router.get('/reporting', requirePermission('reports.view'), (_req: Request, res: Response) => {
+  try {
+    res.json(reportingSummary(getDatabase()));
+  } catch (error) {
+    sendError(res, error);
+  }
+});
+
+router.get('/reporting/day', requirePermission('reports.view'), (req: Request, res: Response) => {
+  try {
+    const date = String(req.query.date ?? '');
+    if (!DATE.test(date)) return res.status(400).json({ error: 'date must be YYYY-MM-DD' });
+    res.json(dayView(getDatabase(), date));
+  } catch (error) {
+    sendError(res, error);
+  }
+});
+
+router.post(
+  '/reporting/send',
+  requirePermission('reports.view'),
+  async (req: Request, res: Response) => {
+    try {
+      const ids = Array.isArray(req.body?.document_ids)
+        ? req.body.document_ids.map((id: unknown) => String(id)).slice(0, 500)
+        : undefined;
+      // Sent by hand: the given documents, or every waiting one regardless of backoff.
+      const result =
+        ids && ids.length > 0
+          ? await zatcaReporting.runNow(ids)
+          : await zatcaReporting.runNow(undefined, { ignoreSchedule: true });
+      const date = String(req.body?.date ?? '');
+      const db = getDatabase();
+      res.json({
+        result,
+        ...(DATE.test(date) ? dayView(db, date) : { summary: reportingSummary(db) }),
+      });
+    } catch (error) {
+      sendError(res, error);
+    }
+  },
+);
+
+router.post(
+  '/reporting/review',
+  requirePermission('reports.view'),
+  (req: Request, res: Response) => {
+    try {
+      const date = String(req.body?.date ?? '');
+      if (!DATE.test(date)) return res.status(400).json({ error: 'date must be YYYY-MM-DD' });
+      const db = getDatabase();
+      const count = markDayReviewed(db, date, sellerSnapshot(db).timezone, reviewerName(db, req));
+      if (count === 0) {
+        return res
+          .status(409)
+          .json({ error: 'No ZATCA documents were issued that day', code: 'zatca_day_empty' });
+      }
+      res.json(dayView(db, date));
     } catch (error) {
       sendError(res, error);
     }

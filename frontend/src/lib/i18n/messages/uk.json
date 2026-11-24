@@ -675,7 +675,8 @@
     "user": "Користувач",
     "whatsapp": "WhatsApp",
     "inventory": "Склад",
-    "tables": "Столи"
+    "tables": "Столи",
+    "zatca": "Рахунки ZATCA"
   },
   "orders": {
     "active": "Активні",

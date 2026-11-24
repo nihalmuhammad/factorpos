@@ -675,7 +675,8 @@
     "uptimeLabel": "執行：",
     "user": "使用者",
     "whatsapp": "WhatsApp",
-    "inventory": "庫存"
+    "inventory": "庫存",
+    "zatca": "ZATCA 發票"
   },
   "orders": {
     "active": "進行中",

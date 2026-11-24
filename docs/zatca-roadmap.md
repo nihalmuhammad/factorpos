@@ -146,16 +146,29 @@ Details: [monthly VAT invoice report](reference/daily-sales-export.md#monthly-va
 - Left: production onboarding (blocked until phase 6 and the pilot); a renewal reminder
   before expiry; the FATOORA `PATCH /production/csids` renewal path if ZATCA requires it.
 
-### 6. Reporting worker
+### 6. Reporting — built on branch `feat/zatca-reporting`
 
 - Decided 2026-11-24: reporting is automatic and cannot be switched off; the
-  accountant reviews the day's invoices afterwards on a review screen (mark the day
-  reviewed, raise credit notes for mistakes) and can send waiting invoices or retry
-  failed ones by hand.
-- Durable queue in SQLite; reports each invoice right after signing; retries
-  with backoff when offline.
-- Alerts before the 24-hour limit (BR-KSA-98); manager screen for warnings and
-  rejections.
+  accountant reviews the day's invoices afterwards and can send waiting invoices or
+  retry failed ones by hand.
+- Done: every signed invoice and credit note gets a `zatca_reporting_jobs` row in the
+  transaction that records it (`main/services/zatca/reporting.ts`). A worker
+  (`reporting-worker.ts`, started with the app) sends due rows every minute to
+  `POST /invoices/reporting/single`. No verdict (offline, ZATCA down, rate limit,
+  refused credentials, no API secret) → retried after 1, 2, 4 … minutes, at most an
+  hour apart. ZATCA's verdict is stored: reported, reported with warnings, or
+  rejected (not resent automatically).
+- Alerts (BR-KSA-98): a bar across the dashboard when a document has waited over
+  12 hours, is past 24 hours, or was rejected.
+- ZATCA invoices page (sidebar, Saudi shops, `reports.view`): one day's documents
+  with ZATCA's verdict and messages, day totals, send waiting now, send one again,
+  mark the day reviewed (who and when). Corrections go through refunds, which issue
+  and report a credit note.
+- Checked against ZATCA's developer-portal sandbox (2026-11-24): a FactorPOS-signed
+  invoice is `REPORTED` (200), a resend also returns 200, a wrong hash is rejected
+  (400 with ZATCA's errors), wrong credentials give 401.
+- Left: production reporting (with production onboarding, after the pilot); the
+  review day follows the calendar issue date, not the 4:00 business-day close.
 
 ### 7. Receipt — first part built on branch `feat/monthly-vat-invoice-report`
 

@@ -6,7 +6,6 @@
 import { useCallback, useEffect, useState } from 'react';
 import { CheckCircle2, Circle, FileBadge, Loader2, XCircle } from 'lucide-react';
 import toast from 'react-hot-toast';
-import { useLocale } from 'use-intl';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
@@ -14,7 +13,7 @@ import { Label } from '@/components/ui/label';
 import { Ltr } from '@/components/layout/Ltr';
 import { useFormatDate } from '@/hooks/useFormatDate';
 import api from '@/lib/api';
-import { ZATCA_TEXT_AR, ZATCA_TEXT_EN } from './zatca-text';
+import { useZatcaText } from './zatca-text';
 
 const SELLER_FIELDS = [
   { key: 'crn', numeric: true, maxLength: 10 },
@@ -68,20 +67,6 @@ interface ZatcaOverview {
     createdAt: string;
     onboarded: boolean;
   } | null;
-}
-
-/** English or Arabic text for this card (see ./zatca-text.ts). */
-function useZatcaText() {
-  const locale = useLocale();
-  const text: unknown = locale.toLowerCase().startsWith('ar') ? ZATCA_TEXT_AR : ZATCA_TEXT_EN;
-  return (key: string, params: Record<string, string | number> = {}) => {
-    const value = key
-      .split('.')
-      .reduce<unknown>((node, part) => (node as Record<string, unknown> | undefined)?.[part], text);
-    let out = typeof value === 'string' ? value : key;
-    for (const [name, v] of Object.entries(params)) out = out.replace(`{${name}}`, String(v));
-    return out;
-  };
 }
 
 const STEP_ORDER: OnboardingStatus[] = ['started', 'compliance_issued', 'checks_passed', 'active'];

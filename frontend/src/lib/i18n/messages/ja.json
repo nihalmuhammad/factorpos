@@ -675,7 +675,8 @@
     "user": "ユーザー",
     "whatsapp": "WhatsApp",
     "inventory": "在庫",
-    "tables": "テーブル"
+    "tables": "テーブル",
+    "zatca": "ZATCA請求書"
   },
   "orders": {
     "active": "有効",

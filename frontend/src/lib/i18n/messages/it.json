@@ -675,7 +675,8 @@
     "user": "Utente",
     "whatsapp": "WhatsApp",
     "inventory": "Scorte",
-    "tables": "Tavoli"
+    "tables": "Tavoli",
+    "zatca": "Fatture ZATCA"
   },
   "orders": {
     "active": "Attivo",
