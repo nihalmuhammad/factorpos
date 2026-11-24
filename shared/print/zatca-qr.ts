@@ -10,6 +10,15 @@
  * Pure TypeScript so the Electron main process and the browser share one encoder.
  */
 
+/**
+ * FactorPOS does not sign or report invoices to ZATCA yet (roadmap phases 4–6), so
+ * the Saudi bill format is a preview: it prints a "not a tax invoice" banner and must
+ * not be given to customers as their tax invoice. Phase 4 turns this off.
+ */
+export const ZATCA_PREVIEW_ONLY = true;
+export const ZATCA_PREVIEW_BANNER_EN = 'NOT A TAX INVOICE - PREVIEW';
+export const ZATCA_PREVIEW_BANNER_AR = 'ليست فاتورة ضريبية - معاينة';
+
 export interface ZatcaQrFields {
   readonly sellerName: string;
   readonly vatNumber: string;

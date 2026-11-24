@@ -6,6 +6,11 @@
 import type { Bill } from '@/lib/types';
 import { isExcludedFromBillReceipt } from '../../../../shared/order-item-status';
 import { parseDbTimestamp } from '@/lib/utils';
+import {
+  ZATCA_PREVIEW_BANNER_AR,
+  ZATCA_PREVIEW_BANNER_EN,
+  ZATCA_PREVIEW_ONLY,
+} from '../../../../shared/print/zatca-qr';
 
 export const SAUDI_TITLE_AR = 'فاتورة ضريبية مبسطة';
 export const SAUDI_TITLE_EN = 'Simplified Tax Invoice';
@@ -149,6 +154,8 @@ export function generateSaudiBillHtml(bill: Bill, opts: SaudiWebInvoiceOptions):
   .meta td.value { text-align: end; white-space: nowrap; vertical-align: top; }
   .meta td.label, .totals td:first-child { width: 100%; }
   .vat-no { white-space: nowrap; }
+  .preview-banner { border: 2px solid #000; padding: 3px; margin: 4px 0 6px; font-weight: 800; }
+  .preview-banner .ar { text-align: center; font-size: 1em; font-weight: 800; }
   .meta .ar, .totals .ar { text-align: left; }
   .totals { margin-top: 6px; }
   .grand td { border-top: 2px solid #000; font-size: 1.2em; font-weight: 800; padding-top: 4px; }
@@ -166,6 +173,7 @@ export function generateSaudiBillHtml(bill: Bill, opts: SaudiWebInvoiceOptions):
     ${vatNumber ? `<div class="vat-no"><strong>VAT No:</strong> <span dir="ltr">${esc(vatNumber)}</span></div><div class="ar" dir="rtl" style="text-align:center">الرقم الضريبي: <span dir="ltr">${esc(vatNumber)}</span></div>` : ''}
   </div>
   <div class="title center"><div class="ar" dir="rtl">${SAUDI_TITLE_AR}</div><div>${SAUDI_TITLE_EN.toUpperCase()}</div></div>
+  ${ZATCA_PREVIEW_ONLY ? `<div class="preview-banner center">${ZATCA_PREVIEW_BANNER_EN}<div class="ar" dir="rtl">${ZATCA_PREVIEW_BANNER_AR}</div></div>` : ''}
   <table class="meta">
     ${meta('Invoice No', 'رقم الفاتورة', bill.bill_number)}
     ${meta('Date', 'التاريخ', issueDate(issuedAt, opts.timezone ?? ''))}

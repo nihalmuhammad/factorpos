@@ -97,7 +97,9 @@ Covered by `npm run test:factorpos-migrations`.
   out on text-only printers). Browser: `frontend/src/lib/printer/saudi-web-print.ts`,
   with the QR image from `GET /api/bills/:id/zatca-qr`. Direct-USB (WebUSB) printers
   use system print for this format. QR tags 6–9 (hash, signature, public key) come
-  with invoice signing (roadmap phase 4).
+  with invoice signing (roadmap phase 4). Until then `ZATCA_PREVIEW_ONLY` prints a
+  "NOT A TAX INVOICE - PREVIEW" banner: shops under ZATCA Phase 2 must keep issuing
+  tax invoices from their compliant system.
 - First-run setup preselects Saudi Arabia, SAR and Asia/Riyadh, and lists the selected
   country first (`frontend/src/lib/factorpos-setup.ts`); FloCafe pins India and Argentina
   to the top, which hid the Saudi tick and made India a one-click mistake. FloCafe 3.14 no

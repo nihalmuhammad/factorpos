@@ -110,6 +110,7 @@ test('thermal text output carries the ZATCA invoice fields and totals', () => {
   ]) {
     assert.ok(text.includes(expected), `bill shows ${expected}`);
   }
+  assert.ok(text.includes('NOT A TAX INVOICE'), 'preview banner until FactorPOS signs invoices');
   assert.ok(!text.includes('Cancelled tea'), 'cancelled items are left off');
   assert.ok(!text.includes('TOKEN'), 'the Saudi invoice has no day token');
   assert.ok(!/Powered by/i.test(text), 'no branding footer');
@@ -233,6 +234,8 @@ test('browser bill shows both titles, VAT split and the QR image', () => {
     'VAT 15%',
     'SAR 400.00',
     'data:image/png;base64,AAAA',
+    'NOT A TAX INVOICE',
+    'ليست فاتورة ضريبية',
   ]) {
     assert.ok(html.includes(expected), `browser bill shows ${expected}`);
   }

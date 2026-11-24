@@ -34,7 +34,13 @@ import {
   parseVariantSelection,
   wrapText,
 } from './formatting-helpers';
-import { encodeZatcaQr, zatcaQrFieldsForBill } from '../../shared/print/zatca-qr';
+import {
+  encodeZatcaQr,
+  zatcaQrFieldsForBill,
+  ZATCA_PREVIEW_BANNER_AR,
+  ZATCA_PREVIEW_BANNER_EN,
+  ZATCA_PREVIEW_ONLY,
+} from '../../shared/print/zatca-qr';
 
 export const SAUDI_INVOICE_TITLE_AR = 'فاتورة ضريبية مبسطة';
 export const SAUDI_INVOICE_TITLE_EN = 'SIMPLIFIED TAX INVOICE';
@@ -226,6 +232,11 @@ export function renderSaudiReceiptLines(
   lines.push(dash);
   center(SAUDI_INVOICE_TITLE_AR, ['BOLD']);
   center(SAUDI_INVOICE_TITLE_EN, ['BOLD']);
+  if (ZATCA_PREVIEW_ONLY) {
+    lines.push(dash);
+    center(`** ${ZATCA_PREVIEW_BANNER_EN} **`, ['BOLD'], false);
+    center(ZATCA_PREVIEW_BANNER_AR, ['BOLD']);
+  }
   lines.push(dash);
 
   const issuedAt = String(bill?.paid_at || bill?.created_at || order?.created_at || '');

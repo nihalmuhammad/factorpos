@@ -208,6 +208,8 @@ test('Saudi simplified tax invoice with the ZATCA QR is a core bill format', () 
   assert.match(read('frontend/src/app/(dashboard)/settings/page.tsx'), /id: 'saudi'/);
   assert.match(read('frontend/src/hooks/usePrinter.ts'), /\/bills\/\$\{bill\.id\}\/zatca-qr/);
   assert.match(read('main/routes/bills.ts'), /'\/:id\/zatca-qr'/);
+  // Until FactorPOS signs and reports invoices, the Saudi format is a marked preview.
+  assert.match(read('shared/print/zatca-qr.ts'), /export const ZATCA_PREVIEW_ONLY = true;/);
 });
 
 test('orders carry the day token and setup preselects Saudi Arabia', () => {
