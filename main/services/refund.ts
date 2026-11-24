@@ -1,27 +1,93 @@
 /** Bill-level cash-back and item-level refund processing for paid bills. */
 import {
-  getDatabase, getSettingValue, now, parseDbTimestamp, verifyPin,
-  dayBoundsInTimezone, localDateInTimezone, tenantBusinessDayStartTime, recordOrderAudit,
+  getDatabase,
+  getSettingValue,
+  now,
+  parseDbTimestamp,
+  verifyPin,
+  dayBoundsInTimezone,
+  localDateInTimezone,
+  tenantBusinessDayStartTime,
+  recordOrderAudit,
 } from '../db';
 import { invertTaxBreakdown, invertTaxSnapshot } from './tax';
+import { adjustProductStock } from './inventory';
+import { reconcileActiveOrderStatusFromItems } from './orders';
+import {
+  getOpenSession,
+  NO_CASH_SESSION_ID,
+  requireOpenSessionForCashTender,
+} from './shift-session-gate';
 import { ROLE_ACCESS } from '../../shared/role-permissions';
-import { getCountryByCode, getCurrencyMinorUnitFactor } from '../countries';
+import {
+  getCurrencyMinorUnitFactor,
+  resolveRegionalSnapshot,
+  resolveTenantCurrency,
+} from '../countries';
 
 type Database = ReturnType<typeof getDatabase>;
 
 // Kept in sync with the 1:1 rate in main/routes/bills.ts — loyalty points equal currency units.
 const LOYALTY_REDEMPTION_RATE = 1;
-// Items already served/completed become refundable once an order is past the short window below.
 const REFUND_ITEM_ELIGIBLE_STATUSES = ['preparing', 'ready', 'served', 'completed'];
-const REFUND_WINDOW_MS = 60 * 60 * 1000;
-// Terminal item statuses excluded from active order calculations.
-export const TERMINAL_ITEM_STATUSES = ['cancelled', 'voided', 'void_adjustment', 'refunded'];
+
+export const REFUND_MANAGER_WINDOWS = ['30m', '1h', '2h', '4h', 'same_business_day'] as const;
+export type RefundManagerWindow = (typeof REFUND_MANAGER_WINDOWS)[number];
+
+export const REFUND_MANAGER_WINDOW_MS: Record<
+  Exclude<RefundManagerWindow, 'same_business_day'>,
+  number
+> = {
+  '30m': 30 * 60 * 1000,
+  '1h': 60 * 60 * 1000,
+  '2h': 2 * 60 * 60 * 1000,
+  '4h': 4 * 60 * 60 * 1000,
+};
+
+export function isRefundManagerWindow(value: unknown): value is RefundManagerWindow {
+  return typeof value === 'string' && (REFUND_MANAGER_WINDOWS as readonly string[]).includes(value);
+}
+
+function readSetting(db: Database | undefined, key: string): string | null {
+  if (db) {
+    try {
+      const row = db.prepare('SELECT value FROM settings WHERE key = ?').get(key) as
+        | { value?: string | null }
+        | undefined;
+      return row?.value ?? null;
+    } catch {
+      return getSettingValue(key);
+    }
+  }
+  return getSettingValue(key);
+}
+
+export function getRefundPolicySettings(db?: Database): {
+  refund_manager_enabled: boolean;
+  refund_manager_window: RefundManagerWindow;
+} {
+  const rawEnabled = readSetting(db, 'refund_manager_enabled');
+  const rawWindow = readSetting(db, 'refund_manager_window');
+  return {
+    refund_manager_enabled: rawEnabled !== 'false',
+    refund_manager_window: isRefundManagerWindow(rawWindow) ? rawWindow : '1h',
+  };
+}
 
 export function getTenantCurrency(db?: Database): string {
-  const explicit = db ? (db.prepare("SELECT value FROM settings WHERE key = 'currency'").get() as any)?.value : getSettingValue('currency');
-  if (explicit && typeof explicit === 'string' && /^[A-Z]{3}$/.test(explicit)) return explicit;
-  const country = (db ? (db.prepare("SELECT value FROM settings WHERE key = 'country'").get() as any)?.value : getSettingValue('country')) || 'IN';
-  return getCountryByCode(country)?.currency || 'INR';
+  const explicit = db
+    ? (db.prepare("SELECT value FROM settings WHERE key = 'currency'").get() as any)?.value
+    : getSettingValue('currency');
+  const country = db
+    ? (db.prepare("SELECT value FROM settings WHERE key = 'country'").get() as any)?.value
+    : getSettingValue('country');
+  return resolveTenantCurrency(explicit, country || '');
+}
+
+export interface PreVerifiedRefundApprover {
+  id: string;
+  verifiedPinHash: string;
+  lateRefund: boolean;
 }
 
 export interface RefundRequest {
@@ -31,13 +97,16 @@ export interface RefundRequest {
   method?: string;
   reason?: string | null;
   shiftId?: string | null;
-  overridePin: string;
+  overridePin?: string;
   approverId?: string | null;
   createdByUserId: string;
   clientIp: string;
   checkPinRateLimit: (key: string) => boolean;
+  isPinRateLimited: (key: string) => boolean;
+  clearPinRateLimit: (key: string) => void;
   idempotencyKey?: string | null;
   requestHash?: string;
+  preVerifiedApprover?: PreVerifiedRefundApprover | null;
 }
 
 export interface RefundResult {
@@ -45,45 +114,255 @@ export interface RefundResult {
   bill: any;
 }
 
-function httpError(message: string, statusCode: number): Error {
-  return Object.assign(new Error(message), { statusCode });
+function httpError(message: string, statusCode: number, diagnosticCode?: string): Error {
+  return Object.assign(new Error(message), {
+    statusCode,
+    ...(diagnosticCode ? { diagnosticCode } : {}),
+  });
 }
 
 /** Returns the refundable balance for a bill in integer minor units. */
-export function getRefundableBalance(db: Database, billId: string | number, currency?: string): {
+export function getRefundableBalance(
+  db: Database,
+  billId: string | number,
+  currency?: string,
+): {
   paidCents: number;
   refundedCents: number;
   refundableCents: number;
 } {
   const effectiveCurrency = currency || getTenantCurrency(db);
   const minorFactor = getCurrencyMinorUnitFactor(effectiveCurrency);
-  const bill = db.prepare('SELECT paid_amount FROM bills WHERE id = ?').get(billId) as { paid_amount: number } | undefined;
+  const bill = db.prepare('SELECT paid_amount FROM bills WHERE id = ?').get(billId) as
+    | { paid_amount: number }
+    | undefined;
   const paidCents = Math.round(Number(bill?.paid_amount || 0) * minorFactor);
-  const refundedRow = db.prepare('SELECT COALESCE(SUM(amount_cents), 0) AS total FROM refunds WHERE bill_id = ?').get(billId) as { total: number };
+  const refundedRow = db
+    .prepare('SELECT COALESCE(SUM(amount_cents), 0) AS total FROM refunds WHERE bill_id = ?')
+    .get(billId) as { total: number };
   const refundedCents = Number(refundedRow.total || 0);
   return { paidCents, refundedCents, refundableCents: paidCents - refundedCents };
 }
 
-/** `ownerOnly` narrows the approving PIN to owner accounts — used once a refund falls outside the short in-progress window. */
-function resolveRefundApprover(db: Database, overridePin: string, approverId: string | null | undefined, ownerOnly: boolean): { id: string } | null {
+/** `ownerOnly` narrows the approving PIN to owner accounts when manager approval is disabled or the manager window has elapsed. */
+function resolveRefundApprover(
+  db: Database,
+  overridePin: string,
+  approverId: string | null | undefined,
+  ownerOnly: boolean,
+): { id: string } | null {
   const allowedRoles = ownerOnly ? ROLE_ACCESS.owner : ROLE_ACCESS.ownerManager;
   const placeholders = allowedRoles.map(() => '?').join(', ');
   if (!approverId) return null;
-  const candidate = db.prepare(`SELECT * FROM users WHERE id = ? AND pin_hash IS NOT NULL AND role IN (${placeholders}) AND is_active = 1`).get(approverId, ...allowedRoles) as any;
+  const candidate = db
+    .prepare(
+      `SELECT * FROM users WHERE id = ? AND pin_hash IS NOT NULL AND role IN (${placeholders}) AND is_active = 1`,
+    )
+    .get(approverId, ...allowedRoles) as any;
   return candidate && verifyPin(candidate.pin_hash, overridePin) ? candidate : null;
+}
+
+export interface RefundBillRecord {
+  id: string | number;
+  order_id: string | number;
+  customer_id?: string | null;
+  bill_number?: string | null;
+  split_group_id?: string | null;
+  payment_status?: string | null;
+  [key: string]: unknown;
+}
+
+export interface RefundOrderItemRecord {
+  id: string | number;
+  order_id: string | number;
+  product_id?: string | number | null;
+  product_name?: string | null;
+  product_sku?: string | null;
+  unit_price: number;
+  quantity: number;
+  subtotal: number;
+  tax_amount?: number | null;
+  tax_breakdown?: string | null;
+  tax_snapshot?: string | null;
+  tax_type?: string | null;
+  discount_amount?: number | null;
+  total: number;
+  variant_selection?: string | null;
+  modifier_selection?: string | null;
+  status: string;
+  [key: string]: unknown;
+}
+
+export interface ValidatedRefundPreconditions {
+  lateRefund: boolean;
+  bill: RefundBillRecord;
+  item: RefundOrderItemRecord | null;
+  amountCents: number;
+  currency: string;
+}
+
+/** Check whether a bill/order requires owner PIN approval (outside manager window or manager approvals disabled). */
+export function checkIsLateRefund(
+  db: Database,
+  billId: string | number,
+  nowMs: number = Date.now(),
+): { lateRefund: boolean; bill: RefundBillRecord } {
+  const bill = db.prepare('SELECT * FROM bills WHERE id = ?').get(billId) as
+    | RefundBillRecord
+    | undefined;
+  if (!bill) throw httpError('Bill not found', 404, 'bill_unavailable');
+  const order = db
+    .prepare('SELECT created_at, release_status, released_at FROM orders WHERE id = ?')
+    .get(bill.order_id as string | number) as
+    | { created_at: string; release_status?: string | null; released_at?: string | null }
+    | undefined;
+  if (!order) throw httpError('Order not found', 404, 'order_unavailable');
+
+  const { refund_manager_enabled, refund_manager_window } = getRefundPolicySettings(db);
+  if (!refund_manager_enabled) {
+    return { lateRefund: true, bill };
+  }
+  if (order.release_status && order.release_status !== 'released') {
+    return { lateRefund: false, bill };
+  }
+  const anchorTimestamp = order.released_at || order.created_at;
+  const orderAnchorMs = parseDbTimestamp(anchorTimestamp).getTime();
+  if (!Number.isFinite(orderAnchorMs)) throw httpError('Order creation time is invalid', 500);
+
+  if (
+    refund_manager_window !== 'same_business_day' &&
+    nowMs - orderAnchorMs > REFUND_MANAGER_WINDOW_MS[refund_manager_window]
+  ) {
+    return { lateRefund: true, bill };
+  }
+
+  const timezone = resolveRegionalSnapshot({
+    country: readSetting(db, 'country') ?? undefined,
+    currency: readSetting(db, 'currency') ?? undefined,
+    timezone: readSetting(db, 'timezone') ?? undefined,
+  }).timezone;
+  const startTime = tenantBusinessDayStartTime(db);
+  const orderBusinessDate = localDateInTimezone(new Date(orderAnchorMs), timezone, startTime);
+  const [, businessDayEnd] = dayBoundsInTimezone(orderBusinessDate, timezone, startTime);
+  if (nowMs >= parseDbTimestamp(businessDayEnd).getTime()) {
+    return { lateRefund: true, bill };
+  }
+  return { lateRefund: false, bill };
+}
+
+/** Validates refund preconditions before PIN verification and write transaction. */
+export function validateRefundPreconditions(
+  db: Database,
+  req: {
+    billId: string | number;
+    method?: string;
+    amountCents?: number;
+    orderItemId?: number | null;
+    createdByUserId?: string;
+  },
+  nowMs: number = Date.now(),
+): ValidatedRefundPreconditions {
+  requireOpenSessionForCashTender(db, [{ method: req.method }], req.createdByUserId);
+
+  const { lateRefund, bill } = checkIsLateRefund(db, req.billId, nowMs);
+
+  const currency = getTenantCurrency(db);
+  const minorFactor = getCurrencyMinorUnitFactor(currency);
+
+  let amountCents = req.amountCents;
+  let item: RefundOrderItemRecord | null = null;
+  if (req.orderItemId != null) {
+    item =
+      (db.prepare('SELECT * FROM order_items WHERE id = ?').get(req.orderItemId) as
+        | RefundOrderItemRecord
+        | undefined) ?? null;
+    if (!item) throw httpError('Order item not found', 404, 'item_unavailable');
+    if (String(item.order_id) !== String(bill.order_id)) {
+      throw httpError("Item does not belong to this bill's order", 400, 'item_bill_mismatch');
+    }
+    if (bill.split_group_id) {
+      const allocation = db
+        .prepare(`
+        SELECT quantity FROM bill_items WHERE bill_id = ? AND order_item_id = ?
+      `)
+        .get(bill.id as string | number, item.id as string | number) as
+        | { quantity: number }
+        | undefined;
+      if (!allocation) {
+        throw httpError('Item is not allocated to this split bill', 400, 'split_item_unallocated');
+      }
+      if (Number(allocation.quantity) !== Number(item.quantity)) {
+        throw httpError(
+          'Partially allocated split items cannot be refunded as a whole item',
+          409,
+          'split_item_partial',
+        );
+      }
+    }
+    if (!REFUND_ITEM_ELIGIBLE_STATUSES.includes(item.status as string)) {
+      throw httpError('Item is not eligible for refund', 409, 'item_status_ineligible');
+    }
+    const itemAmountCents = Math.round(Number(item.total) * minorFactor);
+    if (amountCents !== undefined && amountCents !== itemAmountCents) {
+      throw httpError(
+        "Refund amount does not match the item's refundable total",
+        400,
+        'item_amount_mismatch',
+      );
+    }
+    amountCents = itemAmountCents;
+  }
+
+  if (amountCents === undefined || !Number.isSafeInteger(amountCents) || amountCents <= 0) {
+    throw httpError('Refund amount is required', 400, 'amount_required');
+  }
+  if (!req.method || typeof req.method !== 'string' || req.method.length > 60) {
+    throw httpError('Refund method is required', 400, 'method_required');
+  }
+  const isStoreCreditRefund = req.method === 'wallet';
+  if (isStoreCreditRefund) {
+    const loyaltyEnabled = ['true', '1'].includes(getSettingValue('loyalty_enabled') || '');
+    if (!loyaltyEnabled) throw httpError('Store credit is not enabled', 400, 'wallet_disabled');
+    if (!bill.customer_id)
+      throw httpError(
+        'Customer association is required for a store-credit refund',
+        400,
+        'wallet_customer_required',
+      );
+  }
+
+  const { refundableCents } = getRefundableBalance(db, req.billId, currency);
+  if (refundableCents <= 0)
+    throw httpError('Bill has nothing left to refund', 400, 'nothing_to_refund');
+  if (amountCents > refundableCents)
+    throw httpError(
+      'Refund amount exceeds the refundable balance',
+      400,
+      'amount_exceeds_refundable',
+    );
+
+  return { lateRefund, bill, item, amountCents, currency };
 }
 
 /** Validates, authorizes, and persists a refund inside an active transaction. */
 export function createRefund(db: Database, req: RefundRequest): RefundResult {
   if (req.idempotencyKey) {
-    const prior = db.prepare(`
+    const prior = db
+      .prepare(`
       SELECT bill_id, request_hash, response_json
       FROM refund_idempotency
       WHERE user_id = ? AND idempotency_key = ?
-    `).get(req.createdByUserId, req.idempotencyKey) as { bill_id: string; request_hash: string; response_json: string } | undefined;
+    `)
+      .get(req.createdByUserId, req.idempotencyKey) as
+      | { bill_id: string; request_hash: string; response_json: string }
+      | undefined;
     if (prior) {
       if (String(prior.bill_id) !== String(req.billId) || prior.request_hash !== req.requestHash) {
-        throw httpError('Idempotency-Key was already used for a different refund request', 409);
+        throw httpError(
+          'Idempotency-Key was already used for a different refund request',
+          409,
+          'idempotency_conflict',
+        );
       }
       try {
         return JSON.parse(prior.response_json);
@@ -93,118 +372,190 @@ export function createRefund(db: Database, req: RefundRequest): RefundResult {
     }
   }
 
-  const bill = db.prepare('SELECT * FROM bills WHERE id = ?').get(req.billId) as any;
-  if (!bill) throw httpError('Bill not found', 404);
-  const order = db.prepare('SELECT created_at FROM orders WHERE id = ?').get(bill.order_id) as { created_at: string } | undefined;
-  if (!order) throw httpError('Order not found', 404);
-  const orderCreatedAt = parseDbTimestamp(order.created_at).getTime();
-  if (!Number.isFinite(orderCreatedAt)) throw httpError('Order creation time is invalid', 500);
   const nowMs = Date.now();
-  // Past the short window, an owner-only PIN is required for the rest of the business day (docs/business-decisions.md).
-  let lateRefund = false;
-  if (nowMs - orderCreatedAt > REFUND_WINDOW_MS) {
-    const timezone = getSettingValue('timezone') || 'Asia/Kolkata';
-    const startTime = tenantBusinessDayStartTime(db);
-    const orderBusinessDate = localDateInTimezone(new Date(orderCreatedAt), timezone, startTime);
-    const [, businessDayEnd] = dayBoundsInTimezone(orderBusinessDate, timezone, startTime);
-    if (nowMs >= parseDbTimestamp(businessDayEnd).getTime()) {
-      throw httpError('Refund window has expired. Completed orders can only be refunded within the same business day.', 409);
-    }
-    lateRefund = true;
-  }
-
-  const currency = getTenantCurrency(db);
+  const { lateRefund, bill, item, amountCents, currency } = validateRefundPreconditions(
+    db,
+    req,
+    nowMs,
+  );
   const minorFactor = getCurrencyMinorUnitFactor(currency);
-
-  let amountCents = req.amountCents;
-  let item: any = null;
-  if (req.orderItemId != null) {
-    item = db.prepare('SELECT * FROM order_items WHERE id = ?').get(req.orderItemId) as any;
-    if (!item) throw httpError('Order item not found', 404);
-    if (String(item.order_id) !== String(bill.order_id)) {
-      throw httpError("Item does not belong to this bill's order", 400);
-    }
-    if (bill.split_group_id) {
-      const allocation = db.prepare(`
-        SELECT quantity FROM bill_items WHERE bill_id = ? AND order_item_id = ?
-      `).get(bill.id, item.id) as { quantity: number } | undefined;
-      if (!allocation) {
-        throw httpError('Item is not allocated to this split bill', 400);
-      }
-      if (Number(allocation.quantity) !== Number(item.quantity)) {
-        throw httpError('Partially allocated split items cannot be refunded as a whole item', 409);
-      }
-    }
-    if (!REFUND_ITEM_ELIGIBLE_STATUSES.includes(item.status)) {
-      throw httpError('Item is not eligible for refund', 409);
-    }
-    const itemAmountCents = Math.round(Number(item.total) * minorFactor);
-    if (amountCents !== undefined && amountCents !== itemAmountCents) {
-      throw httpError("Refund amount does not match the item's refundable total", 400);
-    }
-    amountCents = itemAmountCents;
-  }
-
-  if (amountCents === undefined || !Number.isSafeInteger(amountCents) || amountCents <= 0) {
-    throw httpError('Refund amount is required', 400);
-  }
-  if (!req.method || typeof req.method !== 'string' || req.method.length > 60) {
-    throw httpError('Refund method is required', 400);
-  }
   const isStoreCreditRefund = req.method === 'wallet';
-  if (isStoreCreditRefund) {
-    const loyaltyEnabled = ['true', '1'].includes(getSettingValue('loyalty_enabled') || '');
-    if (!loyaltyEnabled) throw httpError('Store credit is not enabled', 400);
-    if (!bill.customer_id) throw httpError('Customer association is required for a store-credit refund', 400);
+  const { paidCents, refundedCents } = getRefundableBalance(db, req.billId, currency);
+
+  let approver: { id: string } | null = null;
+  if (req.preVerifiedApprover) {
+    if (req.preVerifiedApprover.id !== req.approverId) {
+      throw httpError('Pre-verified approver mismatch', 403, 'approver_pin_invalid');
+    }
+    if (lateRefund && !req.preVerifiedApprover.lateRefund) {
+      throw httpError(
+        'Owner PIN required to process a refund on a completed order',
+        403,
+        'approver_pin_invalid',
+      );
+    }
+    const allowedRoles = lateRefund ? ROLE_ACCESS.owner : ROLE_ACCESS.ownerManager;
+    const placeholders = allowedRoles.map(() => '?').join(', ');
+    const candidate = db
+      .prepare(
+        `SELECT id, pin_hash, role, is_active FROM users WHERE id = ? AND pin_hash IS NOT NULL AND role IN (${placeholders}) AND is_active = 1`,
+      )
+      .get(req.preVerifiedApprover.id, ...allowedRoles) as
+      | { id: string; pin_hash: string; role: string; is_active: number }
+      | undefined;
+    if (!candidate || candidate.pin_hash !== req.preVerifiedApprover.verifiedPinHash) {
+      throw httpError(
+        lateRefund ? 'Invalid owner PIN' : 'Invalid manager PIN',
+        403,
+        'approver_pin_invalid',
+      );
+    }
+    approver = candidate;
+  } else {
+    if (!req.overridePin) {
+      throw httpError(
+        lateRefund
+          ? 'Owner PIN required to process a refund on a completed order'
+          : 'Manager PIN required to process a refund',
+        400,
+        'approver_pin_required',
+      );
+    }
+    const rateLimitKey = `pin:${req.clientIp}:refund`;
+    if (req.isPinRateLimited(rateLimitKey)) {
+      throw httpError('Too many PIN attempts. Try again in 15 minutes.', 429, 'pin_rate_limited');
+    }
+    approver = resolveRefundApprover(db, req.overridePin, req.approverId, lateRefund);
+    if (!approver) {
+      req.checkPinRateLimit(rateLimitKey);
+      throw httpError(
+        lateRefund ? 'Invalid owner PIN' : 'Invalid manager PIN',
+        403,
+        'approver_pin_invalid',
+      );
+    }
+    req.clearPinRateLimit(rateLimitKey);
   }
 
-  const { paidCents, refundedCents, refundableCents } = getRefundableBalance(db, req.billId, currency);
-  if (refundableCents <= 0) throw httpError('Bill has nothing left to refund', 400);
-  if (amountCents > refundableCents) throw httpError('Refund amount exceeds the refundable balance', 400);
-
-  if (!req.overridePin) {
-    throw httpError(lateRefund ? 'Owner PIN required to process a refund on a completed order' : 'Manager PIN required to process a refund', 400);
+  if (!approver) {
+    throw httpError(
+      lateRefund ? 'Invalid owner PIN' : 'Invalid manager PIN',
+      403,
+      'approver_pin_invalid',
+    );
   }
-  const rateLimitKey = `pin:${req.clientIp}:refund`;
-  if (!req.checkPinRateLimit(rateLimitKey)) {
-    throw httpError('Too many PIN attempts. Try again in 15 minutes.', 429);
-  }
-  const approver = resolveRefundApprover(db, req.overridePin, req.approverId, lateRefund);
-  if (!approver) throw httpError(lateRefund ? 'Invalid owner PIN' : 'Invalid manager PIN', 403);
 
   const timestamp = now();
 
   if (item) {
     // Insert negative void_adjustment row to reverse item cost while preserving audit trail.
-    const adjustmentResult = db.prepare(`
+    const reversedIngredientCost =
+      Number(item.ingredient_cost_known) === 1 &&
+      typeof item.ingredient_cost === 'number' &&
+      Number.isFinite(item.ingredient_cost)
+        ? item.ingredient_cost === 0
+          ? 0
+          : -item.ingredient_cost
+        : null;
+    const reversedIngredientCostKnown = reversedIngredientCost !== null ? 1 : 0;
+    const adjustmentResult = db
+      .prepare(`
       INSERT INTO order_items (
         order_id, product_id, product_name, product_sku, unit_price, quantity,
         subtotal, tax_amount, tax_breakdown, tax_snapshot, tax_type, discount_amount, total,
-        variant_selection, modifier_selection, status, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'void_adjustment', ?, ?)
-    `).run(
-      item.order_id, item.product_id, `Refund: ${item.product_name}`, item.product_sku,
-      -item.unit_price, item.quantity, -item.subtotal, -(item.tax_amount || 0),
-      invertTaxBreakdown(item.tax_breakdown), invertTaxSnapshot(item.tax_snapshot), item.tax_type,
-      -(item.discount_amount || 0), -item.total,
-      item.variant_selection, item.modifier_selection, timestamp, timestamp,
-    );
+        variant_selection, modifier_selection, ingredient_cost, ingredient_cost_known, status, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'void_adjustment', ?, ?)
+    `)
+      .run(
+        item.order_id,
+        item.product_id,
+        `Refund: ${item.product_name}`,
+        item.product_sku,
+        -item.unit_price,
+        item.quantity,
+        -item.subtotal,
+        -(item.tax_amount || 0),
+        invertTaxBreakdown(item.tax_breakdown),
+        invertTaxSnapshot(item.tax_snapshot),
+        item.tax_type,
+        -(item.discount_amount || 0),
+        -item.total,
+        item.variant_selection,
+        item.modifier_selection,
+        reversedIngredientCost,
+        reversedIngredientCostKnown,
+        timestamp,
+        timestamp,
+      );
     if (bill.split_group_id) {
-      db.prepare('INSERT INTO bill_items (bill_id, order_item_id, quantity) VALUES (?, ?, ?)')
-        .run(bill.id, adjustmentResult.lastInsertRowid, item.quantity);
+      db.prepare('INSERT INTO bill_items (bill_id, order_item_id, quantity) VALUES (?, ?, ?)').run(
+        bill.id,
+        adjustmentResult.lastInsertRowid,
+        item.quantity,
+      );
     }
-    db.prepare("UPDATE order_items SET status = 'refunded', voided_at = ?, updated_at = ? WHERE id = ?")
-      .run(timestamp, timestamp, item.id);
+    db.prepare(
+      "UPDATE order_items SET status = 'refunded', voided_at = ?, updated_at = ? WHERE id = ?",
+    ).run(timestamp, timestamp, item.id);
+    const addonDeductions = db
+      .prepare(`
+        SELECT addon_id, addon_name, inventory_deducted_quantity
+        FROM order_item_addons
+        WHERE order_item_id = ? AND inventory_deducted_quantity > 0
+      `)
+      .all(item.id) as {
+      addon_id: string | null;
+      addon_name: string;
+      inventory_deducted_quantity: number;
+    }[];
+    for (const addon of addonDeductions) {
+      const quantity = Number(addon.inventory_deducted_quantity) || 0;
+      const addonId = addon.addon_id ? String(addon.addon_id) : null;
+      if (quantity <= 0 || !addonId) continue;
+      const catalogAddon = db.prepare('SELECT id FROM addons WHERE id = ?').get(addonId) as
+        | { id: string }
+        | undefined;
+      if (!catalogAddon) continue;
+      adjustProductStock(db, {
+        productId: null,
+        addonId: catalogAddon.id,
+        quantityDelta: quantity,
+        movementType: 'cancel_restore',
+        referenceType: 'order_item',
+        referenceId: `${item.id}:${timestamp}`,
+        reason: req.reason || 'Item refunded',
+        actorUserId: req.createdByUserId,
+        createdAt: timestamp,
+      });
+    }
   }
 
-  const insertResult = db.prepare(`
-    INSERT INTO refunds (bill_id, order_item_id, amount_cents, method, reason, shift_id, approved_by, created_by, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(req.billId, req.orderItemId ?? null, amountCents, req.method, req.reason ?? null, req.shiftId ?? null, approver.id, req.createdByUserId, timestamp);
+  const cashSessionId = getOpenSession(db, req.createdByUserId)?.id ?? NO_CASH_SESSION_ID;
+  const insertResult = db
+    .prepare(`
+    INSERT INTO refunds (bill_id, order_item_id, amount_cents, method, reason, shift_id, approved_by, created_by, created_at, cash_session_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `)
+    .run(
+      req.billId,
+      req.orderItemId ?? null,
+      amountCents,
+      req.method,
+      req.reason ?? null,
+      req.shiftId ?? null,
+      approver.id,
+      req.createdByUserId,
+      timestamp,
+      cashSessionId,
+    );
 
   const newRefundedCents = refundedCents + amountCents;
   const paymentStatus = newRefundedCents >= paidCents ? 'refunded' : 'partially_refunded';
-  db.prepare('UPDATE bills SET payment_status = ?, updated_at = ? WHERE id = ?').run(paymentStatus, timestamp, req.billId);
+  db.prepare('UPDATE bills SET payment_status = ?, updated_at = ? WHERE id = ?').run(
+    paymentStatus,
+    timestamp,
+    req.billId,
+  );
 
   if (isStoreCreditRefund) {
     // A plain 'credit' row — wallet-funded spend is already excluded from the cashback base.
@@ -212,7 +563,14 @@ export function createRefund(db: Database, req: RefundRequest): RefundResult {
     db.prepare(`
       INSERT INTO loyalty_ledger (customer_id, bill_id, type, amount, description, created_at, updated_at)
       VALUES (?, ?, 'credit', ?, ?, ?, ?)
-    `).run(bill.customer_id, req.billId, creditAmount, `Refund credit for bill ${bill.bill_number}`, timestamp, timestamp);
+    `).run(
+      bill.customer_id,
+      req.billId,
+      creditAmount,
+      `Refund credit for bill ${bill.bill_number}`,
+      timestamp,
+      timestamp,
+    );
   }
 
   recordOrderAudit(db, {
@@ -231,13 +589,25 @@ export function createRefund(db: Database, req: RefundRequest): RefundResult {
     },
   });
 
+  if (item) {
+    reconcileActiveOrderStatusFromItems(db, bill.order_id, req.createdByUserId);
+  }
+
   const refund = db.prepare('SELECT * FROM refunds WHERE id = ?').get(insertResult.lastInsertRowid);
   const freshBill = db.prepare('SELECT * FROM bills WHERE id = ?').get(req.billId);
   const result: RefundResult = { refund, bill: freshBill };
 
   if (req.idempotencyKey && req.requestHash) {
-    db.prepare('INSERT INTO refund_idempotency (user_id, idempotency_key, bill_id, request_hash, response_json, created_at) VALUES (?, ?, ?, ?, ?, ?)')
-      .run(req.createdByUserId, req.idempotencyKey, String(req.billId), req.requestHash, JSON.stringify(result), timestamp);
+    db.prepare(
+      'INSERT INTO refund_idempotency (user_id, idempotency_key, bill_id, request_hash, response_json, created_at) VALUES (?, ?, ?, ?, ?, ?)',
+    ).run(
+      req.createdByUserId,
+      req.idempotencyKey,
+      String(req.billId),
+      req.requestHash,
+      JSON.stringify(result),
+      timestamp,
+    );
   }
 
   return result;

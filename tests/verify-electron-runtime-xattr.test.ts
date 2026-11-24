@@ -8,12 +8,30 @@
  * verifier, so it runs on every platform without needing `xattr`/`codesign`.
  */
 import * as assert from 'node:assert/strict';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
 
-// eslint-disable-next-line @typescript-eslint/no-var-requires
-const { classifyQuarantine } = require('../scripts/verify-electron-runtime.cjs');
+const {
+  classifyQuarantine,
+  resolveElectronAbi,
+} = require('../scripts/verify-electron-runtime.cjs');
 
 function run() {
-  console.log('Testing Electron runtime xattr classification...');
+  console.log('Testing Electron runtime xattr classification and ABI resolution...');
+
+  const electronPkg = JSON.parse(
+    fs.readFileSync(path.join(__dirname, '../node_modules/electron/package.json'), 'utf8'),
+  );
+  assert.match(
+    resolveElectronAbi(electronPkg.version),
+    /^\d+$/,
+    `resolveElectronAbi must resolve numeric ABI for installed Electron ${electronPkg.version}`,
+  );
+  assert.throws(
+    () => resolveElectronAbi('999.0.0'),
+    /Could not detect abi for version 999\.0\.0/,
+    'resolveElectronAbi must throw when node-abi lacks a mapping for an unknown Electron version',
+  );
 
   // Present attribute (exit 0, value on stdout) → must fail as quarantined.
   const present = classifyQuarantine(0, '', '0083;1234567890;Electron');
@@ -25,13 +43,29 @@ function run() {
   assert.equal(absent.state, 'absent', 'exit 1 with "No such xattr" is "absent"');
 
   // Unexpected failure (exit 1 + permission denied) → must NOT be clean.
-  const permissionDenied = classifyQuarantine(1, 'xattr: [Errno 13] Permission denied: /path/Electron.app', '');
-  assert.equal(permissionDenied.state, 'error', 'exit 1 with a permission error is "error", not clean');
-  assert.match(permissionDenied.message, /Permission denied/, 'permission error message is preserved');
+  const permissionDenied = classifyQuarantine(
+    1,
+    'xattr: [Errno 13] Permission denied: /path/Electron.app',
+    '',
+  );
+  assert.equal(
+    permissionDenied.state,
+    'error',
+    'exit 1 with a permission error is "error", not clean',
+  );
+  assert.match(
+    permissionDenied.message,
+    /Permission denied/,
+    'permission error message is preserved',
+  );
 
   // Unexpected failure (exit 1 + empty stderr) → must NOT be clean.
   const silentFailure = classifyQuarantine(1, '', '');
-  assert.equal(silentFailure.state, 'error', 'exit 1 with no "No such xattr" stderr is "error", not clean');
+  assert.equal(
+    silentFailure.state,
+    'error',
+    'exit 1 with no "No such xattr" stderr is "error", not clean',
+  );
 
   // Missing tool (exit 127) → must NOT be clean.
   const missingTool = classifyQuarantine(127, 'xattr: command not found', '');

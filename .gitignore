@@ -1,3 +1,4 @@
+node_modules
 node_modules/
 dist/
 release/
@@ -42,6 +43,7 @@ build/flo.provisionprofile
 
 .next/
 brain/
+.xerj/
 
 # Private code-review reports and remediation notes — never commit
 code-review/
@@ -49,3 +51,4 @@ code-review/
 # Private shared docs repo — cloned in by hand, never tracked here (see AGENTS.md)
 specs/
 test-results/
+playwright-report/

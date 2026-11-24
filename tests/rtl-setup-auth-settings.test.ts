@@ -30,6 +30,14 @@
 import * as fs from 'fs';
 import * as path from 'path';
 
+/** FactorPOS keeps only some UI languages selectable; a browser asking for another one gets English. */
+function factorposBrowserLanguage(
+  i18n: { LANGUAGES: Record<string, { selectable: boolean }> },
+  code: string,
+): string {
+  return i18n.LANGUAGES[code]?.selectable ? code : 'en';
+}
+
 const ROOT = path.join(__dirname, '..');
 const Module = require('module');
 const frontendRequire = Module.createRequire(path.join(ROOT, 'frontend/package.json'));
@@ -78,7 +86,12 @@ function loadLtrComponent(): {
   };
   const originalResolveFilename = moduleApi._resolveFilename;
 
-  moduleApi._resolveFilename = function (request: string, parent: any, isMain: boolean, options?: any) {
+  moduleApi._resolveFilename = function (
+    request: string,
+    parent: any,
+    isMain: boolean,
+    options?: any,
+  ) {
     let resolvedRequest = request;
     if (request.startsWith('@/')) {
       resolvedRequest = path.resolve(ROOT, 'frontend/src', request.slice(2));
@@ -119,7 +132,9 @@ async function run(): Promise<void> {
     }
     totalPhysical += matches.length;
   }
-  console.log(`  ✓ batch screens use logical direction utilities (${totalPhysical} allowlisted physical cases)`);
+  console.log(
+    `  ✓ batch screens use logical direction utilities (${totalPhysical} allowlisted physical cases)`,
+  );
 
   // 2. Directional navigation arrows carry `.rtl-flip`.
   const arrowFiles = SCREEN_FILES.filter((f) => {
@@ -127,13 +142,17 @@ async function run(): Promise<void> {
     return /\bArrow(Left|Right)\b/.test(src);
   });
   for (const file of arrowFiles) {
-    const lines = fs.readFileSync(path.join(ROOT, file), 'utf8').split('\n');
-    lines.forEach((line, i) => {
-      // Only flag JSX usage (`<Arrow…`), not the lucide import statement.
-      if (/<Arrow(Left|Right)\b/.test(line) && !line.includes('rtl-flip')) {
-        assert(false, `${file}:${i + 1} uses a directional arrow without rtl-flip: ${line.trim()}`);
+    const src = fs.readFileSync(path.join(ROOT, file), 'utf8');
+    // Match the full JSX opening tag (`<Arrow…`) across line wraps, not imports.
+    for (const match of src.matchAll(/<Arrow(Left|Right)\b(?:[^>"'<]|"[^"]*"|'[^']*')*>/g)) {
+      if (!match[0].includes('rtl-flip')) {
+        const line = src.slice(0, match.index ?? 0).split('\n').length;
+        assert(
+          false,
+          `${file}:${line} uses a directional arrow without rtl-flip: ${match[0].trim()}`,
+        );
       }
-    });
+    }
   }
   console.log(`  ✓ directional arrows carry rtl-flip (${arrowFiles.length} file(s) with arrows)`);
 
@@ -145,33 +164,44 @@ async function run(): Promise<void> {
   const anchorRender = ReactDOMServer.renderToStaticMarkup(
     React.createElement(
       Ltr,
-      { as: 'a', href: 'http://192.168.1.5:3001', target: '_blank', rel: 'noopener noreferrer', className: 'block font-mono text-sm break-all' },
-      'http://192.168.1.5:3001'
-    )
+      {
+        as: 'a',
+        href: 'http://192.168.1.5:3001',
+        target: '_blank',
+        rel: 'noopener noreferrer',
+        className: 'block font-mono text-sm break-all',
+      },
+      'http://192.168.1.5:3001',
+    ),
   );
   assert(
     anchorRender ===
       '<a dir="ltr" class="ltr-island block font-mono text-sm break-all" href="http://192.168.1.5:3001" target="_blank" rel="noopener noreferrer">http://192.168.1.5:3001</a>',
-    `Ltr as="a" must render an anchor with dir="ltr" and ltr-island, got: ${anchorRender}`
+    `Ltr as="a" must render an anchor with dir="ltr" and ltr-island, got: ${anchorRender}`,
   );
 
   const codeRender = ReactDOMServer.renderToStaticMarkup(
-    React.createElement(Ltr, { as: 'code', className: 'text-xs' }, 'cat_standard')
+    React.createElement(Ltr, { as: 'code', className: 'text-xs' }, 'cat_standard'),
   );
   assert(
     codeRender === '<code dir="ltr" class="ltr-island text-xs">cat_standard</code>',
-    `Ltr as="code" must render a code element with dir="ltr" and ltr-island, got: ${codeRender}`
+    `Ltr as="code" must render a code element with dir="ltr" and ltr-island, got: ${codeRender}`,
   );
 
   console.log('  ✓ Ltr polymorphic rendering (as="a", as="code") verified through React interface');
 
-  // 4. getBrowserLanguage returns 'fa' for fa locales, 'es' for es, 'pt' for pt, 'en' otherwise.
+  // 4. getBrowserLanguage resolves registered browser locales and falls back to English.
   const i18nModule = (() => {
     const moduleApi = require('module') as {
       _resolveFilename: (...args: any[]) => string;
     };
     const originalResolveFilename = moduleApi._resolveFilename;
-    moduleApi._resolveFilename = function (request: string, parent: any, isMain: boolean, options?: any) {
+    moduleApi._resolveFilename = function (
+      request: string,
+      parent: any,
+      isMain: boolean,
+      options?: any,
+    ) {
       let resolvedRequest = request;
       if (request.startsWith('@/')) {
         resolvedRequest = path.resolve(ROOT, 'frontend/src', request.slice(2));
@@ -187,7 +217,11 @@ async function run(): Promise<void> {
     }
   })();
 
-  function withNavigatorLanguage(lang: string | undefined, fn: () => void, languages?: string[]): void {
+  function withNavigatorLanguage(
+    lang: string | undefined,
+    fn: () => void,
+    languages?: string[],
+  ): void {
     const originalDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
     const originalNav = (globalThis as any).navigator;
     try {
@@ -211,39 +245,392 @@ async function run(): Promise<void> {
   }
 
   withNavigatorLanguage('fa-IR', () => {
-    assert(i18nModule.getBrowserLanguage() === 'fa', 'getBrowserLanguage must return "fa" for fa-IR');
+    assert(
+      i18nModule.getBrowserLanguage() === factorposBrowserLanguage(i18nModule, 'fa'),
+      'getBrowserLanguage must return "fa" for fa-IR',
+    );
   });
   withNavigatorLanguage('fa', () => {
-    assert(i18nModule.getBrowserLanguage() === 'fa', 'getBrowserLanguage must return "fa" for fa');
+    assert(
+      i18nModule.getBrowserLanguage() === factorposBrowserLanguage(i18nModule, 'fa'),
+      'getBrowserLanguage must return "fa" for fa',
+    );
   });
   withNavigatorLanguage('fa-AF', () => {
-    assert(i18nModule.getBrowserLanguage() === 'fa', 'getBrowserLanguage must return "fa" for fa-AF');
+    assert(
+      i18nModule.getBrowserLanguage() === factorposBrowserLanguage(i18nModule, 'fa'),
+      'getBrowserLanguage must return "fa" for fa-AF',
+    );
+  });
+  withNavigatorLanguage('ur-PK', () => {
+    assert(
+      i18nModule.getBrowserLanguage() === factorposBrowserLanguage(i18nModule, 'ur'),
+      'getBrowserLanguage must return "ur" for ur-PK',
+    );
+  });
+  withNavigatorLanguage('ur', () => {
+    assert(
+      i18nModule.getBrowserLanguage() === factorposBrowserLanguage(i18nModule, 'ur'),
+      'getBrowserLanguage must return "ur" for ur',
+    );
+  });
+  withNavigatorLanguage('ur-IN', () => {
+    assert(
+      i18nModule.getBrowserLanguage() === factorposBrowserLanguage(i18nModule, 'ur'),
+      'getBrowserLanguage must return "ur" for ur-IN',
+    );
   });
   withNavigatorLanguage('es-ES', () => {
-    assert(i18nModule.getBrowserLanguage() === 'es', 'getBrowserLanguage must return "es" for es-ES');
+    assert(
+      i18nModule.getBrowserLanguage() === factorposBrowserLanguage(i18nModule, 'es'),
+      'getBrowserLanguage must return "es" for es-ES',
+    );
   });
   withNavigatorLanguage('pt-BR', () => {
-    assert(i18nModule.getBrowserLanguage() === 'pt', 'getBrowserLanguage must return "pt" for pt-BR');
+    assert(
+      i18nModule.getBrowserLanguage() === factorposBrowserLanguage(i18nModule, 'pt'),
+      'getBrowserLanguage must return "pt" for pt-BR',
+    );
+  });
+  withNavigatorLanguage('ru-RU', () => {
+    assert(
+      i18nModule.getBrowserLanguage() === factorposBrowserLanguage(i18nModule, 'ru'),
+      'getBrowserLanguage must return "ru" for ru-RU',
+    );
+  });
+  withNavigatorLanguage('pt-PT', () => {
+    assert(
+      i18nModule.getBrowserLanguage() === factorposBrowserLanguage(i18nModule, 'pt'),
+      'getBrowserLanguage must preserve same-script regional fallback for pt-PT',
+    );
+  });
+  withNavigatorLanguage('de-CH', () => {
+    assert(
+      i18nModule.getBrowserLanguage() === factorposBrowserLanguage(i18nModule, 'de'),
+      'getBrowserLanguage must preserve same-script regional fallback for de-CH',
+    );
+  });
+  withNavigatorLanguage('zh-TW-u-nu-latn', () => {
+    assert(
+      i18nModule.getBrowserLanguage() === factorposBrowserLanguage(i18nModule, 'zh-tw'),
+      'getBrowserLanguage must ignore extensions when matching zh-TW',
+    );
+  });
+  withNavigatorLanguage('zh-Hant-TW-u-ca-chinese', () => {
+    assert(
+      i18nModule.getBrowserLanguage() === factorposBrowserLanguage(i18nModule, 'zh-tw'),
+      'getBrowserLanguage must maximize zh-Hant-TW without its extensions',
+    );
+  });
+  withNavigatorLanguage('zh-Hans-CN-u-nu-latn', () => {
+    assert(
+      i18nModule.getBrowserLanguage() === factorposBrowserLanguage(i18nModule, 'zh'),
+      'getBrowserLanguage must match a Unicode-extension tag to the registered zh-CN bundle',
+    );
+  });
+  withNavigatorLanguage('zh-TW', () => {
+    assert(
+      i18nModule.getBrowserLanguage() === factorposBrowserLanguage(i18nModule, 'zh-tw'),
+      'getBrowserLanguage must return "zh-tw" for zh-TW',
+    );
+  });
+  withNavigatorLanguage('zh-Hant-TW', () => {
+    assert(
+      i18nModule.getBrowserLanguage() === factorposBrowserLanguage(i18nModule, 'zh-tw'),
+      'getBrowserLanguage must return "zh-tw" for zh-Hant-TW',
+    );
+  });
+  withNavigatorLanguage('zh', () => {
+    assert(
+      i18nModule.getBrowserLanguage() === factorposBrowserLanguage(i18nModule, 'zh'),
+      'bare zh must preserve the registered Simplified Chinese fallback',
+    );
+  });
+  withNavigatorLanguage('zh-CN', () => {
+    assert(
+      i18nModule.getBrowserLanguage() === factorposBrowserLanguage(i18nModule, 'zh'),
+      'zh-CN must preserve the Simplified Chinese bundle',
+    );
+  });
+  withNavigatorLanguage('nl-NL', () => {
+    assert(
+      i18nModule.getBrowserLanguage() === factorposBrowserLanguage(i18nModule, 'nl'),
+      'getBrowserLanguage must return "nl" for nl-NL',
+    );
+  });
+  withNavigatorLanguage('hi-IN', () => {
+    assert(
+      i18nModule.getBrowserLanguage() === factorposBrowserLanguage(i18nModule, 'hi'),
+      'getBrowserLanguage must return "hi" for hi-IN',
+    );
+  });
+  withNavigatorLanguage('bn-BD', () => {
+    assert(
+      i18nModule.getBrowserLanguage() === factorposBrowserLanguage(i18nModule, 'bn'),
+      'getBrowserLanguage must return "bn" for bn-BD',
+    );
+  });
+  withNavigatorLanguage('bn-IN', () => {
+    assert(
+      i18nModule.getBrowserLanguage() === factorposBrowserLanguage(i18nModule, 'bn'),
+      'getBrowserLanguage must return "bn" for bn-IN',
+    );
   });
   withNavigatorLanguage('en-US', () => {
-    assert(i18nModule.getBrowserLanguage() === 'en', 'getBrowserLanguage must return "en" for en-US');
+    assert(
+      i18nModule.getBrowserLanguage() === factorposBrowserLanguage(i18nModule, 'en'),
+      'getBrowserLanguage must return "en" for en-US',
+    );
   });
   withNavigatorLanguage('fr-FR', () => {
-    assert(i18nModule.getBrowserLanguage() === 'fr', 'getBrowserLanguage must return "fr" for fr-FR');
+    assert(
+      i18nModule.getBrowserLanguage() === factorposBrowserLanguage(i18nModule, 'fr'),
+      'getBrowserLanguage must return "fr" for fr-FR',
+    );
   });
-  withNavigatorLanguage('en-US', () => {
-    assert(i18nModule.getBrowserLanguage() === 'es', 'getBrowserLanguage must honor the first supported navigator.languages preference');
-  }, ['es-ES', 'en-US']);
-  withNavigatorLanguage('zz-ZZ', () => {
-    assert(i18nModule.getBrowserLanguage() === 'pt', 'getBrowserLanguage must skip unsupported navigator.languages preferences');
-  }, ['zz-ZZ', 'pt-BR']);
+  withNavigatorLanguage('sq-AL', () => {
+    assert(
+      i18nModule.getBrowserLanguage() === factorposBrowserLanguage(i18nModule, 'sq'),
+      'getBrowserLanguage must return "sq" for sq-AL',
+    );
+  });
+  withNavigatorLanguage('sq', () => {
+    assert(
+      i18nModule.getBrowserLanguage() === factorposBrowserLanguage(i18nModule, 'sq'),
+      'getBrowserLanguage must return "sq" for sq',
+    );
+  });
+  withNavigatorLanguage(
+    'vi-VN',
+    () => {
+      assert(
+        i18nModule.getBrowserLanguage() === factorposBrowserLanguage(i18nModule, 'vi'),
+        'getBrowserLanguage must return "vi" for vi-VN',
+      );
+    },
+    ['vi-VN', 'en-US'],
+  );
+  withNavigatorLanguage('vi', () => {
+    assert(
+      i18nModule.getBrowserLanguage() === factorposBrowserLanguage(i18nModule, 'vi'),
+      'getBrowserLanguage must return "vi" for bare vi',
+    );
+  });
+  withNavigatorLanguage('th-TH', () => {
+    assert(
+      i18nModule.getBrowserLanguage() === factorposBrowserLanguage(i18nModule, 'th'),
+      'getBrowserLanguage must return "th" for th-TH',
+    );
+  });
+  withNavigatorLanguage('th', () => {
+    assert(
+      i18nModule.getBrowserLanguage() === factorposBrowserLanguage(i18nModule, 'th'),
+      'getBrowserLanguage must return "th" for bare th',
+    );
+  });
+  withNavigatorLanguage('ne-NP', () => {
+    assert(
+      i18nModule.getBrowserLanguage() === factorposBrowserLanguage(i18nModule, 'ne'),
+      'getBrowserLanguage must return "ne" for ne-NP',
+    );
+  });
+  withNavigatorLanguage('ne', () => {
+    assert(
+      i18nModule.getBrowserLanguage() === factorposBrowserLanguage(i18nModule, 'ne'),
+      'getBrowserLanguage must return "ne" for bare ne',
+    );
+  });
+  withNavigatorLanguage('hi-NP', () => {
+    assert(
+      i18nModule.getBrowserLanguage() === factorposBrowserLanguage(i18nModule, 'hi'),
+      'hi-NP must keep the Hindi bundle; a registered Devanagari sibling must not hijack it',
+    );
+  });
+  withNavigatorLanguage('ne-IN', () => {
+    assert(
+      i18nModule.getBrowserLanguage() === factorposBrowserLanguage(i18nModule, 'ne'),
+      'ne-IN must resolve through the same-script regional fallback to ne-NP',
+    );
+  });
+  withNavigatorLanguage('ha-NG', () => {
+    assert(
+      i18nModule.getBrowserLanguage() === factorposBrowserLanguage(i18nModule, 'ha'),
+      'getBrowserLanguage must return "ha" for ha-NG',
+    );
+  });
+  withNavigatorLanguage('ha', () => {
+    assert(
+      i18nModule.getBrowserLanguage() === factorposBrowserLanguage(i18nModule, 'ha'),
+      'getBrowserLanguage must return "ha" for bare ha',
+    );
+  });
+  withNavigatorLanguage('ha-NE', () => {
+    assert(
+      i18nModule.getBrowserLanguage() === factorposBrowserLanguage(i18nModule, 'ha'),
+      'ha-NE must resolve through the same-script regional fallback to ha-NG',
+    );
+  });
+  withNavigatorLanguage('jv-ID', () => {
+    assert(
+      i18nModule.getBrowserLanguage() === factorposBrowserLanguage(i18nModule, 'jv'),
+      'getBrowserLanguage must return "jv" for jv-ID',
+    );
+  });
+  withNavigatorLanguage('jv', () => {
+    assert(
+      i18nModule.getBrowserLanguage() === factorposBrowserLanguage(i18nModule, 'jv'),
+      'getBrowserLanguage must return "jv" for bare jv',
+    );
+  });
+  withNavigatorLanguage('mr-IN', () => {
+    assert(
+      i18nModule.getBrowserLanguage() === factorposBrowserLanguage(i18nModule, 'mr'),
+      'getBrowserLanguage must return "mr" for mr-IN',
+    );
+  });
+  withNavigatorLanguage('mr', () => {
+    assert(
+      i18nModule.getBrowserLanguage() === factorposBrowserLanguage(i18nModule, 'mr'),
+      'getBrowserLanguage must return "mr" for bare mr',
+    );
+  });
+  withNavigatorLanguage('sw-KE', () => {
+    assert(
+      i18nModule.getBrowserLanguage() === factorposBrowserLanguage(i18nModule, 'sw'),
+      'getBrowserLanguage must return "sw" for sw-KE',
+    );
+  });
+  withNavigatorLanguage('sw', () => {
+    assert(
+      i18nModule.getBrowserLanguage() === factorposBrowserLanguage(i18nModule, 'sw'),
+      'getBrowserLanguage must return "sw" for bare sw',
+    );
+  });
+  withNavigatorLanguage('sw-TZ', () => {
+    assert(
+      i18nModule.getBrowserLanguage() === factorposBrowserLanguage(i18nModule, 'sw'),
+      'sw-TZ must resolve through the same-script regional fallback to sw-KE',
+    );
+  });
+  withNavigatorLanguage('pa-IN', () => {
+    assert(
+      i18nModule.getBrowserLanguage() === factorposBrowserLanguage(i18nModule, 'pa'),
+      'getBrowserLanguage must return "pa" for pa-IN',
+    );
+  });
+  withNavigatorLanguage('pa', () => {
+    assert(
+      i18nModule.getBrowserLanguage() === factorposBrowserLanguage(i18nModule, 'pa'),
+      'getBrowserLanguage must return "pa" for bare pa',
+    );
+  });
+  withNavigatorLanguage('pa-Guru-IN', () => {
+    assert(
+      i18nModule.getBrowserLanguage() === factorposBrowserLanguage(i18nModule, 'pa'),
+      'pa-Guru-IN must resolve through the Gurmukhi script fallback to pa-IN',
+    );
+  });
+  withNavigatorLanguage('te-IN', () => {
+    assert(
+      i18nModule.getBrowserLanguage() === factorposBrowserLanguage(i18nModule, 'te'),
+      'getBrowserLanguage must return "te" for te-IN',
+    );
+  });
+  withNavigatorLanguage('te', () => {
+    assert(
+      i18nModule.getBrowserLanguage() === factorposBrowserLanguage(i18nModule, 'te'),
+      'getBrowserLanguage must return "te" for bare te',
+    );
+  });
+  withNavigatorLanguage('ta-IN', () => {
+    assert(
+      i18nModule.getBrowserLanguage() === factorposBrowserLanguage(i18nModule, 'ta'),
+      'getBrowserLanguage must return "ta" for ta-IN',
+    );
+  });
+  withNavigatorLanguage('ta', () => {
+    assert(
+      i18nModule.getBrowserLanguage() === factorposBrowserLanguage(i18nModule, 'ta'),
+      'getBrowserLanguage must return "ta" for bare ta',
+    );
+  });
+  withNavigatorLanguage('ta-LK', () => {
+    assert(
+      i18nModule.getBrowserLanguage() === factorposBrowserLanguage(i18nModule, 'ta'),
+      'ta-LK must resolve through the same-script regional fallback to ta-IN',
+    );
+  });
+  withNavigatorLanguage('uk-UA', () => {
+    assert(
+      i18nModule.getBrowserLanguage() === factorposBrowserLanguage(i18nModule, 'uk'),
+      'getBrowserLanguage must return "uk" for uk-UA',
+    );
+  });
+  withNavigatorLanguage('uk', () => {
+    assert(
+      i18nModule.getBrowserLanguage() === factorposBrowserLanguage(i18nModule, 'uk'),
+      'getBrowserLanguage must return "uk" for bare uk',
+    );
+  });
+  withNavigatorLanguage(
+    'en-US',
+    () => {
+      assert(
+        i18nModule.getBrowserLanguage() === factorposBrowserLanguage(i18nModule, 'es'),
+        'getBrowserLanguage must honor the first supported navigator.languages preference',
+      );
+    },
+    ['es-ES', 'en-US'],
+  );
+  withNavigatorLanguage(
+    'zz-ZZ',
+    () => {
+      assert(
+        i18nModule.getBrowserLanguage() === factorposBrowserLanguage(i18nModule, 'pt'),
+        'getBrowserLanguage must skip unsupported navigator.languages preferences',
+      );
+    },
+    ['zz-ZZ', 'pt-BR'],
+  );
   withNavigatorLanguage(undefined, () => {
-    assert(i18nModule.getBrowserLanguage() === 'en', 'getBrowserLanguage must fallback to "en" when navigator is undefined');
+    assert(
+      i18nModule.getBrowserLanguage() === factorposBrowserLanguage(i18nModule, 'en'),
+      'getBrowserLanguage must fallback to "en" when navigator is undefined',
+    );
   });
-  console.log('  ✓ getBrowserLanguage resolves fa for fa* locales and defaults correctly');
+  console.log('  ✓ getBrowserLanguage resolves regional locales before primary-language fallbacks');
 
   // 5. Translation keys setup.languagePersian and settings.languageFa resolve in all supported languages.
-  const languages = ['en', 'es', 'fr', 'pt', 'fa'] as const;
+  const languages = [
+    'en',
+    'es',
+    'fr',
+    'pt',
+    'ru',
+    'fa',
+    'ur',
+    'it',
+    'ja',
+    'zh',
+    'zh-tw',
+    'ko',
+    'id',
+    'nl',
+    'hi',
+    'bn',
+    'sq',
+    'vi',
+    'th',
+    'ne',
+    'ha',
+    'jv',
+    'mr',
+    'sw',
+    'pa',
+    'te',
+    'ta',
+    'uk',
+  ] as const;
   const { createTranslator } = frontendRequire('use-intl/core');
   // #375: prime the shared locale cache so messages resolve for all locales.
   for (const lang of languages) {
@@ -255,17 +642,36 @@ async function run(): Promise<void> {
       messages: i18nModule.getCachedMessages(lang),
     });
     const setupLabel = t('setup.languagePersian');
-    assert(setupLabel && setupLabel !== 'setup.languagePersian', `setup.languagePersian must be translated in ${lang}, got: ${setupLabel}`);
+    assert(
+      setupLabel && setupLabel !== 'setup.languagePersian',
+      `setup.languagePersian must be translated in ${lang}, got: ${setupLabel}`,
+    );
     const settingsLabel = t('settings.languageFa');
-    assert(settingsLabel && settingsLabel !== 'settings.languageFa', `settings.languageFa must be translated in ${lang}, got: ${settingsLabel}`);
+    assert(
+      settingsLabel && settingsLabel !== 'settings.languageFa',
+      `settings.languageFa must be translated in ${lang}, got: ${settingsLabel}`,
+    );
   }
   const tFa = createTranslator({ locale: 'fa-IR', messages: i18nModule.getCachedMessages('fa') });
+  const tUr = createTranslator({ locale: 'ur-PK', messages: i18nModule.getCachedMessages('ur') });
   const tEn = createTranslator({ locale: 'en', messages: i18nModule.getCachedMessages('en') });
+  assert(
+    tUr('setup.welcome') === 'FactorPOS میں خوش آمدید',
+    'Urdu setup welcome message is localized',
+  );
   assert(tFa('setup.languagePersian') === 'فارسی', 'setup.languagePersian in fa must be فارسی');
-  assert(tFa('settings.languageFa') === 'فارسی (FA)', 'settings.languageFa in fa must be فارسی (FA)');
+  assert(
+    tFa('settings.languageFa') === 'فارسی (FA)',
+    'settings.languageFa in fa must be فارسی (FA)',
+  );
   assert(tEn('setup.languagePersian') === 'Persian', 'setup.languagePersian in en must be Persian');
-  assert(tEn('settings.languageFa') === 'Persian (FA)', 'settings.languageFa in en must be Persian (FA)');
-  console.log('  ✓ setup.languagePersian and settings.languageFa translate across en, es, fr, pt, fa');
+  assert(
+    tEn('settings.languageFa') === 'Persian (FA)',
+    'settings.languageFa in en must be Persian (FA)',
+  );
+  console.log(
+    '  ✓ setup.languagePersian and settings.languageFa translate across all registered locales',
+  );
 
   console.log('\n✅ All RTL/LTR Setup, Auth, and Settings checks passed.');
 }

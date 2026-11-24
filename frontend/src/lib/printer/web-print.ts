@@ -1,17 +1,20 @@
 /** Thermal-width bill printing using browser print dialog for merchants without hardware printers. */
 
 import type { Bill, Tenant } from '@/lib/types';
+import { receiptChargeLines } from '@/lib/charges';
 import toast from 'react-hot-toast';
 import type { PrintWarning } from './warnings';
 import {
   getCountryByCode,
   getCurrencyFractionDigits,
   getCurrencySymbol,
+  resolveIntlCurrencyDisplay,
   formatCurrencyForTenant,
   formatNumberForTenant,
   formatDateForTenant,
 } from '@/lib/countries';
 import { columnsForReceiptPaperSize } from '@print/width';
+import { normalizePrinterTextSize, type PrinterTextSize } from '@print/text-size';
 import { parseDbTimestamp } from '@/lib/utils';
 import { loadLocaleMessages } from '@/lib/i18n/loader';
 import {
@@ -19,8 +22,10 @@ import {
   ensurePrintLanguagesLoaded,
   printLabelResolver,
   resolveBillPrintLanguages,
+  resolveReadyBillPrintLanguages,
 } from './print-document';
 import { RECEIPT_BRANDING_NAME } from './branding';
+import { generateSaudiBillHtml } from './saudi-web-print';
 import { LANGUAGES, type Language } from '@/lib/i18n/languages';
 import {
   getBlock,
@@ -31,6 +36,7 @@ import {
   type ItemTableBlock,
   type MessageBlock,
   type PaymentsBlock,
+  paymentDisplayRows,
   type TaxBreakdownBlock,
   type TotalsBlock,
 } from '@print/document';
@@ -41,7 +47,13 @@ export type PaperSize = 'thermal58' | 'thermal80';
 /** The slice of a tenant a browser receipt needs to render locale-correctly. */
 export type ReceiptTenant = Pick<
   Tenant,
-  'business_name' | 'currency' | 'country' | 'timezone' | 'currency_display' | 'number_digits' | 'calendar'
+  | 'business_name'
+  | 'currency'
+  | 'country'
+  | 'timezone'
+  | 'currency_display'
+  | 'number_digits'
+  | 'calendar'
 >;
 
 /** Encodes HTML entity characters so database-sourced values can't inject markup/scripts into the bill print window. */
@@ -67,6 +79,10 @@ export interface WebPrintOptions {
   paperSize?: PaperSize;
   /** Use the minimal core receipt layout for faster thermal printing. */
   compactLayout?: boolean;
+  /** Per-printer text size ('normal' | 'large' | 'extra_large'). Default: 'normal'. */
+  textSize?: PrinterTextSize;
+  /** Exact column count the configured printer declares; overrides `paperSize`. */
+  columns?: number;
   includeTaxId?: boolean;
   taxRegistrationNumber?: string;
   address?: string;
@@ -74,10 +90,16 @@ export interface WebPrintOptions {
   footerNote?: string;
   businessName?: string;
   showBusinessName?: boolean;
+  showLogo?: boolean;
+  receiptLogo?: string;
+  receiptLogoRaster?: string;
   showTaxBreakdown?: boolean;
   showCustomerName?: boolean;
   showCustomerPhone?: boolean;
+  deliveryShowCustomerPhoneAlways?: boolean;
   showTableNumber?: boolean;
+  /** Print the Order Number in a large bold callout banner on customer receipts. */
+  showLargeOrderNumber?: boolean;
   /** Ignored for browser receipts: HTML uses locale currency formatting and code fallback. */
   useUnicode?: boolean;
   /** Show a large "REPRINT" banner so a reprinted bill can't be mistaken for the original. */
@@ -88,12 +110,14 @@ export interface WebPrintOptions {
   language?: Language;
   /** Resolved receipt languages supplied by the caller's print policy. */
   languages?: ResolvedPrintLanguages;
+  /** FactorPOS: print the Saudi simplified tax invoice with this ZATCA QR image. */
+  saudiInvoice?: { qrDataUrl: string | null; vatNumber?: string };
 }
 
 /** Resolve tax-id label printed on receipt (special case for Iranian Economic Code). */
 function resolveTaxIdLabel(country: string | undefined, lang: Language): string {
   if (country?.toUpperCase() === 'IR') return printLabelResolver('receipt.economicCode', lang);
-  return getCountryByCode(country ?? 'IN')?.taxIdLabel || 'Tax ID';
+  return getCountryByCode(country ?? '')?.taxIdLabel || 'Tax ID';
 }
 
 /** Ensure the requested receipt language messages are loaded in memory. */
@@ -106,30 +130,61 @@ export async function ensureReceiptMessagesLoaded(lang: Language): Promise<Langu
   }
 }
 
+const PRINT_IMAGE_WAIT_MS = 3000;
+
+/** Resolves once every image in the document has loaded or failed, or after `timeoutMs`. */
+export function waitForPrintImages(doc: Document, timeoutMs: number): Promise<void> {
+  const pending = Array.from(doc.images ?? []).filter((img) => !img.complete);
+  if (pending.length === 0) return Promise.resolve();
+  const loads = pending.map(
+    (img) =>
+      new Promise<void>((resolve) => {
+        img.addEventListener('load', () => resolve(), { once: true });
+        img.addEventListener('error', () => resolve(), { once: true });
+      }),
+  );
+  return Promise.race([
+    Promise.all(loads).then(() => undefined),
+    new Promise<void>((resolve) => setTimeout(resolve, timeoutMs)),
+  ]);
+}
+
 /** Generate HTML for A4/A5 printing and open print dialog. */
 export async function printWebBill(
   bill: Bill,
   tenant: ReceiptTenant,
-  opts: WebPrintOptions = {}
+  opts: WebPrintOptions = {},
+  reservedWindow?: Window | null,
 ): Promise<PrintWarning[]> {
-  const languages = resolvePrintLanguages(opts);
-
   // 1. Open popup window synchronously to maintain transient user activation
-  const printWindow = typeof window !== 'undefined' ? window.open('', '_blank', 'width=800,height=600') : null;
+  const printWindow =
+    reservedWindow === undefined
+      ? typeof window !== 'undefined'
+        ? window.open('', '_blank', 'width=800,height=600')
+        : null
+      : reservedWindow;
   if (!printWindow) {
     toast.error('Please allow popups to print bills');
     throw new Error('Popup window was blocked by browser');
   }
 
-  // Ensure print languages are loaded before synchronous document build.
-  const failedLanguages = await ensurePrintLanguagesLoaded(languages);
-  const warnings: PrintWarning[] = failedLanguages.map((language) => ({
-    field: 'receipt language',
-    text: language,
-    message: `Receipt language "${language}" could not be loaded, so English labels were used. Check the locale bundle and retry.`,
-    kind: 'locale' as const,
-  }));
-  const html = generateBillHtml(bill, tenant, { ...opts, languages });
+  // Ensure print policy and language bundles are loaded before synchronous document build.
+  let warnings: PrintWarning[];
+  let html: string;
+  try {
+    const languages = opts.languages ?? (await resolveReadyBillPrintLanguages(opts.language));
+    const failedLanguages = await ensurePrintLanguagesLoaded(languages);
+    warnings = failedLanguages.map((language) => ({
+      field: 'receipt language',
+      text: language,
+      message: `Receipt language "${language}" could not be loaded, so English labels were used. Check the locale bundle and retry.`,
+      kind: 'locale' as const,
+    }));
+    html = generateBillHtml(bill, tenant, { ...opts, languages });
+  } catch (error) {
+    if (!printWindow.closed) printWindow.close();
+    throw error;
+  }
 
   // 3. Write HTML and trigger print
   if (printWindow.closed) {
@@ -152,13 +207,25 @@ export async function printWebBill(
       settled = true;
       cleanup();
       if (err) {
+        if (!printWindow.closed) printWindow.close();
         reject(err);
       } else {
         resolve();
       }
     };
 
+    // FactorPOS: a data: image (logo, ZATCA QR) written into the print window may
+    // still be decoding when the document reports complete; wait for it so the
+    // printed bill is not missing the QR.
+    let waitingForImages = false;
     const triggerPrint = () => {
+      if (settled || waitingForImages) return;
+      waitingForImages = true;
+      void waitForPrintImages(printWindow.document, PRINT_IMAGE_WAIT_MS).then(printNow);
+    };
+
+    const printNow = () => {
+      if (settled) return;
       try {
         if (printWindow.closed) {
           settle(new Error('Print window was closed before receipt could be printed'));
@@ -209,8 +276,23 @@ export async function printWebBill(
 export function generateBillHtml(
   bill: Bill,
   tenant: ReceiptTenant,
-  opts: WebPrintOptions = {}
+  opts: WebPrintOptions = {},
 ): string {
+  if (opts.saudiInvoice) {
+    return generateSaudiBillHtml(bill, {
+      paperSize: opts.paperSize,
+      businessName:
+        opts.showBusinessName === false ? undefined : opts.businessName || tenant.business_name,
+      address: opts.address,
+      phone: opts.phone,
+      vatNumber: opts.saudiInvoice.vatNumber ?? opts.taxRegistrationNumber,
+      footerNote: opts.footerNote,
+      timezone: tenant.timezone,
+      showTableNumber: opts.showTableNumber,
+      isReprint: opts.isReprint,
+      qrDataUrl: opts.saudiInvoice.qrDataUrl,
+    });
+  }
   const {
     paperSize = 'thermal58',
     compactLayout = false,
@@ -221,9 +303,13 @@ export function generateBillHtml(
     footerNote,
     businessName,
     showBusinessName = true,
+    showLogo = false,
+    receiptLogo,
+    receiptLogoRaster,
     showTaxBreakdown = true,
     showCustomerName = true,
     showCustomerPhone = true,
+    deliveryShowCustomerPhoneAlways,
     showTableNumber = true,
     isReprint = false,
     trimDecimals = false,
@@ -233,7 +319,7 @@ export function generateBillHtml(
   const lang = languages[0] as Language;
 
   const document = buildFrontendBillDocument(bill, tenant, {
-    columns: columnsForReceiptPaperSize(paperSize === 'thermal80' ? 80 : 58),
+    columns: opts.columns ?? columnsForReceiptPaperSize(paperSize === 'thermal80' ? 80 : 58),
     businessName: showBusinessName ? (businessName ?? tenant.business_name) : undefined,
     address,
     phone,
@@ -242,10 +328,15 @@ export function generateBillHtml(
     includeTaxId: includeTaxId && !!taxRegistrationNumber,
     taxIdLabel: resolveTaxIdLabel(tenant.country, lang),
     showBusinessName,
+    showLogo,
+    receiptLogo,
+    receiptLogoRaster,
     showTaxBreakdown,
     showCustomerName,
     showCustomerPhone,
+    deliveryShowCustomerPhoneAlways,
     showTableNumber,
+    showLargeOrderNumber: opts.showLargeOrderNumber,
     isReprint,
     trimDecimals,
     languages,
@@ -271,11 +362,22 @@ export function generateBillHtml(
     table: stripLabelPlaceholder(metaTableLabel),
     customer: documentLabel(customer?.nameLabel, 'pos.customer', lang),
     customerNo: documentLabel(customer?.phoneLabel, 'print.numberShort', lang),
+    deliveryAddress: documentLabel(customer?.addressLabel, 'print.deliverySlip.address', lang),
     rate: itemsBlock?.header.rate.primary ?? printLabelResolver('receipt.rate', lang),
     totalTax: surfaceLabel(totals?.tax?.label, 'pos.tax', 'receipt.totalTax', lang),
-    deliveryCharge: surfaceLabel(totals?.deliveryCharge?.label, 'pos.delivery', 'receipt.deliveryCharge', lang),
+    deliveryCharge: surfaceLabel(
+      totals?.deliveryCharge?.label,
+      'pos.delivery',
+      'receipt.deliveryCharge',
+      lang,
+    ),
     packagingCharge: documentLabel(totals?.packagingCharge?.label, 'pos.packaging', lang),
-    grandTotal: surfaceLabel(totals?.grandTotal?.label, 'print.grandTotal', 'receipt.grandTotal', lang),
+    grandTotal: surfaceLabel(
+      totals?.grandTotal?.label,
+      'print.grandTotal',
+      'receipt.grandTotal',
+      lang,
+    ),
     taxDetails: breakdown?.heading.primary ?? printLabelResolver('receipt.taxDetails', lang),
     paymentsHeader: payments?.heading.primary ?? printLabelResolver('receipt.payments', lang),
     thankYou: surfaceLabel(messages?.thankYou, 'print.thankYouShort', 'receipt.thankYou', lang),
@@ -284,18 +386,20 @@ export function generateBillHtml(
   };
 
   const invoiceNumberLabel = L.billNumber;
-  const styles = getPaperStyles(paperSize, compactLayout);
+  const styles = getPaperStyles(paperSize, opts.textSize, compactLayout);
 
   const items = itemsBlock?.rows ?? [];
+  const itemisedCharges = receiptChargeLines(totals?.chargesBreakdown);
+  const itemisedChargeIds = new Set(itemisedCharges.map((charge) => charge.id));
   const fmtAmount = (value: number) => formatAmount(value, tenant, trimDecimals);
-  const fmtQuantity = (value: number) => formatNumberForTenant(
-    Number(value) || 0,
-    tenant.country,
-    { digits: tenant.number_digits },
-  );
+  const fmtQuantity = (value: number) =>
+    formatNumberForTenant(Number(value) || 0, tenant.country, { digits: tenant.number_digits });
 
-  const hasTax = (totals?.tax != null)
-    || (breakdown != null && breakdown.lines.length > 0);
+  const hasTax = totals?.tax != null || (breakdown != null && breakdown.lines.length > 0);
+  const largeOrderNumber =
+    meta?.showLargeOrderNumber === true
+      ? (meta.orderNumber?.text ?? '').trim().replace(/^#/, '')
+      : '';
 
   return `<!DOCTYPE html>
 <html lang="${localeTag}" dir="${dir}">
@@ -317,6 +421,7 @@ export function generateBillHtml(
     <!-- Header -->
     <div class="header">
       ${compactLayout ? '<div class="document-title">ORDER NOTE</div>' : ''}
+      ${!compactLayout && header?.logo && header.logo.startsWith('data:image/') ? `<div class="logo-container"><img class="receipt-logo" src="${escapeHtml(header.logo)}" alt="Logo" /></div>` : ''}
       ${!compactLayout && header?.name ? `<h1>${escapeHtml(header.name.text)}</h1>` : ''}
       ${header?.address ? `<p>${escapeHtml(header.address.text).replace(/\n/g, '<br>')}</p>` : ''}
       ${header?.phone && header.phoneLabel ? `<p>${escapeHtml(header.phoneLabel.primary)}: ${directionalValue(header.phone, base)}</p>` : ''}
@@ -324,9 +429,12 @@ export function generateBillHtml(
     </div>
 
     <!-- Bill Details -->
+    ${largeOrderNumber ? `<div class="order-number-banner" dir="ltr" style="direction: ltr; unicode-bidi: isolate; font-size: 1.5em; font-weight: 800; text-align: center; border: 2px solid #000; padding: 4px 8px; margin: 6px 0;">#${escapeHtml(largeOrderNumber)}</div>` : ''}
     <div class="bill-details">
-      ${meta?.tokenNumber !== null && meta?.tokenNumber !== undefined ? `<div class="token-number">TOKEN #${escapeHtml(meta.tokenNumber)}</div>` : ''}
-      ${compactLayout ? `
+      ${compactLayout && meta?.tokenNumber !== null && meta?.tokenNumber !== undefined ? `<div class="token-number">TOKEN #${escapeHtml(meta.tokenNumber)}</div>` : ''}
+      ${
+        compactLayout
+          ? `
       <table class="compact-meta">
         <tr><td><strong>${escapeHtml(invoiceNumberLabel)}</strong></td><td class="text-end">${meta ? directionalValue(meta.invoiceNumber, base) : ''}</td></tr>
         <tr><td><strong>${escapeHtml(L.date)}</strong></td><td class="text-end receipt-date">${meta ? escapeHtml(formatReceiptDate(meta.timestamp.text, tenant, LANGUAGES[lang]?.locale ?? lang, true)) : ''}</td></tr>
@@ -334,17 +442,21 @@ export function generateBillHtml(
         ${customer?.name ? `<tr><td><strong>${escapeHtml(L.customer)}</strong></td><td class="text-end">${escapeHtml(customer.name.text)}</td></tr>` : ''}
         ${customer?.phone ? `<tr><td><strong>${escapeHtml(L.customerNo)}</strong></td><td class="text-end">${directionalValue(customer.phone, base)}</td></tr>` : ''}
       </table>
-      ` : `
+      `
+          : `
       <table>
         <tr>
           <td><strong>${escapeHtml(invoiceNumberLabel)}</strong> ${meta ? directionalValue(meta.invoiceNumber, base) : ''}</td>
-          <td class="text-end receipt-date"><strong>${escapeHtml(L.date)}</strong> ${meta ? escapeHtml(formatReceiptDate(meta.timestamp.text, tenant, LANGUAGES[lang]?.locale ?? lang, compactLayout)) : ''}</td>
+          <td class="text-end"><strong>${escapeHtml(L.date)}</strong> ${meta ? escapeHtml(formatReceiptDate(meta.timestamp.text, tenant, LANGUAGES[lang]?.locale ?? lang)) : ''}</td>
         </tr>
         ${meta?.table ? `<tr><td><strong>${escapeHtml(L.table)}</strong> ${escapeHtml(meta.table.name.text)}</td><td></td></tr>` : ''}
+        ${customer?.heading ? `<tr><td colspan="2"><strong>${escapeHtml(customer.heading.primary)}</strong></td></tr>` : ''}
         ${customer?.name ? `<tr><td><strong>${escapeHtml(L.customer)}</strong> ${escapeHtml(customer.name.text)}</td><td></td></tr>` : ''}
         ${customer?.phone ? `<tr><td><strong>${escapeHtml(L.customerNo)}</strong> ${directionalValue(customer.phone, base)}</td><td></td></tr>` : ''}
+        ${customer?.address ? `<tr><td><strong>${escapeHtml(L.deliveryAddress)}</strong> ${directionalValue(customer.address, base).replace(/\n/g, '<br>')}</td><td></td></tr>` : ''}
       </table>
-      `}
+      `
+      }
     </div>
 
     <!-- Items Table -->
@@ -358,70 +470,103 @@ export function generateBillHtml(
         </tr>
       </thead>
       <tbody>
-        ${items.map(row => `
+        ${items
+          .map(
+            (row) => `
           <tr>
             <td>
               ${escapeHtml(row.name.text)}
-              ${row.addons.length > 0 ? `<br><small class="text-muted">${row.addons.map(a => `+ ${escapeHtml(a.name.text)}${(a.quantity ?? 1) > 1 ? ` ×${escapeHtml(a.quantity)}` : ''}${a.price > 0 ? ` (${fmtAmount(a.price)})` : ''}`).join(', ')}</small>` : ''}
+              ${row.addons.length > 0 ? `<br><small class="text-muted">${row.addons.map((a) => `+ ${escapeHtml(a.name.text)}${(a.quantity ?? 1) > 1 ? ` ×${escapeHtml(a.quantity)}` : ''}${a.price > 0 ? ` (${fmtAmount(a.price)})` : ''}`).join(', ')}</small>` : ''}
               ${row.specialInstructions ? `<br><small class="text-italic">${escapeHtml(row.specialInstructions.text)}</small>` : ''}
             </td>
             <td class="text-end num">${fmtQuantity(row.quantity)}</td>
             ${compactLayout ? '' : `<td class="text-end num">${fmtAmount(row.unitPrice ?? 0)}</td>`}
             <td class="text-end num">${fmtAmount(row.amount)}</td>
           </tr>
-        `).join('')}
+        `,
+          )
+          .join('')}
       </tbody>
     </table>
 
     <!-- Tax Breakdown -->
-    ${!compactLayout && breakdown && breakdown.lines.length > 0 ? `
+    ${
+      !compactLayout && breakdown && breakdown.lines.length > 0
+        ? `
     <table class="tax-table">
       <thead>
         <tr><th colspan="2">${escapeHtml(L.taxDetails)}</th></tr>
       </thead>
       <tbody>
-        ${breakdown.lines.map((line) => `
+        ${breakdown.lines
+          .map(
+            (line) => `
           <tr><td>${escapeHtml(line.rate === null ? line.label.primary : `${line.label.primary} @${line.rate}%`)}</td><td class="text-end num">${fmtAmount(line.amount)}</td></tr>
-        `).join('')}
+        `,
+          )
+          .join('')}
       </tbody>
     </table>
-    ` : ''}
+    `
+        : ''
+    }
 
     <!-- Totals -->
     <table class="totals-table">
-      ${totals ? `
+      ${
+        totals
+          ? `
       ${!compactLayout && totals.pointsRedeemed ? `<tr><td>${escapeHtml(totals.pointsRedeemed.label.primary)}</td><td class="text-end num">-${escapeHtml(totals.pointsRedeemed.points)} pts</td></tr>` : ''}
       <tr class="subtotal-row"><td>${compactLayout ? `<strong>${escapeHtml(totals.subtotal.label.primary)}</strong>` : escapeHtml(totals.subtotal.label.primary)}</td><td class="text-end num">${compactLayout ? `<strong>${fmtAmount(totals.subtotal.amount)}</strong>` : fmtAmount(totals.subtotal.amount)}</td></tr>
       ${!compactLayout && totals.discount ? `<tr><td>${escapeHtml(totals.discount.label.primary)}</td><td class="text-end num">-${fmtAmount(totals.discount.amount)}</td></tr>` : ''}
       ${!compactLayout && totals.tax ? `<tr><td>${escapeHtml(L.totalTax)}</td><td class="text-end num">${fmtAmount(totals.tax.amount)}</td></tr>` : ''}
-      ${!compactLayout && totals.serviceCharge ? `<tr><td>${escapeHtml(totals.serviceCharge.label.primary)}</td><td class="text-end num">${fmtAmount(totals.serviceCharge.amount)}</td></tr>` : ''}
+      ${!compactLayout && totals.serviceCharge && !itemisedChargeIds.has('service_charge') ? `<tr><td>${escapeHtml(totals.serviceCharge.label.primary)}</td><td class="text-end num">${fmtAmount(totals.serviceCharge.amount)}</td></tr>` : ''}
       ${!compactLayout && totals.deliveryCharge ? `<tr><td>${escapeHtml(L.deliveryCharge)}</td><td class="text-end num">${fmtAmount(totals.deliveryCharge.amount)}</td></tr>` : ''}
-      ${!compactLayout && totals.packagingCharge ? `<tr><td>${escapeHtml(L.packagingCharge)}</td><td class="text-end num">${fmtAmount(totals.packagingCharge.amount)}</td></tr>` : ''}
+      ${!compactLayout && totals.packagingCharge && !itemisedChargeIds.has('packaging_charge') ? `<tr><td>${escapeHtml(L.packagingCharge)}</td><td class="text-end num">${fmtAmount(totals.packagingCharge.amount)}</td></tr>` : ''}
+      ${compactLayout ? '' : itemisedCharges.map((charge) => `<tr><td>${escapeHtml(charge.name)}</td><td class="text-end num">${fmtAmount(charge.amount)}</td></tr>`).join('')}
       <tr class="total-row"><td><strong>${escapeHtml(compactLayout ? printLabelResolver('print.grandTotal', lang) : L.grandTotal)}</strong></td><td class="text-end num total-amount"><strong>${fmtAmount(totals.grandTotal.amount)}</strong></td></tr>
       ${!compactLayout && totals.pointsEarned ? `<tr><td>${escapeHtml(totals.pointsEarned.label.primary)}</td><td class="text-end num">${escapeHtml(totals.pointsEarned.points)} pts</td></tr>` : ''}
       ${!compactLayout && totals.pointsBalance ? `<tr><td>${escapeHtml(totals.pointsBalance.label.primary)}</td><td class="text-end num">${escapeHtml(totals.pointsBalance.points)} pts</td></tr>` : ''}
-      ` : ''}
+      `
+          : ''
+      }
     </table>
 
     <!-- Payments -->
-    ${payments && payments.lines.length > 0 ? `
-    ${compactLayout ? `
+    ${
+      payments && payments.lines.length > 0
+        ? `
+    ${
+      compactLayout
+        ? `
     <table class="payment-line">
       ${payments.lines.map((line) => `<tr><td><strong>${escapeHtml(paymentLineLabel(line.label))}</strong></td><td class="text-end num">${fmtAmount(line.amount)}</td></tr>`).join('')}
     </table>
-    ` : `
+    `
+        : `
     <table class="payments-table">
       <thead>
         <tr><th colspan="2">${escapeHtml(L.paymentsHeader)}</th></tr>
       </thead>
       <tbody>
-        ${payments.lines.map((line) => `
-          <tr><td>${escapeHtml(paymentLineLabel(line.label))}</td><td class="text-end num">${fmtAmount(line.amount)}</td></tr>
-        `).join('')}
+        ${payments.lines
+          .map((line) =>
+            paymentDisplayRows(line)
+              .map(
+                (row) => `
+          <tr><td>${escapeHtml(paymentLineLabel(row.label))}</td><td class="text-end num">${fmtAmount(row.amount)}</td></tr>
+        `,
+              )
+              .join(''),
+          )
+          .join('')}
       </tbody>
     </table>
-    `}
-    ` : ''}
+    `
+    }
+    `
+        : ''
+    }
 
     <!-- Footer -->
     <div class="footer">
@@ -441,7 +586,9 @@ export function generateBillHtml(
 
 // Helpers
 /** Resolve the receipt language list through the shared policy bridge. */
-function resolvePrintLanguages(opts: Pick<WebPrintOptions, 'language' | 'languages'>): ResolvedPrintLanguages {
+function resolvePrintLanguages(
+  opts: Pick<WebPrintOptions, 'language' | 'languages'>,
+): ResolvedPrintLanguages {
   return opts.languages ?? resolveBillPrintLanguages(opts.language);
 }
 
@@ -469,7 +616,10 @@ function surfaceLabel(
 
 /** Remove the semantic table label's interpolation token for a separate value cell. */
 function stripLabelPlaceholder(label: string): string {
-  return label.replace('{name}', '').replace(/[:：]\s*$/, '').trim();
+  return label
+    .replace('{name}', '')
+    .replace(/[:：]\s*$/, '')
+    .trim();
 }
 
 /** Unknown payment methods keep their legacy capitalized literal rendering. */
@@ -479,44 +629,53 @@ function paymentLineLabel(label: { conceptId?: string; primary: string }): strin
     : label.primary.charAt(0).toUpperCase() + label.primary.slice(1);
 }
 
-function getPaperStyles(size: PaperSize, compactLayout: boolean): string {
+export function getPaperStyles(
+  size: PaperSize,
+  textSize?: PrinterTextSize,
+  compactLayout = false,
+): string {
+  const normalizedTextSize = normalizePrinterTextSize(textSize);
   const baseStyles = `
     * { box-sizing: border-box; margin: 0; padding: 0; }
-    body { font-family: -apple-system, 'Segoe UI', Tahoma, 'Noto Naskh Arabic', 'Helvetica Neue', Arial, sans-serif; font-size: 12px; line-height: 1.4; color: #333; }
-    .bill-container { max-width: 100%; margin: 0 auto; }
-    .reprint-banner { text-align: center; font-size: 22px; font-weight: bold; letter-spacing: 2px; color: #c00; border: 3px solid #c00; padding: 6px; margin-bottom: 15px; }
-    .online-order-banner { text-align: center; font-size: 18px; font-weight: bold; letter-spacing: 1px; border: 2px solid #333; padding: 6px; margin-bottom: 15px; }
-    .online-order-banner .online-order-detail { font-size: 13px; font-weight: normal; letter-spacing: normal; margin-top: 2px; }
-    .header { text-align: center; margin-bottom: 20px; padding-bottom: 10px; border-bottom: 1px solid #ccc; }
-    .document-title { font-size: 1.25em; font-weight: 800; letter-spacing: .08em; margin-bottom: 2px; }
-    .header h1 { font-size: 24px; margin-bottom: 5px; }
-    .bill-details { margin-bottom: 15px; }
-    .token-number { text-align: center; font-size: calc(1em + 3pt); font-weight: 700; margin-bottom: 6px; }
+    body { font-family: -apple-system, 'Segoe UI', Tahoma, 'Noto Naskh Arabic', 'Noto Sans Bengali', 'Vrinda', 'Bangla Sangam MN', 'Noto Sans Devanagari', 'Nirmala UI', 'Kohinoor Devanagari', 'Devanagari Sangam MN', 'Noto Sans Gurmukhi', 'Raavi', 'Kohinoor Gurmukhi', 'Gurmukhi Sangam MN', 'Noto Sans Telugu', 'Kohinoor Telugu', 'Telugu Sangam MN', 'Noto Sans Tamil', 'Latha', 'Tamil Sangam MN', 'Noto Sans Thai', 'Leelawadee UI', Thonburi, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', 'Hiragino Sans', 'Yu Gothic', 'Meiryo', 'Noto Sans CJK JP', 'Noto Sans JP', 'Helvetica Neue', Arial, sans-serif; font-size: 13px; font-weight: 600; line-height: 1.4; color: #000; }
+    body:lang(zh-TW) { font-family: -apple-system, 'Segoe UI', Tahoma, 'Noto Naskh Arabic', 'PingFang TC', 'Microsoft JhengHei', 'Noto Sans CJK TC', 'Noto Sans TC', 'Helvetica Neue', Arial, sans-serif; }
+    .bill-container { max-width: 100%; margin: 0 auto; color: #000; }
+    .reprint-banner { text-align: center; font-size: 20px; font-weight: 700; letter-spacing: 2px; color: #000; border: 2px solid #000; padding: 6px; margin-bottom: 12px; }
+    .online-order-banner { text-align: center; font-size: 18px; font-weight: 700; letter-spacing: 1px; color: #000; border: 2px solid #000; padding: 6px; margin-bottom: 12px; }
+    .online-order-banner .online-order-detail { font-size: 13px; font-weight: 600; letter-spacing: normal; margin-top: 2px; color: #000; }
+    .header { text-align: center; margin-bottom: 12px; padding-bottom: 8px; color: #000; border-bottom: 1px solid #000; }
+    .receipt-logo { max-width: 80%; max-height: 120px; object-fit: contain; margin: 0 auto 8px auto; display: block; }
+    .header h1 { font-size: 20px; font-weight: 700; margin-bottom: 4px; color: #000; }
+    .bill-details { margin-bottom: 12px; color: #000; }
     .bill-details table { width: 100%; }
+    .items-table { width: 100%; border-collapse: collapse; margin-bottom: 12px; color: #000; }
+    .items-table th, .items-table td { padding: 6px; border-bottom: 1px solid #000; text-align: start; color: #000; }
+    .items-table th { background: transparent; font-weight: 700; color: #000; }
+    .tax-table, .payments-table { width: 50%; margin-inline-start: 50%; border-collapse: collapse; margin-bottom: 12px; color: #000; }
+    .tax-table th, .tax-table td, .payments-table th, .payments-table td { padding: 4px 6px; color: #000; }
+    .tax-table th, .payments-table th { background: transparent; text-align: start; font-weight: 700; color: #000; }
+    .totals-table { width: 100%; border-collapse: collapse; margin-bottom: 12px; color: #000; }
+    .totals-table td { padding: 4px 6px; color: #000; }
+    .total-row { border-top: 2px solid #000; font-size: 16px; font-weight: 700; color: #000; }
+    .footer { text-align: center; margin-top: 16px; padding-top: 10px; border-top: 1px solid #000; color: #000; }
+    .powered-by { font-size: 11px; font-weight: 600; margin-top: 8px; color: #000; }
+    /* FactorPOS compact ORDER NOTE */
+    .document-title { font-size: 1.25em; font-weight: 800; letter-spacing: .08em; margin-bottom: 2px; }
+    .token-number { text-align: center; font-size: calc(1em + 3pt); font-weight: 700; margin-bottom: 6px; }
     .receipt-date { white-space: nowrap; }
-    .items-table { width: 100%; border-collapse: collapse; margin-bottom: 15px; }
-    .items-table th, .items-table td { padding: 8px; border-bottom: 1px solid #eee; text-align: start; }
-    .items-table th { background: #f5f5f5; font-weight: bold; }
-    .tax-table, .payments-table { width: 50%; margin-inline-start: 50%; border-collapse: collapse; margin-bottom: 15px; }
-    .tax-table th, .tax-table td, .payments-table th, .payments-table td { padding: 6px 8px; }
-    .tax-table th, .payments-table th { background: #f9f9f9; text-align: start; }
-    .totals-table { width: 100%; border-collapse: collapse; margin-bottom: 15px; }
-    .totals-table td { padding: 6px 8px; }
     .subtotal-row { font-size: 1.08em; }
-    .total-row { border-top: 2px solid #333; }
     .total-amount { font-size: calc(1em + 3pt); font-weight: 700; }
     .payment-line { width: 100%; border-collapse: collapse; margin-bottom: 10px; white-space: nowrap; }
     .payment-line td { padding: 1px 3px; }
-    .footer { text-align: center; margin-top: 30px; padding-top: 15px; border-top: 1px solid #ccc; }
-    .powered-by { font-size: 10px; margin-top: 8px; color: #555; }
     .text-end { text-align: end !important; }
     .num { unicode-bidi: isolate; white-space: nowrap; }
     .ltr { direction: ltr; unicode-bidi: isolate; }
-    .text-muted { color: #666; }
-    .text-italic { font-style: italic; color: #888; }
+    .text-muted { color: #000; font-weight: 600; }
+    .text-italic { font-style: italic; color: #000; font-weight: 600; }
   `;
 
-  const compactStyles = compactLayout ? `
+  const compactStyles = compactLayout
+    ? `
     .header { margin-bottom: 8px; padding-bottom: 5px; }
     .header h1 { font-size: 1.15em; margin-bottom: 2px; }
     .bill-details, .items-table, .totals-table { margin-bottom: 7px; }
@@ -526,20 +685,123 @@ function getPaperStyles(size: PaperSize, compactLayout: boolean): string {
     .footer { margin-top: 4px; padding-top: 4px; }
     .footer p + p { margin-top: 2px; }
     .powered-by { margin-top: 3px; }
-  ` : '';
+  `
+    : '';
 
   switch (size) {
-    case 'thermal58':
-      return baseStyles + compactStyles + `
-        .bill-container { padding: 5px; max-width: 58mm; font-size: 10px; }
-        .header h1 { font-size: ${compactLayout ? '11px' : '14px'}; }
+    case 'thermal58': {
+      const bodyFontSize =
+        normalizedTextSize === 'extra_large'
+          ? '17px'
+          : normalizedTextSize === 'large'
+            ? '15px'
+            : '13px';
+      const headingFontSize =
+        normalizedTextSize === 'extra_large'
+          ? '21px'
+          : normalizedTextSize === 'large'
+            ? '19px'
+            : '17px';
+      const totalFontSize =
+        normalizedTextSize === 'extra_large'
+          ? '19px'
+          : normalizedTextSize === 'large'
+            ? '17px'
+            : '15px';
+      const bannerFontSize =
+        normalizedTextSize === 'extra_large'
+          ? '20px'
+          : normalizedTextSize === 'large'
+            ? '18px'
+            : '16px';
+      const poweredByFontSize =
+        normalizedTextSize === 'extra_large'
+          ? '13px'
+          : normalizedTextSize === 'large'
+            ? '12px'
+            : '11px';
+      const bodyWeight = normalizedTextSize === 'extra_large' ? 700 : 600;
+      return (
+        baseStyles +
+        compactStyles +
+        `
+        @page { size: 58mm auto; margin: 0; }
+        body { color: #000; font-size: ${bodyFontSize}; font-weight: ${bodyWeight}; width: 58mm; max-width: 58mm; margin: 0 auto; }
+        .bill-container { padding: 2mm; width: 100%; max-width: 58mm; font-size: ${bodyFontSize}; font-weight: ${bodyWeight}; color: #000; }
+        .reprint-banner, .online-order-banner { color: #000; border: 2px solid #000; font-size: ${bannerFontSize}; font-weight: 700; }
+        .header { color: #000; border-bottom: 1px solid #000; }
+        .header h1 { font-size: ${headingFontSize}; font-weight: 700; color: #000; }
+        .text-muted, .text-italic { color: #000; font-weight: ${bodyWeight}; }
+        .items-table th, .tax-table th, .payments-table th { background: transparent; color: #000; border-bottom: 1px solid #000; font-weight: 700; }
+        .items-table td { color: #000; border-bottom: 1px dashed #000; font-size: ${bodyFontSize}; font-weight: ${bodyWeight}; }
+        .total-row { color: #000; border-top: 2px solid #000; font-size: ${totalFontSize}; font-weight: 700; }
+        .footer { color: #000; border-top: 1px solid #000; }
+        .powered-by { color: #000; font-size: ${poweredByFontSize}; font-weight: 600; }
+        .tax-table, .payments-table { width: 100%; margin-inline-start: 0; }
         .items-table th, .items-table td, .tax-table td, .totals-table td, .payments-table td { padding: 2px 4px; }
-      `;
-    case 'thermal80':
-      return baseStyles + compactStyles + `
-        .bill-container { padding: 10px; max-width: 80mm; font-size: 11px; }
-        .header h1 { font-size: ${compactLayout ? '12px' : '16px'}; }
-      `;
+        .bill-container { overflow-wrap: anywhere; word-break: break-word; }
+        .items-table thead, .items-table tbody { display: block; width: 100%; }
+        .items-table thead tr, .items-table tbody tr { display: flex; flex-wrap: wrap; width: 100%; border-bottom: 1px dashed #000; }
+        .items-table thead tr { border-bottom: 1px solid #000; }
+        .items-table th, .items-table td { border-bottom: none; overflow-wrap: anywhere; word-break: break-word; }
+        .items-table th:first-child, .items-table td:first-child { flex: 1 1 100%; width: 100%; max-width: 100%; }
+        .items-table th:not(:first-child), .items-table td:not(:first-child) { flex: 1 1 auto; min-width: 0; }
+        .items-table td.num { white-space: normal; overflow-wrap: anywhere; word-break: break-word; }
+      `
+      );
+    }
+    case 'thermal80': {
+      const bodyFontSize =
+        normalizedTextSize === 'extra_large'
+          ? '18px'
+          : normalizedTextSize === 'large'
+            ? '16px'
+            : '14px';
+      const headingFontSize =
+        normalizedTextSize === 'extra_large'
+          ? '22px'
+          : normalizedTextSize === 'large'
+            ? '20px'
+            : '18px';
+      const totalFontSize =
+        normalizedTextSize === 'extra_large'
+          ? '20px'
+          : normalizedTextSize === 'large'
+            ? '18px'
+            : '16px';
+      const bannerFontSize =
+        normalizedTextSize === 'extra_large'
+          ? '22px'
+          : normalizedTextSize === 'large'
+            ? '20px'
+            : '18px';
+      const poweredByFontSize =
+        normalizedTextSize === 'extra_large'
+          ? '13px'
+          : normalizedTextSize === 'large'
+            ? '12px'
+            : '11px';
+      const bodyWeight = normalizedTextSize === 'extra_large' ? 700 : 600;
+      return (
+        baseStyles +
+        compactStyles +
+        `
+        @page { size: 80mm auto; margin: 0; }
+        body { color: #000; font-size: ${bodyFontSize}; font-weight: ${bodyWeight}; width: 80mm; max-width: 80mm; margin: 0 auto; }
+        .bill-container { padding: 3mm; width: 100%; max-width: 80mm; font-size: ${bodyFontSize}; font-weight: ${bodyWeight}; color: #000; }
+        .reprint-banner, .online-order-banner { color: #000; border: 2px solid #000; font-size: ${bannerFontSize}; font-weight: 700; }
+        .header { color: #000; border-bottom: 1px solid #000; }
+        .header h1 { font-size: ${headingFontSize}; font-weight: 700; color: #000; }
+        .text-muted, .text-italic { color: #000; font-weight: ${bodyWeight}; }
+        .items-table th, .tax-table th, .payments-table th { background: transparent; color: #000; border-bottom: 1px solid #000; font-weight: 700; }
+        .items-table td { color: #000; border-bottom: 1px dashed #000; font-size: ${bodyFontSize}; font-weight: ${bodyWeight}; }
+        .total-row { color: #000; border-top: 2px solid #000; font-size: ${totalFontSize}; font-weight: 700; }
+        .footer { color: #000; border-top: 1px solid #000; }
+        .powered-by { color: #000; font-size: ${poweredByFontSize}; font-weight: 600; }
+        .tax-table, .payments-table { width: 100%; margin-inline-start: 0; }
+      `
+      );
+    }
     default:
       return baseStyles;
   }
@@ -549,7 +811,7 @@ function getPaperStyles(size: PaperSize, compactLayout: boolean): string {
 function formatAmount(value: number, tenant: ReceiptTenant, trimDecimals = false): string {
   const numeric = Number.isFinite(Number(value)) ? Number(value) : 0;
   const prefs = { currencyDisplay: tenant.currency_display, digits: tenant.number_digits };
-  const fractionDigits = getCurrencyFractionDigits(tenant.currency ?? 'INR');
+  const fractionDigits = getCurrencyFractionDigits(tenant.currency);
   const factor = 10 ** fractionDigits;
   const hasDecimals = fractionDigits > 0 && Math.round(numeric * factor) % factor !== 0;
   const isToman =
@@ -558,14 +820,17 @@ function formatAmount(value: number, tenant: ReceiptTenant, trimDecimals = false
 
   // trimDecimals hides trailing .00 only when there is no fractional part.
   if (trimDecimals && !hasDecimals && !isToman) {
-    const locale = getCountryByCode(tenant.country ?? 'IN')?.locale ?? 'en-US';
+    const locale = getCountryByCode(tenant.country)?.locale ?? 'en-US';
     const numberingSystem = tenant.number_digits === 'latin' ? 'latn' : undefined;
-    const currency = tenant.currency || 'INR';
+    const currency = tenant.currency;
     try {
       return new Intl.NumberFormat(locale, {
         style: 'currency',
         currency,
-        currencyDisplay: getCurrencySymbol(currency, locale) === currency ? 'code' : 'narrowSymbol',
+        currencyDisplay:
+          getCurrencySymbol(currency, locale) === currency
+            ? 'code'
+            : resolveIntlCurrencyDisplay(currency, locale),
         ...(numberingSystem ? { numberingSystem } : {}),
         minimumFractionDigits: 0,
         maximumFractionDigits: 0,
@@ -578,7 +843,12 @@ function formatAmount(value: number, tenant: ReceiptTenant, trimDecimals = false
   return formatCurrencyForTenant(numeric, tenant.country, tenant.currency, prefs);
 }
 
-function formatReceiptDate(iso: string, tenant: ReceiptTenant, locale?: string, compact = false): string {
+function formatReceiptDate(
+  iso: string,
+  tenant: ReceiptTenant,
+  locale?: string,
+  compact = false,
+): string {
   if (!iso) return '';
   try {
     const d = parseDbTimestamp(iso);
@@ -589,7 +859,14 @@ function formatReceiptDate(iso: string, tenant: ReceiptTenant, locale?: string, 
       tenant.timezone || Intl.DateTimeFormat().resolvedOptions().timeZone,
       { digits: tenant.number_digits, calendar: tenant.calendar },
       compact
-        ? { year: '2-digit', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false }
+        ? {
+            year: '2-digit',
+            month: '2-digit',
+            day: '2-digit',
+            hour: '2-digit',
+            minute: '2-digit',
+            hour12: false,
+          }
         : { year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' },
       locale,
     );

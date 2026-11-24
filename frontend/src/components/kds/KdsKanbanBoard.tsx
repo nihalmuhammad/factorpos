@@ -3,7 +3,7 @@
 import { PointerActivationConstraints, PointerSensor } from '@dnd-kit/dom';
 import { DragDropProvider, useDraggable, type DragEndEvent } from '@dnd-kit/react';
 import { Clock } from 'lucide-react';
-import { useMemo, useState } from 'react';
+import { memo, useMemo, useState } from 'react';
 import toast from 'react-hot-toast';
 import { ElapsedTime } from '@/components/kds/ElapsedTime';
 import { KdsColumn } from '@/components/kds/KdsColumn';
@@ -22,11 +22,16 @@ import { ORDER_TYPE_LABEL_KEYS, type OrderType } from '@/lib/order-types';
 import { useTranslations } from 'use-intl';
 import { useConfirm } from '@/hooks/use-confirm';
 import { Ltr } from '@/components/layout/Ltr';
+import { formatItemHeading } from '@/lib/printer/item-heading';
 
 export interface KdsKanbanBoardProps {
   orders: KdsOrder[];
   updating: number | null;
-  updateItemStatus: (itemId: number, status: KitchenStatus, opts?: { silent?: boolean; expectedStatus?: KitchenStatus }) => Promise<boolean>;
+  updateItemStatus: (
+    itemId: number,
+    status: KitchenStatus,
+    opts?: { silent?: boolean; expectedStatus?: KitchenStatus },
+  ) => Promise<boolean>;
 }
 
 interface DropData {
@@ -47,9 +52,17 @@ function statusOf(item: KdsOrderItem): KitchenStatus {
 type BoardStatus = Exclude<KitchenStatus, 'voided'>;
 
 export function KdsKanbanBoard({ orders, updating, updateItemStatus }: KdsKanbanBoardProps) {
-  const [modalItem, setModalItem] = useState<{ item: KdsOrderItem; orderNumber: string } | null>(null);
+  const [modalItem, setModalItem] = useState<{ item: KdsOrderItem; orderNumber: string } | null>(
+    null,
+  );
   const resolvedModalItem = modalItem
-    ? { ...modalItem, item: orders.flatMap((order) => order.items || []).find((item) => item.id === modalItem.item.id) || modalItem.item }
+    ? {
+        ...modalItem,
+        item:
+          orders
+            .flatMap((order) => order.items || [])
+            .find((item) => item.id === modalItem.item.id) || modalItem.item,
+      }
     : null;
   const t = useTranslations('kds');
   const { confirm, ConfirmDialog } = useConfirm();
@@ -105,16 +118,21 @@ export function KdsKanbanBoard({ orders, updating, updateItemStatus }: KdsKanban
     const skipsStage = sourceIdx >= 0 && targetIdx > sourceIdx + 1;
     if (skipsStage) {
       const targetLabel = t(STATUS_CONFIG[targetData.status].labelKey);
-      const proceed = await confirm(
-        t('skipStageMessage', { status: targetLabel }),
-        { title: t('skipStageTitle'), confirmLabel: t('markAs', { status: targetLabel }) },
-      );
+      const proceed = await confirm(t('skipStageMessage', { status: targetLabel }), {
+        title: t('skipStageTitle'),
+        confirmLabel: t('markAs', { status: targetLabel }),
+      });
       if (!proceed) return;
     }
 
-    const results = await Promise.all(sourceData.itemIds.map((id) =>
-      updateItemStatus(id, targetData.status, { silent: !skipsStage, expectedStatus: sourceData.fromStatus }),
-    ));
+    const results = await Promise.all(
+      sourceData.itemIds.map((id) =>
+        updateItemStatus(id, targetData.status, {
+          silent: !skipsStage,
+          expectedStatus: sourceData.fromStatus,
+        }),
+      ),
+    );
     const failed = results.filter((result) => !result).length;
     if (failed > 0) {
       toast.error(t('itemsUpdateFailed', { count: failed }));
@@ -170,7 +188,9 @@ export function KdsKanbanBoard({ orders, updating, updateItemStatus }: KdsKanban
           updating={updating === resolvedModalItem.item.id}
           onClose={() => setModalItem(null)}
           onUpdateStatus={async (itemId, status) => {
-            const updated = await updateItemStatus(itemId, status, { expectedStatus: statusOf(resolvedModalItem.item) });
+            const updated = await updateItemStatus(itemId, status, {
+              expectedStatus: statusOf(resolvedModalItem.item),
+            });
             if (updated) setModalItem(null);
           }}
         />
@@ -179,7 +199,21 @@ export function KdsKanbanBoard({ orders, updating, updateItemStatus }: KdsKanban
   );
 }
 
-function KanbanOrderCard({
+// onItemOpen is intentionally ignored: it only opens the item modal and is recreated every render.
+function kanbanOrderCardPropsEqual(
+  prev: { order: KdsOrder; status: KitchenStatus; items: KdsOrderItem[]; updating: number | null },
+  next: { order: KdsOrder; status: KitchenStatus; items: KdsOrderItem[]; updating: number | null },
+): boolean {
+  return (
+    prev.order === next.order &&
+    prev.status === next.status &&
+    prev.updating === next.updating &&
+    prev.items.length === next.items.length &&
+    prev.items.every((item, index) => item === next.items[index])
+  );
+}
+
+const KanbanOrderCard = memo(function KanbanOrderCard({
   order,
   status,
   items,
@@ -209,13 +243,17 @@ function KanbanOrderCard({
         isDragging ? 'opacity-40' : ''
       } ${busy ? 'pointer-events-none opacity-60' : ''}`}
     >
-      <div className={`rounded-xl border-2 ${config.border} bg-card p-3 flex flex-col shadow-sm`}>
+      <div
+        className={`rounded-xl bg-card shadow-sm ring-1 ring-border/50 border-t-4 ${config.border} p-3 flex flex-col`}
+      >
         <div className="flex justify-between items-center mb-2 gap-2">
           <div className="flex items-center gap-1.5 min-w-0 flex-wrap">
-            <Ltr as="span" className="font-bold text-sm shrink-0">#{order.order_number}</Ltr>
+            <Ltr as="span" className="font-extrabold text-lg tracking-tight shrink-0">
+              #{order.order_number}
+            </Ltr>
             <Badge
               variant="outline"
-              className={ORDER_TYPE_BADGE_STYLES[order.type] || 'bg-muted text-foreground border-border'}
+              className={`${ORDER_TYPE_BADGE_STYLES[order.type] || 'bg-muted text-foreground'} border-transparent dark:border-transparent`}
             >
               {ORDER_TYPE_LABEL_KEYS[order.type as OrderType]
                 ? tOrders(ORDER_TYPE_LABEL_KEYS[order.type as OrderType])
@@ -225,19 +263,21 @@ function KanbanOrderCard({
               <Badge variant="secondary">{t('tableLabel', { name: order.table.name })}</Badge>
             )}
           </div>
-          <div className="flex items-center gap-1 text-sm text-gray-400 font-mono shrink-0">
+          <div className="flex items-center gap-1 text-sm text-slate-700 dark:text-slate-300 font-mono shrink-0">
             <Clock size={12} />
-            <Ltr><ElapsedTime dateStr={order.created_at} /></Ltr>
+            <Ltr>
+              <ElapsedTime dateStr={order.created_at} />
+            </Ltr>
           </div>
         </div>
 
         {order.special_instructions && (
-          <p className="mb-2 px-2 py-1 bg-amber-50 border border-amber-200 rounded text-sm text-amber-700 font-medium break-words">
+          <p className="mb-2.5 px-2.5 py-1.5 border-s-4 border-amber-500 bg-amber-50 text-amber-900 dark:bg-amber-950/80 dark:text-amber-200 rounded-e-md text-sm font-medium break-words">
             📝 {order.special_instructions}
           </p>
         )}
 
-        <div className="space-y-1">
+        <div className="divide-y divide-border/40 -mx-1">
           {items.map((item) => (
             <button
               key={item.id}
@@ -247,17 +287,31 @@ function KanbanOrderCard({
                 e.stopPropagation();
                 onItemOpen(item);
               }}
-              className={`w-full text-start rounded-lg border ${config.border} ${config.bg} px-2 py-1.5 hover:brightness-95 active:scale-[0.98] transition`}
+              className="w-full text-start px-2 py-2 first:pt-1.5 last:pb-1 hover:bg-muted/60 active:bg-muted/80 active:scale-[0.99] transition rounded-md"
             >
               <div className="flex items-center gap-2">
-                <span className={`text-base font-bold w-6 shrink-0 ${config.text}`}>{item.quantity}×</span>
-                <span className="text-lg text-foreground font-medium flex-1 truncate">{item.product_name}</span>
-                {item.addons && item.addons.length > 0 && (
-                  <span className="text-[10px] text-blue-600">+{item.addons.length}</span>
-                )}
+                <span className={`text-base font-bold w-6 shrink-0 ${config.text}`}>
+                  {item.quantity}×
+                </span>
+                <span className="text-lg font-semibold text-foreground flex-1 truncate">
+                  {formatItemHeading(item.product_name, item.variant_selection)}
+                </span>
               </div>
+              {item.addons && item.addons.length > 0 && (
+                <div className="ms-[26px] flex flex-wrap gap-1 mt-1.5">
+                  {item.addons.map((addon, i) => (
+                    <span
+                      key={`${addon.id ?? addon.name}-${i}`}
+                      className="text-xs font-medium bg-blue-100/90 text-blue-900 dark:bg-blue-950/90 dark:text-blue-200 px-2 py-0.5 rounded-md"
+                    >
+                      + {addon.name}
+                      {(addon.quantity || 1) > 1 ? ` ×${addon.quantity}` : ''}
+                    </span>
+                  ))}
+                </div>
+              )}
               {item.special_instructions && (
-                <p className="ms-[26px] text-sm text-red-600 italic mt-0.5 font-medium break-words">
+                <p className="ms-[26px] mt-1.5 px-2 py-0.5 border-s-3 border-red-500 bg-red-50 text-red-900 dark:bg-red-950/90 dark:text-red-200 rounded-e text-xs font-semibold italic break-words">
                   {`"${item.special_instructions}"`}
                 </p>
               )}
@@ -267,7 +321,7 @@ function KanbanOrderCard({
       </div>
     </div>
   );
-}
+}, kanbanOrderCardPropsEqual);
 
 // Read-only display column for voided items; drag-and-drop transitions are disabled.
 function VoidedColumn({
@@ -282,45 +336,72 @@ function VoidedColumn({
   const count = groups.reduce((sum, g) => sum + g.items.length, 0);
 
   return (
-    <div className="flex-1 min-w-[260px] flex flex-col">
-      <div className={`flex items-center gap-2 px-3 py-2 ${config.bg} rounded-t-lg border-2 ${config.border} border-b-0`}>
-        <div className={`w-2 h-2 rounded-full ${config.color}`} />
+    <div className="rounded-2xl bg-muted/40 dark:bg-muted/25 flex-1 min-w-[260px] flex flex-col overflow-hidden">
+      <div className={`flex items-center gap-2 px-3.5 py-2.5 ${config.bg}`}>
+        <div className={`w-2.5 h-2.5 rounded-full ${config.color}`} />
         <span className={`text-base font-semibold ${config.text}`}>{t(config.labelKey)}</span>
-        <span className="ms-auto text-xs px-1.5 py-0.5 rounded-full bg-card/70 text-foreground font-medium tabular-nums">
+        <span className="ms-auto text-xs px-2 py-0.5 rounded-full bg-card/80 text-foreground font-semibold tabular-nums shadow-2xs">
           {count}
         </span>
       </div>
       <div
-        className={`flex-1 border-2 ${config.border} border-t-0 rounded-b-lg p-2 space-y-2 overflow-y-auto bg-muted/40`}
+        className="flex-1 p-2.5 space-y-2.5 overflow-y-auto"
         style={{ minHeight: '60vh', maxHeight: 'calc(100vh - 220px)' }}
       >
         {groups.map(({ order, items }) => (
-          <div key={order.id} className={`rounded-xl border-2 ${config.border} bg-card p-3 flex flex-col shadow-sm opacity-80`}>
+          <div
+            key={order.id}
+            className={`rounded-xl bg-card shadow-sm ring-1 ring-border/50 border-t-4 ${config.border} p-3 flex flex-col`}
+          >
             <div className="flex items-center gap-1.5 min-w-0 flex-wrap mb-2">
-              <Ltr as="span" className="font-bold text-sm shrink-0">#{order.order_number}</Ltr>
+              <Ltr as="span" className="font-extrabold text-lg tracking-tight shrink-0">
+                #{order.order_number}
+              </Ltr>
               {order.table?.name && (
                 <Badge variant="secondary">{t('tableLabel', { name: order.table.name })}</Badge>
               )}
             </div>
-            <div className="space-y-1">
+            <div className="divide-y divide-border/40 -mx-1">
               {items.map((item) => (
                 <button
                   key={item.id}
                   type="button"
                   onClick={() => onItemOpen(item, order.order_number)}
-                  className={`w-full text-start rounded-lg border ${config.border} ${config.bg} px-2 py-1.5 hover:brightness-95 active:scale-[0.98] transition`}
+                  className="w-full text-start px-2 py-2 first:pt-1.5 last:pb-1 hover:bg-muted/60 active:bg-muted/80 active:scale-[0.99] transition rounded-md"
                 >
                   <div className="flex items-center gap-2">
-                    <span className={`text-base font-bold w-6 shrink-0 ${config.text}`}>{item.quantity}×</span>
-                    <span className="text-lg text-gray-400 line-through font-medium flex-1 truncate">{item.product_name}</span>
+                    <span className={`text-base font-bold w-6 shrink-0 ${config.text}`}>
+                      {item.quantity}×
+                    </span>
+                    <span className="text-lg text-slate-700 dark:text-slate-200 line-through font-semibold flex-1 truncate">
+                      {formatItemHeading(item.product_name, item.variant_selection)}
+                    </span>
                   </div>
+                  {item.addons && item.addons.length > 0 && (
+                    <div className="ms-[26px] flex flex-wrap gap-1 mt-1.5">
+                      {item.addons.map((addon, i) => (
+                        <span
+                          key={`${addon.id ?? addon.name}-${i}`}
+                          className="text-xs font-medium bg-blue-100/90 text-blue-900 dark:bg-blue-950/90 dark:text-blue-200 px-2 py-0.5 rounded-md"
+                        >
+                          + {addon.name}
+                          {(addon.quantity || 1) > 1 ? ` ×${addon.quantity}` : ''}
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                  {item.special_instructions && (
+                    <p className="ms-[26px] mt-1.5 px-2 py-0.5 border-s-3 border-red-500 bg-red-50 text-red-900 dark:bg-red-950/90 dark:text-red-200 rounded-e text-xs font-semibold italic break-words">
+                      {`"${item.special_instructions}"`}
+                    </p>
+                  )}
                 </button>
               ))}
             </div>
           </div>
         ))}
         {count === 0 && (
-          <div className="flex flex-col items-center justify-center py-6 text-gray-400 text-xs">
+          <div className="flex flex-col items-center justify-center py-6 text-slate-700 dark:text-slate-300 text-xs">
             <span>{t('emptyColumn')}</span>
           </div>
         )}

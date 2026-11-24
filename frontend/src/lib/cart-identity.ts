@@ -1,4 +1,5 @@
 import type { Addon, CartItem } from './types';
+import { normalizeOverridePrice } from './cart-price';
 
 /** Serializes cart identity into a typed, sorted canonical representation. */
 function canonicalize(value: unknown): string {
@@ -28,7 +29,10 @@ function canonicalize(value: unknown): string {
       }
       const entries = Object.keys(value as Record<string, unknown>)
         .sort()
-        .map((key) => `${JSON.stringify(key)}:${canonicalize((value as Record<string, unknown>)[key])}`);
+        .map(
+          (key) =>
+            `${JSON.stringify(key)}:${canonicalize((value as Record<string, unknown>)[key])}`,
+        );
       return `{${entries.join(',')}}`;
     }
     default:
@@ -36,8 +40,31 @@ function canonicalize(value: unknown): string {
   }
 }
 
+/**
+ * Bounded identity for one cart line: the canonical form grows with add-on and
+ * note text, while some consumers bound an id (POST /held-orders caps it).
+ * FNV-1a over two 32-bit lanes stays deterministic and collision-resistant
+ * enough to keep distinct lines distinct.
+ */
+function lineDigest(value: string): string {
+  let first = 0x811c9dc5;
+  let second = 0xc9dc5118;
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    first = Math.imul(first ^ code, 0x01000193) >>> 0;
+    second = Math.imul(second ^ code, 0x01000193) >>> 0;
+  }
+  return `${first.toString(16).padStart(8, '0')}${second.toString(16).padStart(8, '0')}`;
+}
+
 /** Builds order-insensitive, typed cart identity for merging equivalent items. */
-export function generateCartItemId(productId: number | string, addons: Addon[], specialInstructions: string): string {
+export function generateCartItemId(
+  productId: number | string,
+  variantId: string | null,
+  addons: Addon[],
+  specialInstructions: string,
+  priceOverride?: { price: number; reason: string } | null,
+): string {
   const normalizedAddons = addons.map((addon) => ({
     ...addon,
     quantity: addon.quantity || 1,
@@ -50,19 +77,35 @@ export function generateCartItemId(productId: number | string, addons: Addon[], 
     return 0;
   });
 
-  return `cart-v2:${canonicalize({ productId, addons: sortedAddons, specialInstructions })}`;
+  return `cart-v3:${lineDigest(canonicalize({ productId, variantId, addons: sortedAddons, specialInstructions, ...(priceOverride ? { priceOverride: { price: normalizeOverridePrice(priceOverride.price), reason: priceOverride.reason } } : {}) }))}`;
 }
 
 /** Normalize persisted/held cart lines to the current identity format. */
 export function normalizeCartItems(items: CartItem[]): CartItem[] {
   const normalized: CartItem[] = [];
   for (const item of items) {
-    const id = generateCartItemId(item.product.id, item.addons || [], item.special_instructions || '');
+    const normalizedOverride = item.price_override
+      ? {
+          price: normalizeOverridePrice(item.price_override.price),
+          reason: item.price_override.reason,
+        }
+      : item.price_override;
+    const id = generateCartItemId(
+      item.product.id,
+      item.variant?.id ?? null,
+      item.addons || [],
+      item.special_instructions || '',
+      normalizedOverride,
+    );
     const existing = normalized.find((candidate) => candidate.id === id);
     if (existing) {
       existing.quantity += item.quantity;
     } else {
-      normalized.push({ ...item, id });
+      normalized.push({
+        ...item,
+        ...(normalizedOverride !== undefined ? { price_override: normalizedOverride } : {}),
+        id,
+      });
     }
   }
   return normalized;

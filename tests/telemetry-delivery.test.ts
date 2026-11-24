@@ -24,6 +24,7 @@ const { initDatabase, getDatabase, closeDatabase, now } = require('../main/db');
 const { telemetry, sendEvent, TELEMETRY_URL } = require('../main/services/telemetry');
 
 async function main() {
+  process.env.FLO_TELEMETRY_DEV = '1';
   initDatabase();
   const db = getDatabase();
   const set = db.prepare(`
@@ -32,6 +33,7 @@ async function main() {
   `);
   set.run('telemetry_enabled', 'true', now());
   set.run('country', 'AR', now());
+  set.run('currency', ' usd ', now());
   // settings.country is seeded to 'IN' at install, so telemetry only reports a
   // country a human confirmed. Without this stamp 'AR' is indistinguishable
   // from an untouched default and is deliberately withheld — see the
@@ -49,6 +51,11 @@ async function main() {
 
     assert.equal(await sendEvent('app_launch'), true, '2xx telemetry delivery succeeds');
     assert.equal(requestBody?.country, 'AR', 'telemetry sends the configured ISO country');
+    assert.equal(
+      requestBody?.currency,
+      'USD',
+      'telemetry sends the normalized configured currency',
+    );
     assert.equal(requestBody?.app, 'flocafe');
     assert.equal(requestBody?.app_version, '2.7.2-test');
 
@@ -61,37 +68,83 @@ async function main() {
     assert.equal(
       Object.prototype.hasOwnProperty.call(requestBody ?? {}, 'country'),
       false,
-      'an unconfirmed country is omitted so the server can geolocate instead'
+      'an unconfirmed country is omitted so the server can geolocate instead',
     );
     set.run('country_confirmed_at', new Date().toISOString(), now());
 
+    set.run('currency', '$', now());
+    requestBody = null;
+    assert.equal(await sendEvent('daily_ping'), true);
+    assert.equal(
+      Object.prototype.hasOwnProperty.call(requestBody ?? {}, 'currency'),
+      false,
+      'telemetry omits currency symbols',
+    );
+
+    set.run('currency', 'ZZZ', now());
+    requestBody = null;
+    assert.equal(await sendEvent('daily_ping'), true);
+    assert.equal(
+      Object.prototype.hasOwnProperty.call(requestBody ?? {}, 'currency'),
+      false,
+      'telemetry omits unsupported currency codes',
+    );
+    set.run('currency', 'USD', now());
+
     let bodyCancelled = false;
-    globalThis.fetch = (async () => ({
-      ok: true,
-      status: 204,
-      body: { cancel: async () => { bodyCancelled = true; } },
-    }) as unknown as Response) as typeof fetch;
-    assert.equal(await sendEvent('app_launch'), true, 'telemetry delivery succeeds with a response body');
+    globalThis.fetch = (async () =>
+      ({
+        ok: true,
+        status: 204,
+        body: {
+          cancel: async () => {
+            bodyCancelled = true;
+          },
+        },
+      }) as unknown as Response) as typeof fetch;
+    assert.equal(
+      await sendEvent('app_launch'),
+      true,
+      'telemetry delivery succeeds with a response body',
+    );
     assert.equal(bodyCancelled, true, 'telemetry cancels the response body before settling');
 
     let non2xxBodyCancelled = false;
-    globalThis.fetch = (async () => ({
-      ok: false,
-      status: 503,
-      body: { cancel: async () => { non2xxBodyCancelled = true; } },
-    }) as unknown as Response) as typeof fetch;
-    assert.equal(await sendEvent('daily_ping'), false, 'non-2xx telemetry is reported as undelivered');
-    assert.equal(non2xxBodyCancelled, true, 'telemetry cancels the response body on non-2xx responses');
+    globalThis.fetch = (async () =>
+      ({
+        ok: false,
+        status: 503,
+        body: {
+          cancel: async () => {
+            non2xxBodyCancelled = true;
+          },
+        },
+      }) as unknown as Response) as typeof fetch;
+    assert.equal(
+      await sendEvent('daily_ping'),
+      false,
+      'non-2xx telemetry is reported as undelivered',
+    );
+    assert.equal(
+      non2xxBodyCancelled,
+      true,
+      'telemetry cancels the response body on non-2xx responses',
+    );
 
     // Verify telemetry.stop() drains and cancels non-2xx in-flight work before settling
     let stopBodyCancelled = false;
     let finishFetch: () => void = () => {};
     const fetchDeferred = new Promise<Response>((resolve) => {
-      finishFetch = () => resolve({
-        ok: false,
-        status: 500,
-        body: { cancel: async () => { stopBodyCancelled = true; } },
-      } as unknown as Response);
+      finishFetch = () =>
+        resolve({
+          ok: false,
+          status: 500,
+          body: {
+            cancel: async () => {
+              stopBodyCancelled = true;
+            },
+          },
+        } as unknown as Response);
     });
     globalThis.fetch = (() => fetchDeferred) as unknown as typeof fetch;
 
@@ -100,7 +153,11 @@ async function main() {
     finishFetch();
     assert.equal(await inFlightOp, false);
     await stopPromise;
-    assert.equal(stopBodyCancelled, true, 'telemetry.stop() drains in-flight non-2xx requests and cancels response body');
+    assert.equal(
+      stopBodyCancelled,
+      true,
+      'telemetry.stop() drains in-flight non-2xx requests and cancels response body',
+    );
 
     set.run('telemetry_enabled', 'false', now());
     let calledWhileDisabled = false;
@@ -126,6 +183,7 @@ async function main() {
 
     console.log('✅ Telemetry delivery contract checks passed');
   } finally {
+    delete process.env.FLO_TELEMETRY_DEV;
     globalThis.fetch = originalFetch;
     closeDatabase();
     fs.rmSync(testDir, { recursive: true, force: true });

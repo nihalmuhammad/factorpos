@@ -2,26 +2,92 @@
 
 import axios, { AxiosInstance } from 'axios';
 import toast from 'react-hot-toast';
-import { Bell, CheckCircle2, ChefHat, Circle, Flame, LogOut, Minus, Plus, RefreshCw, Search, Send, ShoppingCart, Smartphone, SquarePen, Trash2, UserRound } from 'lucide-react';
+import {
+  ArrowRightLeft,
+  Bell,
+  CheckCircle2,
+  ChefHat,
+  Circle,
+  Delete,
+  Flame,
+  KeyRound,
+  LayoutGrid,
+  LogOut,
+  Mail,
+  Minus,
+  Plus,
+  RefreshCw,
+  Send,
+  ShoppingCart,
+  Smartphone,
+  SquarePen,
+  Trash2,
+  UserRound,
+} from 'lucide-react';
 import { Drawer, DrawerContent, DrawerTrigger } from '@/components/ui/drawer';
-import { FormEvent, useEffect, useMemo, useRef, useState } from 'react';
+import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { parsePhone } from '@/lib/phone';
 import { useSyncServerLanguage } from '@/lib/i18n';
 import { useTranslations, type AppConfig } from 'use-intl';
 import { Ltr } from '@/components/layout/Ltr';
 import { toastApiError } from '@/lib/api-error';
+import { parseLoginFailure } from '@/lib/login-errors';
 import { formatCurrencyForTenant } from '@/lib/countries';
 import { createPaymentIdempotencyKey } from '@/lib/payment-idempotency';
-import { printerService } from '@/lib/printer/PrinterService';
+import { formatItemHeading } from '@/lib/printer/item-heading';
 import { generateCartItemId } from '@/lib/cart-identity';
+import { productNeedsCustomizer, scannedVariantNeedsCustomizer } from '@/lib/product-variants';
 import AddonModal from '@/components/pos/AddonModal';
-import type { Order as FullOrder, Product, Addon, CartItem } from '@/lib/types';
+import ProductGrid from '@/components/pos/ProductGrid';
+import type { PosCategorySort, PosItemSort } from '@/lib/pos-sort';
+import MoveTableModal from '@/components/tables/MoveTableModal';
+import { AccountCredentialsDialog } from '@/components/auth/AccountCredentialsDialog';
+import { ROLE_LABEL_KEYS } from '@/lib/i18n-enums';
+import { tenantCan } from '@/lib/permissions';
+import type {
+  Table as FullTable,
+  Tenant,
+  Product,
+  Addon,
+  CartItem,
+  Category,
+  ProductVariant,
+} from '@/lib/types';
+import { cartItemToOrderItem } from '@/lib/cart-order-item';
 
-type User = { id: string; name: string; email: string; role: string };
-type Category = { id: string; name: string };
-type Table = { id: string; name?: string; number?: string; status?: string; activeOrder?: Order | null; current_order?: Order | null };
-type OrderItem = { id: number; product_name: string; quantity: number; status: string; special_instructions?: string | null };
-type Order = { id: number; order_number: string; table_id?: string | null; status: string; items?: OrderItem[]; customer?: { id: string; name: string; phone?: string } | null };
+type User = {
+  id: string;
+  name: string;
+  email: string;
+  role: string;
+  has_pin?: boolean;
+  permission_ids?: string[];
+};
+type PinUser = { id: string; name: string; role: string };
+type Table = {
+  id: string;
+  name?: string;
+  number?: string;
+  status?: string;
+  activeOrder?: Order | null;
+  current_order?: Order | null;
+};
+type OrderItem = {
+  id: number;
+  product_name: string;
+  quantity: number;
+  status: string;
+  special_instructions?: string | null;
+  variant_selection?: unknown;
+};
+type Order = {
+  id: number;
+  order_number: string;
+  table_id?: string | null;
+  status: string;
+  items?: OrderItem[];
+  customer?: { id: string; name: string; phone?: string } | null;
+};
 type DraftLine = CartItem;
 type ServerAppInfo = {
   country: string;
@@ -29,6 +95,8 @@ type ServerAppInfo = {
   currency_symbol: string;
   currency_position: 'prefix' | 'suffix';
   currency_fraction_digits: number;
+  category_sort?: PosCategorySort;
+  item_sort?: PosItemSort;
 };
 
 type ServerAppKey = keyof AppConfig['Messages']['serverApp'];
@@ -39,13 +107,17 @@ function createApi(): AxiosInstance {
   const api = axios.create({ baseURL: window.location.origin, timeout: 10000 });
   api.interceptors.request.use((config) => {
     const token = localStorage.getItem(TOKEN_KEY);
-    if (token) config.headers.Authorization = `Bearer ${token}`;
+    if (token && !config.headers.Authorization) config.headers.Authorization = `Bearer ${token}`;
     return config;
   });
   api.interceptors.response.use(
     (response) => response,
     (error) => {
-      if (error.response?.status === 401) localStorage.removeItem(TOKEN_KEY);
+      const sentAuth = error.config?.headers?.Authorization;
+      const currentToken = localStorage.getItem(TOKEN_KEY);
+      if (error.response?.status === 401 && currentToken && sentAuth === `Bearer ${currentToken}`) {
+        localStorage.removeItem(TOKEN_KEY);
+      }
       return Promise.reject(error);
     },
   );
@@ -53,23 +125,69 @@ function createApi(): AxiosInstance {
 }
 
 function itemStatusIcon(status: string, t: (key: ServerAppKey) => string) {
-  if (status === 'preparing') return <Flame size={15} className="text-orange-500 dark:text-orange-400" aria-label={t('statusPreparing')} />;
-  if (status === 'ready') return <Bell size={15} className="text-emerald-600 dark:text-emerald-400" aria-label={t('statusReady')} />;
-  if (status === 'served') return <CheckCircle2 size={15} className="text-blue-600 dark:text-blue-400" aria-label={t('statusServed')} />;
-  return <Circle size={15} className="text-gray-400 dark:text-gray-500" aria-label={t('statusWaiting')} />;
+  if (status === 'preparing')
+    return (
+      <Flame
+        size={15}
+        className="text-orange-500 dark:text-orange-400"
+        aria-label={t('statusPreparing')}
+      />
+    );
+  if (status === 'ready')
+    return (
+      <Bell
+        size={15}
+        className="text-emerald-600 dark:text-emerald-400"
+        aria-label={t('statusReady')}
+      />
+    );
+  if (status === 'served')
+    return (
+      <CheckCircle2
+        size={15}
+        className="text-blue-600 dark:text-blue-400"
+        aria-label={t('statusServed')}
+      />
+    );
+  return (
+    <Circle
+      size={15}
+      className="text-gray-400 dark:text-gray-500"
+      aria-label={t('statusWaiting')}
+    />
+  );
 }
 
 function money(value: number | string, regional: ServerAppInfo | null) {
   return formatCurrencyForTenant(
     Number(value || 0),
-    regional?.country,
-    regional?.currency || 'INR',
+    regional?.country || '',
+    regional?.currency || '',
   );
 }
 
-function sendAttemptSignature(scopeId: string, draft: DraftLine[], customerName: string, customerPhone: string): string {
+type SendSnapshot = {
+  tableId: string;
+  requestTableId?: string;
+  tableName: string | undefined;
+  orderId: number | null;
+  orderCustomer: Order['customer'] | null;
+  existingItemIds: Set<number>;
+  draftLines: DraftLine[];
+  customerName: string;
+  customerPhone: string;
+  orderNotes: string;
+};
+
+function sendAttemptSignature(
+  tableId: string,
+  draft: DraftLine[],
+  customerName: string,
+  customerPhone: string,
+  orderNotes: string,
+): string {
   const items = draft.map((line) => `${line.id}:${line.quantity}`).join('|');
-  return `${scopeId}|${items}|${customerName.trim()}|${customerPhone.trim()}`;
+  return `${tableId}|${items}|${customerName.trim()}|${customerPhone.trim()}|${orderNotes.trim()}`;
 }
 
 export default function ServerStandalonePage() {
@@ -77,10 +195,12 @@ export default function ServerStandalonePage() {
   useSyncServerLanguage('/api/server-app/info');
   const t = useTranslations('serverApp');
   const tAuth = useTranslations('auth');
-  const tOrders = useTranslations('orders');
   const tTables = useTranslations('tables');
   const tCommon = useTranslations('common');
+  const tNav = useTranslations('nav');
   const tPos = useTranslations('pos');
+  const tSettings = useTranslations('settings');
+  const tStaff = useTranslations('staff');
 
   // Fall back to caller-supplied localized message for server-app errors without dotted error codes.
   const apiErrorT = (key: string): string => key;
@@ -90,6 +210,11 @@ export default function ServerStandalonePage() {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [rememberMe, setRememberMe] = useState(true);
+  const [pinUsers, setPinUsers] = useState<PinUser[]>([]);
+  const [selectedPinUser, setSelectedPinUser] = useState<PinUser | null>(null);
+  const [pin, setPin] = useState('');
+  const [pinError, setPinError] = useState('');
+  const [signInMode, setSignInMode] = useState<'pin' | 'password' | null>(null);
   const [user, setUser] = useState<User | null>(null);
   const [disabled, setDisabled] = useState(false);
   const [regional, setRegional] = useState<ServerAppInfo | null>(null);
@@ -97,39 +222,127 @@ export default function ServerStandalonePage() {
   const [categories, setCategories] = useState<Category[]>([]);
   const [products, setProducts] = useState<Product[]>([]);
   const [tables, setTables] = useState<Table[]>([]);
+  const [tablesLoaded, setTablesLoaded] = useState(false);
   const [selectedTableId, setSelectedTableId] = useState<string>('');
-  const [selectedCategoryId, setSelectedCategoryId] = useState<string>('all');
+  const [orderLoadedTableId, setOrderLoadedTableId] = useState<string>('');
+  const [selectedCategoryId, setSelectedCategoryId] = useState<string | null>(null);
   const [query, setQuery] = useState('');
   const [draft, setDraft] = useState<DraftLine[]>([]);
+  const [orderNotes, setOrderNotes] = useState('');
   const [addonModalProduct, setAddonModalProduct] = useState<Product | null>(null);
+  const [addonModalQuantity, setAddonModalQuantity] = useState(1);
+  const [addonModalVariant, setAddonModalVariant] = useState<ProductVariant | null>(null);
   const [editingDraftLine, setEditingDraftLine] = useState<DraftLine | null>(null);
   const [mobileCartOpen, setMobileCartOpen] = useState(false);
+  const [moveTableModalOpen, setMoveTableModalOpen] = useState(false);
+  const [credentialsOpen, setCredentialsOpen] = useState(false);
   const [currentOrder, setCurrentOrder] = useState<Order | null>(null);
   const [customerName, setCustomerName] = useState('');
   const [customerPhone, setCustomerPhone] = useState('');
-  const [customerMatch, setCustomerMatch] = useState<{ id: string; name: string } | null>(null);
+  const [customerMatch, setCustomerMatch] = useState<{
+    id: string;
+    name: string;
+  } | null>(null);
   const [customerSearched, setCustomerSearched] = useState(false);
   const phoneDebounceRef = useRef<ReturnType<typeof setTimeout>>(undefined);
   const phoneAbortRef = useRef<AbortController | null>(null);
   const [sending, setSending] = useState(false);
   // Synchronous re-entry guard: `sending` state updates too late to stop a second click fired before the first render.
   const sendInFlightRef = useRef(false);
-  // Nonce for the in-flight send attempt, paired with a signature of what defines it (draft/customer/order).
-  // Reused only while retrying that exact same attempt; a content change or a success both rotate it.
-  const sendAttemptRef = useRef<{ signature: string; nonce: string } | null>(null);
+  // Nonce and frozen target snapshot for the pending send attempt, paired with a signature of what defines it.
+  // Reused while retrying that exact same attempt so a lost create response cannot switch to append on retry.
+  const sendAttemptRef = useRef<{
+    signature: string;
+    nonce: string;
+    snapshot: SendSnapshot;
+  } | null>(null);
+  const sendSeqRef = useRef(0);
+  const addonModalSendSeqRef = useRef(0);
+  const editingDraftSendSeqRef = useRef(0);
+  const selectedTableIdRef = useRef('');
+  const orderLoadedTableIdRef = useRef('');
+  const orderLookupFailedRef = useRef(false);
+  const orderLoadSeqRef = useRef(0);
+  const authSessionSeqRef = useRef(0);
+  const activeUserIdRef = useRef<string | null>(null);
+  const [autoLockMinutes, setAutoLockMinutes] = useState(0);
+  const lastActivityRef = useRef(0);
+  const liveDraftRef = useRef({
+    tableId: '',
+    draft: [] as DraftLine[],
+    customerName: '',
+    customerPhone: '',
+    orderNotes: '',
+  });
+  const suspendedDraftRef = useRef<
+    | (typeof liveDraftRef.current & {
+        ownerId: string;
+        attempt: typeof sendAttemptRef.current;
+      })
+    | null
+  >(null);
 
-  async function loadAll() {
+  useEffect(() => {
+    liveDraftRef.current = {
+      tableId: selectedTableId,
+      draft,
+      customerName,
+      customerPhone,
+      orderNotes,
+    };
+  }, [selectedTableId, draft, customerName, customerPhone, orderNotes]);
+
+  const loadUser = useCallback(async () => {
+    if (!api || sendInFlightRef.current) return;
+    const requestToken = localStorage.getItem(TOKEN_KEY);
+    if (!requestToken) return;
+    const sessionSeq = authSessionSeqRef.current;
+    const res = await api.get('/api/auth/me');
+    if (
+      sendInFlightRef.current ||
+      sessionSeq !== authSessionSeqRef.current ||
+      localStorage.getItem(TOKEN_KEY) !== requestToken ||
+      !res.data?.user
+    ) {
+      return;
+    }
+    const nextUser: User = res.data.user;
+    setUser((prev) => {
+      if (!prev || prev.id !== nextUser.id) return prev;
+      if (
+        prev.role === nextUser.role &&
+        prev.name === nextUser.name &&
+        prev.email === nextUser.email &&
+        prev.has_pin === nextUser.has_pin &&
+        (prev.permission_ids || []).join(',') === (nextUser.permission_ids || []).join(',')
+      ) {
+        return prev;
+      }
+      return nextUser;
+    });
+  }, [api]);
+
+  async function loadAll(options?: { allowWhileSending?: boolean }) {
     if (!api) return;
+    if (sendInFlightRef.current && !options?.allowWhileSending) return;
+    const session = authSessionSeqRef.current;
+    const token = localStorage.getItem(TOKEN_KEY);
     const [categoriesRes, productsRes, tablesRes] = await Promise.all([
       api.get('/api/categories', { params: { active: 'true' } }),
       api.get('/api/products', { params: { active: 'true' } }),
       api.get('/api/tables', { params: { active: 'true' } }),
     ]);
+    if (session !== authSessionSeqRef.current || token !== localStorage.getItem(TOKEN_KEY)) return;
+    if (sendInFlightRef.current && !options?.allowWhileSending) return;
     setCategories(categoriesRes.data.categories || []);
     setProducts(productsRes.data.products || []);
     const loadedTables = tablesRes.data.tables || [];
     setTables(loadedTables);
-    if (!selectedTableId && loadedTables[0]) setSelectedTableId(loadedTables[0].id);
+    setTablesLoaded(true);
+    if (!selectedTableIdRef.current && loadedTables[0]) {
+      selectedTableIdRef.current = loadedTables[0].id;
+      setSelectedTableId(loadedTables[0].id);
+    }
   }
 
   function cancelPendingCustomerLookup() {
@@ -137,29 +350,77 @@ export default function ServerStandalonePage() {
     phoneAbortRef.current?.abort();
   }
 
-  async function loadOrder(tableId: string) {
+  async function loadOrder(tableId: string, options?: { allowWhileSending?: boolean }) {
     if (!api || !tableId) return;
-    cancelPendingCustomerLookup();
-    const res = await api.get('/api/orders', {
-      params: { table_id: tableId, type: 'dine_in', status: 'pending,preparing,ready', per_page: 1 },
-    });
-    const order = res.data.orders?.[0] || null;
-    setCurrentOrder(order);
-    if (order?.customer) {
-      setCustomerName(order.customer.name || '');
-      setCustomerPhone(order.customer.phone || '');
-    } else {
-      setCustomerName('');
-      setCustomerPhone('');
+    if (sendInFlightRef.current && !options?.allowWhileSending) return;
+    const loadSeq = ++orderLoadSeqRef.current;
+    orderLookupFailedRef.current = false;
+    if (!options?.allowWhileSending) {
+      orderLoadedTableIdRef.current = '';
+      setOrderLoadedTableId('');
     }
-    setCustomerMatch(null);
-    setCustomerSearched(false);
+    cancelPendingCustomerLookup();
+    try {
+      const res = await api.get('/api/orders', {
+        params: {
+          table_id: tableId,
+          type: 'dine_in',
+          status: 'pending,preparing,ready,served',
+          per_page: 1,
+        },
+      });
+      if (
+        (sendInFlightRef.current && !options?.allowWhileSending) ||
+        loadSeq !== orderLoadSeqRef.current ||
+        selectedTableIdRef.current !== tableId
+      ) {
+        return;
+      }
+      const order = res.data.orders?.[0] || null;
+      setCurrentOrder(order);
+      const suspended = suspendedDraftRef.current;
+      const pendingAttempt =
+        sendAttemptRef.current?.snapshot.tableId === tableId
+          ? sendAttemptRef.current.snapshot
+          : suspended?.ownerId === activeUserIdRef.current && suspended.tableId === tableId
+            ? suspended
+            : null;
+      if (pendingAttempt) {
+        setCustomerName(pendingAttempt.customerName);
+        setCustomerPhone(pendingAttempt.customerPhone);
+      } else if (order?.customer) {
+        setCustomerName(order.customer.name || '');
+        setCustomerPhone(order.customer.phone || '');
+      } else {
+        setCustomerName('');
+        setCustomerPhone('');
+      }
+      if (suspended && !sendInFlightRef.current) suspendedDraftRef.current = null;
+      setCustomerMatch(null);
+      setCustomerSearched(false);
+      orderLoadedTableIdRef.current = tableId;
+      setOrderLoadedTableId(tableId);
+    } catch (error) {
+      if (
+        !options?.allowWhileSending &&
+        !sendInFlightRef.current &&
+        loadSeq === orderLoadSeqRef.current &&
+        selectedTableIdRef.current === tableId
+      ) {
+        setCurrentOrder(null);
+        orderLoadedTableIdRef.current = '';
+        setOrderLoadedTableId('');
+        orderLookupFailedRef.current = true;
+      }
+      throw error;
+    }
   }
 
   useEffect(() => {
     if (!api) return;
     let cancelled = false;
-    api.get<ServerAppInfo>('/api/server-app/info')
+    api
+      .get<ServerAppInfo>('/api/server-app/info')
       .then((infoResponse) => {
         if (!cancelled) setRegional(infoResponse.data);
         return api.get('/api/auth/me');
@@ -173,51 +434,241 @@ export default function ServerStandalonePage() {
       .finally(() => {
         if (!cancelled) setLoading(false);
       });
-    return () => { cancelled = true; };
+    return () => {
+      cancelled = true;
+    };
   }, [api]);
 
+  const userId = user?.id;
+
   useEffect(() => {
-    if (!user || !api) return;
+    activeUserIdRef.current = userId ?? null;
+  }, [userId]);
+
+  useEffect(() => {
+    if (!api || user || disabled || loading) return;
+    let cancelled = false;
+    api
+      .get('/api/auth/pin-users')
+      .then((res) => {
+        if (!cancelled && Array.isArray(res.data?.users)) {
+          setPinUsers(res.data.users);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) setPinUsers([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [api, user, disabled, loading]);
+
+  useEffect(() => {
+    if (!api || !userId) return;
+    let cancelled = false;
+    const session = authSessionSeqRef.current;
+    const token = localStorage.getItem(TOKEN_KEY);
+    const refresh = () => {
+      api
+        .get('/api/settings/auto_lock_minutes')
+        .then((response) => {
+          if (
+            cancelled ||
+            session !== authSessionSeqRef.current ||
+            token !== localStorage.getItem(TOKEN_KEY)
+          )
+            return;
+          const minutes = Number(response.data?.setting?.value);
+          if ([0, 1, 5, 15, 30].includes(minutes)) setAutoLockMinutes(minutes);
+        })
+        .catch(() => {});
+    };
+    lastActivityRef.current = Date.now();
+    refresh();
+    window.addEventListener('focus', refresh);
+    return () => {
+      cancelled = true;
+      window.removeEventListener('focus', refresh);
+    };
+  }, [api, userId]);
+
+  useEffect(() => {
+    if (!api || !userId || autoLockMinutes <= 0) return;
+    const timeout = autoLockMinutes * 60_000;
+    let timer: ReturnType<typeof setTimeout>;
+    let locked = false;
+    const lock = () => {
+      if (locked) return;
+      locked = true;
+      const token = localStorage.getItem(TOKEN_KEY);
+      suspendedDraftRef.current = {
+        ...liveDraftRef.current,
+        ownerId: userId,
+        attempt: sendAttemptRef.current,
+      };
+      authSessionSeqRef.current += 1;
+      orderLoadSeqRef.current += 1;
+      sendSeqRef.current += 1;
+      cancelPendingCustomerLookup();
+      localStorage.removeItem(TOKEN_KEY);
+      sendAttemptRef.current = null;
+      selectedTableIdRef.current = '';
+      orderLoadedTableIdRef.current = '';
+      activeUserIdRef.current = null;
+      setUser(null);
+      setEmail('');
+      setPassword('');
+      setDraft([]);
+      setOrderNotes('');
+      setCustomerName('');
+      setCustomerPhone('');
+      setCustomerMatch(null);
+      setCustomerSearched(false);
+      setSelectedTableId('');
+      setOrderLoadedTableId('');
+      setCurrentOrder(null);
+      setAddonModalProduct(null);
+      setEditingDraftLine(null);
+      setMoveTableModalOpen(false);
+      setMobileCartOpen(false);
+      setAutoLockMinutes(0);
+      if (token)
+        void api
+          .post('/api/auth/logout', {}, { headers: { Authorization: `Bearer ${token}` } })
+          .catch(() => {});
+    };
+    const check = () => {
+      const remaining = timeout - (Date.now() - lastActivityRef.current);
+      if (remaining <= 0) lock();
+      else timer = setTimeout(check, remaining);
+    };
+    const activity = () => {
+      lastActivityRef.current = Date.now();
+      clearTimeout(timer);
+      timer = setTimeout(check, timeout);
+    };
+    const visible = () => {
+      if (document.visibilityState === 'visible') {
+        clearTimeout(timer);
+        check();
+      }
+    };
+    const events = ['pointerdown', 'keydown', 'touchstart', 'wheel', 'mousemove'] as const;
+    events.forEach((event) => window.addEventListener(event, activity, { passive: true }));
+    document.addEventListener('visibilitychange', visible);
+    check();
+    return () => {
+      clearTimeout(timer);
+      events.forEach((event) => window.removeEventListener(event, activity));
+      document.removeEventListener('visibilitychange', visible);
+    };
+  }, [api, userId, autoLockMinutes]);
+
+  useEffect(() => {
+    if (!userId || !api) return;
     let cancelled = false;
     Promise.all([
       api.get('/api/categories', { params: { active: 'true' } }),
       api.get('/api/products', { params: { active: 'true' } }),
       api.get('/api/tables', { params: { active: 'true' } }),
-    ]).then(([categoriesRes, productsRes, tablesRes]) => {
-      if (cancelled) return;
-      setCategories(categoriesRes.data.categories || []);
-      setProducts(productsRes.data.products || []);
-      const loadedTables = tablesRes.data.tables || [];
-      setTables(loadedTables);
-      if (!selectedTableId && loadedTables[0]) setSelectedTableId(loadedTables[0].id);
-    }).catch(() => toast.error(t('couldNotLoadData')));
-    return () => { cancelled = true; };
-  }, [api, selectedTableId, user, t]);
+    ])
+      .then(([categoriesRes, productsRes, tablesRes]) => {
+        if (cancelled || sendInFlightRef.current) return;
+        setCategories(categoriesRes.data.categories || []);
+        setProducts(productsRes.data.products || []);
+        const loadedTables = tablesRes.data.tables || [];
+        setTables(loadedTables);
+        setTablesLoaded(true);
+        if (!selectedTableIdRef.current && loadedTables[0]) {
+          selectedTableIdRef.current = loadedTables[0].id;
+          setSelectedTableId(loadedTables[0].id);
+        }
+      })
+      .catch(() => toast.error(t('couldNotLoadData')));
+    return () => {
+      cancelled = true;
+    };
+  }, [api, selectedTableId, userId, t]);
 
   useEffect(() => {
-    if (!selectedTableId || !user || !api) return;
+    if (!selectedTableId || !userId || !api) return;
     let cancelled = false;
+    const loadSeq = ++orderLoadSeqRef.current;
+    const targetTableId = selectedTableId;
+    orderLookupFailedRef.current = false;
+    orderLoadedTableIdRef.current = '';
     cancelPendingCustomerLookup();
-    api.get('/api/orders', {
-      params: { table_id: selectedTableId, type: 'dine_in', status: 'pending,preparing,ready', per_page: 1 },
-    }).then((res) => {
-      if (cancelled) return;
-      const order = res.data.orders?.[0] || null;
-      setCurrentOrder(order);
-      if (order?.customer) {
-        setCustomerName(order.customer.name || '');
-        setCustomerPhone(order.customer.phone || '');
-      } else {
-        setCustomerName('');
-        setCustomerPhone('');
-      }
-      setCustomerMatch(null);
-      setCustomerSearched(false);
-    }).catch(() => {
-      if (!cancelled) setCurrentOrder(null);
-    });
-    return () => { cancelled = true; };
-  }, [api, selectedTableId, user]);
+    api
+      .get('/api/orders', {
+        params: {
+          table_id: targetTableId,
+          type: 'dine_in',
+          status: 'pending,preparing,ready,served',
+          per_page: 1,
+        },
+      })
+      .then((res) => {
+        if (
+          cancelled ||
+          sendInFlightRef.current ||
+          loadSeq !== orderLoadSeqRef.current ||
+          selectedTableIdRef.current !== targetTableId
+        ) {
+          return;
+        }
+        const order = res.data.orders?.[0] || null;
+        setCurrentOrder(order);
+        const suspended = suspendedDraftRef.current;
+        const pendingAttempt =
+          sendAttemptRef.current?.snapshot.tableId === targetTableId
+            ? sendAttemptRef.current.snapshot
+            : suspended?.ownerId === activeUserIdRef.current && suspended.tableId === targetTableId
+              ? suspended
+              : null;
+        if (pendingAttempt) {
+          setCustomerName(pendingAttempt.customerName);
+          setCustomerPhone(pendingAttempt.customerPhone);
+        } else if (order?.customer) {
+          setCustomerName(order.customer.name || '');
+          setCustomerPhone(order.customer.phone || '');
+        } else {
+          setCustomerName('');
+          setCustomerPhone('');
+        }
+        if (suspended && !sendInFlightRef.current) suspendedDraftRef.current = null;
+        setCustomerMatch(null);
+        setCustomerSearched(false);
+        orderLoadedTableIdRef.current = targetTableId;
+        setOrderLoadedTableId(targetTableId);
+      })
+      .catch(() => {
+        if (
+          !cancelled &&
+          !sendInFlightRef.current &&
+          loadSeq === orderLoadSeqRef.current &&
+          selectedTableIdRef.current === targetTableId
+        ) {
+          setCurrentOrder(null);
+          orderLoadedTableIdRef.current = '';
+          setOrderLoadedTableId('');
+          orderLookupFailedRef.current = true;
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [api, selectedTableId, userId]);
+
+  useEffect(() => {
+    if (!userId || !api) return;
+    const onFocus = () => {
+      loadUser().catch(() => {});
+    };
+    window.addEventListener('focus', onFocus);
+    return () => {
+      window.removeEventListener('focus', onFocus);
+    };
+  }, [api, loadUser, userId]);
 
   useEffect(() => {
     return () => {
@@ -227,6 +678,7 @@ export default function ServerStandalonePage() {
   }, []);
 
   function searchCustomerByPhone(rawPhone: string) {
+    if (sendInFlightRef.current) return;
     clearTimeout(phoneDebounceRef.current);
     phoneAbortRef.current?.abort();
     const digits = rawPhone.replace(/\D/g, '');
@@ -236,13 +688,17 @@ export default function ServerStandalonePage() {
       return;
     }
     phoneDebounceRef.current = setTimeout(async () => {
-      if (!api) return;
+      if (!api || sendInFlightRef.current) return;
       const controller = new AbortController();
       phoneAbortRef.current = controller;
       try {
         const parsed = regional?.country ? parsePhone(rawPhone, regional.country) : null;
         const lookupPhone = parsed ? parsed.e164 : rawPhone;
-        const { data } = await api.get('/api/crm/lookup', { params: { phone: lookupPhone }, signal: controller.signal });
+        const { data } = await api.get('/api/crm/lookup', {
+          params: { phone: lookupPhone },
+          signal: controller.signal,
+        });
+        if (controller.signal.aborted || sendInFlightRef.current) return;
         if (data.found && data.customer) {
           setCustomerMatch({ id: data.customer.id, name: data.customer.name });
           setCustomerName(data.customer.name || '');
@@ -251,7 +707,7 @@ export default function ServerStandalonePage() {
         }
         setCustomerSearched(true);
       } catch {
-        if (controller.signal.aborted) return;
+        if (controller.signal.aborted || sendInFlightRef.current) return;
         setCustomerMatch(null);
         setCustomerSearched(true);
       }
@@ -259,6 +715,7 @@ export default function ServerStandalonePage() {
   }
 
   function handleCustomerPhoneChange(value: string) {
+    if (sendInFlightRef.current) return;
     setCustomerPhone(value);
     setCustomerMatch(null);
     setCustomerSearched(false);
@@ -266,14 +723,109 @@ export default function ServerStandalonePage() {
     searchCustomerByPhone(value);
   }
 
+  function handleCustomerNameChange(value: string) {
+    if (sendInFlightRef.current || customerMatch) return;
+    setCustomerName(value);
+  }
+
+  function handleOrderNotesChange(value: string) {
+    if (sendInFlightRef.current) return;
+    setOrderNotes(value.slice(0, 200));
+  }
+
+  function selectTable(tableId: string) {
+    if (sendInFlightRef.current) return;
+    if (tableId === selectedTableIdRef.current) {
+      if (orderLookupFailedRef.current) {
+        loadOrder(tableId).catch(() => toast.error(t('couldNotLoadData')));
+      }
+      return;
+    }
+    selectedTableIdRef.current = tableId;
+    setMoveTableModalOpen(false);
+    orderLookupFailedRef.current = false;
+    orderLoadedTableIdRef.current = '';
+    setOrderLoadedTableId('');
+    orderLoadSeqRef.current += 1;
+    cancelPendingCustomerLookup();
+    setCurrentOrder(null);
+    const pendingAttempt =
+      sendAttemptRef.current?.snapshot.tableId === tableId ? sendAttemptRef.current.snapshot : null;
+    setCustomerName(pendingAttempt?.customerName ?? '');
+    setCustomerPhone(pendingAttempt?.customerPhone ?? '');
+    setCustomerMatch(null);
+    setCustomerSearched(false);
+    setSelectedTableId(tableId);
+  }
+
+  function handleRefresh() {
+    if (sendInFlightRef.current) return;
+    const tableId = selectedTableIdRef.current;
+    Promise.all([loadUser(), loadAll(), tableId ? loadOrder(tableId) : Promise.resolve()]).catch(
+      () => toast.error(t('refreshFailed')),
+    );
+  }
+
+  function openAddonModal(
+    product: Product,
+    quantity: number,
+    variant: ProductVariant | null = null,
+  ) {
+    if (sendInFlightRef.current) return;
+    addonModalSendSeqRef.current = sendSeqRef.current;
+    setAddonModalQuantity(quantity);
+    setAddonModalVariant(variant);
+    setAddonModalProduct(product);
+  }
+
+  function openEditDraftModal(line: DraftLine) {
+    if (sendInFlightRef.current) return;
+    editingDraftSendSeqRef.current = sendSeqRef.current;
+    setEditingDraftLine(line);
+  }
+
+  function applyAuthenticatedSession(accessToken: string, loggedInUser: User) {
+    authSessionSeqRef.current += 1;
+    localStorage.setItem(TOKEN_KEY, accessToken);
+    const suspended = suspendedDraftRef.current;
+    if (suspended && suspended.ownerId === loggedInUser.id) {
+      selectedTableIdRef.current = suspended.tableId;
+      setSelectedTableId(suspended.tableId);
+      setDraft(suspended.draft);
+      setCustomerName(suspended.customerName);
+      setCustomerPhone(suspended.customerPhone);
+      setOrderNotes(suspended.orderNotes);
+      sendAttemptRef.current = suspended.attempt;
+    } else if (suspended) {
+      const hadDraft =
+        suspended.draft.length > 0 ||
+        Boolean(suspended.attempt) ||
+        Boolean(suspended.orderNotes.trim()) ||
+        Boolean(suspended.customerName.trim()) ||
+        Boolean(suspended.customerPhone.trim());
+      suspendedDraftRef.current = null;
+      if (hadDraft) {
+        toast(t('draftDiscardedOnUserChange'));
+      }
+    }
+    setSelectedPinUser(null);
+    setPin('');
+    setPinError('');
+    activeUserIdRef.current = loggedInUser.id;
+    setUser(loggedInUser);
+  }
+
   async function handleLogin(event: FormEvent) {
     event.preventDefault();
     if (!api) return;
     setLoginLoading(true);
     try {
-      const res = await api.post('/api/auth/login', { email, password, remember_me: rememberMe });
-      localStorage.setItem(TOKEN_KEY, res.data.access_token);
-      setUser(res.data.user);
+      const res = await api.post('/api/auth/login', {
+        email,
+        password,
+        remember_me: rememberMe,
+      });
+      applyAuthenticatedSession(res.data.access_token, res.data.user);
     } catch (error: unknown) {
       toastApiError(error, t('signInFailed'), apiErrorT);
     } finally {
@@ -281,31 +833,131 @@ export default function ServerStandalonePage() {
     }
   }
 
+  function appendPinDigit(digit: string) {
+    setPinError('');
+    setPin((prev) => (prev.length < 6 ? prev + digit : prev));
+  }
+
+  function backspacePin() {
+    setPinError('');
+    setPin((prev) => prev.slice(0, -1));
+  }
+
+  function clearPin() {
+    setPinError('');
+    setPin('');
+  }
+
+  async function handlePinLogin(event?: FormEvent) {
+    event?.preventDefault();
+    if (!api || !selectedPinUser || pin.length < 4 || loginLoading) return;
+    setPinError('');
+    setLoginLoading(true);
+    try {
+      const res = await api.post('/api/auth/pin-login', {
+        user_id: selectedPinUser.id,
+        pin,
+        remember_me: rememberMe,
+      });
+      applyAuthenticatedSession(res.data.access_token, res.data.user);
+    } catch (error: unknown) {
+      const failure = parseLoginFailure(error);
+      let msg = failure.message || t('signInFailed');
+      if (failure.status === 401) {
+        const remaining = failure.attemptsRemaining;
+        if (remaining === 0) {
+          msg = tAuth('lockedOut', { minutes: failure.lockoutMinutes ?? 15 });
+        } else if (typeof remaining === 'number' && remaining < 4) {
+          msg = `${tAuth('invalidCredentials')} ${tAuth('attemptsRemaining', { count: remaining })}`;
+        } else {
+          msg = tAuth('invalidCredentials');
+        }
+      } else if (failure.status === 429) {
+        msg = tAuth('lockedOut', { minutes: failure.lockoutMinutes ?? 15 });
+      } else if (failure.status === undefined) {
+        msg = tAuth('connectionFailed');
+      }
+      setPinError(msg);
+      setPin('');
+    } finally {
+      setLoginLoading(false);
+    }
+  }
+
   async function logout() {
-    try { await api?.post('/api/auth/logout'); } catch {}
+    authSessionSeqRef.current += 1;
+    try {
+      await api?.post('/api/auth/logout');
+    } catch {}
     localStorage.removeItem(TOKEN_KEY);
     setUser(null);
   }
 
-  function addDraftLine(product: Product, quantity: number, addons: Addon[], specialInstructions: string) {
+  function addDraftLine(
+    product: Product,
+    quantity: number,
+    addons: Addon[],
+    specialInstructions: string,
+    variant: ProductVariant | null = null,
+  ) {
+    if (sendInFlightRef.current) return;
     setDraft((lines) => {
-      const lineId = generateCartItemId(product.id, addons, specialInstructions);
+      const lineId = generateCartItemId(
+        product.id,
+        variant?.id ?? null,
+        addons,
+        specialInstructions,
+      );
       const existing = lines.find((line) => line.id === lineId);
       if (existing) {
-        return lines.map((line) => line.id === lineId ? { ...line, quantity: line.quantity + quantity } : line);
+        return lines.map((line) =>
+          line.id === lineId ? { ...line, quantity: line.quantity + quantity } : line,
+        );
       }
-      return [...lines, { id: lineId, product, quantity, addons, special_instructions: specialInstructions }];
+      return [
+        ...lines,
+        {
+          id: lineId,
+          product,
+          quantity,
+          addons,
+          special_instructions: specialInstructions,
+          variant,
+        },
+      ];
     });
   }
 
-  function updateDraftLine(lineId: string, quantity: number, addons: Addon[], specialInstructions: string) {
+  function updateDraftLine(
+    lineId: string,
+    quantity: number,
+    addons: Addon[],
+    specialInstructions: string,
+    variant: ProductVariant | null = null,
+  ) {
+    if (sendInFlightRef.current) return;
     setDraft((lines) => {
       const target = lines.find((line) => line.id === lineId);
       if (!target) return lines;
 
-      const newId = generateCartItemId(target.product.id, addons, specialInstructions);
+      const newId = generateCartItemId(
+        target.product.id,
+        (variant ?? target.variant)?.id ?? null,
+        addons,
+        specialInstructions,
+      );
       if (newId === lineId) {
-        return lines.map((line) => line.id === lineId ? { ...line, quantity, addons, special_instructions: specialInstructions } : line);
+        return lines.map((line) =>
+          line.id === lineId
+            ? {
+                ...line,
+                quantity,
+                addons,
+                special_instructions: specialInstructions,
+                variant: variant ?? target.variant ?? null,
+              }
+            : line,
+        );
       }
 
       // The edit produced a config that matches another existing line — merge into it.
@@ -313,163 +965,299 @@ export default function ServerStandalonePage() {
       if (collision) {
         return lines
           .filter((line) => line.id !== lineId)
-          .map((line) => line.id === newId ? { ...line, quantity: line.quantity + quantity } : line);
+          .map((line) =>
+            line.id === newId ? { ...line, quantity: line.quantity + quantity } : line,
+          );
       }
-      return lines.map((line) => line.id === lineId ? { ...line, id: newId, quantity, addons, special_instructions: specialInstructions } : line);
+      return lines.map((line) =>
+        line.id === lineId
+          ? {
+              ...line,
+              id: newId,
+              quantity,
+              addons,
+              special_instructions: specialInstructions,
+              variant: variant ?? target.variant ?? null,
+            }
+          : line,
+      );
     });
   }
 
   function removeDraftLine(lineId: string) {
+    if (sendInFlightRef.current) return;
     setDraft((lines) => lines.filter((line) => line.id !== lineId));
   }
 
   function changeQty(lineId: string, delta: number) {
-    setDraft((lines) => lines
-      .map((line) => line.id === lineId ? { ...line, quantity: line.quantity + delta } : line)
-      .filter((line) => line.quantity > 0));
+    if (sendInFlightRef.current) return;
+    setDraft((lines) =>
+      lines
+        .map((line) => (line.id === lineId ? { ...line, quantity: line.quantity + delta } : line))
+        .filter((line) => line.quantity > 0),
+    );
   }
 
-  async function ensureCustomer(): Promise<string | null> {
+  async function ensureCustomer(
+    submittedName: string,
+    submittedPhone: string,
+    token: string,
+    isCurrent: () => boolean,
+  ): Promise<string | null> {
     if (!api) return null;
-    const name = customerName.trim();
-    const rawPhone = customerPhone.trim();
+    const name = submittedName.trim();
+    const rawPhone = submittedPhone.trim();
     if (!name && !rawPhone) return null;
     let normalizedPhone: string | undefined = undefined;
     if (rawPhone) {
       const parsed = regional?.country ? parsePhone(rawPhone, regional.country) : null;
       normalizedPhone = parsed ? parsed.e164 : rawPhone;
       try {
-        const lookup = await api.get('/api/crm/lookup', { params: { phone: normalizedPhone } });
+        const lookup = await api.get('/api/crm/lookup', {
+          params: { phone: normalizedPhone },
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        if (!isCurrent()) throw new Error('Session changed');
         if (lookup.data.found && lookup.data.customer?.id) return lookup.data.customer.id;
-      } catch {}
+      } catch {
+        if (!isCurrent()) throw new Error('Session changed');
+      }
     }
+    if (!isCurrent()) throw new Error('Session changed');
     const fallbackName = name || t('guestFallbackName', { last4: rawPhone.slice(-4) });
-    const res = await api.post('/api/customers', { name: fallbackName, phone: normalizedPhone || undefined });
+    const res = await api.post(
+      '/api/customers',
+      {
+        name: fallbackName,
+        phone: normalizedPhone || undefined,
+      },
+      { headers: { Authorization: `Bearer ${token}` } },
+    );
+    if (!isCurrent()) throw new Error('Session changed');
     return res.data.customer?.id || null;
   }
 
-  // Falls back to this device's browser print dialog when no hardware printer is configured (400).
-  async function printKotForOrder(orderId: number, orderForPrint: Record<string, unknown>) {
-    if (!api) return;
+  // Stays quiet on 400 (no hardware printer configured) so tableside devices never open window.print().
+  async function printKotForOrder(
+    orderId: number,
+    orderForPrint: Record<string, unknown>,
+    token: string,
+    isCurrent: () => boolean,
+  ) {
+    if (!api || !isCurrent()) return;
     try {
-      await api.post('/api/printers/print-kot', { orderId, items: orderForPrint.items });
-      return;
+      await api.post(
+        '/api/printers/print-kot',
+        {
+          orderId,
+          items: orderForPrint.items,
+        },
+        { headers: { Authorization: `Bearer ${token}` } },
+      );
     } catch (printError: unknown) {
+      if (!isCurrent()) return;
       const status = axios.isAxiosError(printError) ? printError.response?.status : undefined;
-      if (status !== 400) {
-        toastApiError(printError, t('kotPrintFailed'), apiErrorT);
-        return;
-      }
-    }
-    try {
-      const { generateKotHtml, resolveKotTicketLanguage } = await import('@/lib/printer/kot-web-print');
-      const html = generateKotHtml(orderForPrint as unknown as FullOrder, {
-        paperWidth: 80,
-        language: resolveKotTicketLanguage(),
-        stationName: t('kitchen'),
-      });
-      await printerService.printViaBrowser(html, 80);
-    } catch (fallbackError: unknown) {
-      toastApiError(fallbackError, t('kotPrintFailed'), apiErrorT);
+      const errorCode = axios.isAxiosError(printError)
+        ? (printError.response?.data as { code?: unknown } | undefined)?.code
+        : undefined;
+      if (status === 400 || (status === 403 && errorCode === 'KOT_PRINTING_DISABLED')) return;
+      toastApiError(printError, t('kotPrintFailed'), apiErrorT);
     }
   }
 
-  // Same browser-print fallback as KOT above on 400; stays quiet on 403 (owner hasn't enabled server bill printing).
-  async function printOrderSlip(orderId: number, orderForPrint: Record<string, unknown>) {
-    if (!api) return;
+  // Stays quiet on 400 (no hardware printer configured) and 403 (owner hasn't enabled server bill printing).
+  async function printOrderSlip(
+    orderId: number,
+    _orderForPrint: Record<string, unknown>,
+    token: string,
+    isCurrent: () => boolean,
+  ) {
+    if (!api || !isCurrent()) return;
     try {
-      await api.post('/api/printers/print-bill', { orderId });
-      return;
+      await api.post(
+        '/api/printers/print-bill',
+        { orderId },
+        { headers: { Authorization: `Bearer ${token}` } },
+      );
     } catch (printError: unknown) {
+      if (!isCurrent()) return;
       const status = axios.isAxiosError(printError) ? printError.response?.status : undefined;
-      if (status === 403) return;
-      if (status !== 400) {
-        toastApiError(printError, t('billPrintFailed'), apiErrorT);
-        return;
-      }
-    }
-    try {
-      const { generateOrderSlipHtml } = await import('@/lib/printer/order-slip-web-print');
-      const html = generateOrderSlipHtml(orderForPrint as unknown as FullOrder, {
-        title: t('orderSlipTitle'),
-        subtotal: t('orderSlipSubtotal'),
-        discount: t('orderSlipDiscount'),
-        serviceCharge: t('orderSlipServiceCharge'),
-        deliveryCharge: t('orderSlipDeliveryCharge'),
-        packagingCharge: t('orderSlipPackagingCharge'),
-        tax: t('orderSlipTax'),
-        total: t('orderSlipTotal'),
-      }, { paperWidth: 80, country: regional?.country, currency: regional?.currency });
-      await printerService.printViaBrowser(html, 80);
-    } catch (fallbackError: unknown) {
-      toastApiError(fallbackError, t('billPrintFailed'), apiErrorT);
+      const errorCode = axios.isAxiosError(printError)
+        ? (printError.response?.data as { code?: unknown } | undefined)?.code
+        : undefined;
+      if (status === 400 || (status === 403 && errorCode === 'BILL_PRINTING_DISABLED')) return;
+      toastApiError(printError, t('billPrintFailed'), apiErrorT);
     }
   }
 
   async function sendDraft() {
-    if (!api || !selectedTableId || draft.length === 0 || sendInFlightRef.current) return;
+    if (
+      !api ||
+      !selectedTableId ||
+      orderLoadedTableIdRef.current !== selectedTableId ||
+      draft.length === 0 ||
+      sendInFlightRef.current
+    ) {
+      return;
+    }
+    const requestToken = localStorage.getItem(TOKEN_KEY);
+    const requestSession = authSessionSeqRef.current;
+    const requestOwner = user?.id;
+    if (!requestToken || !requestOwner) return;
+    const isCurrent = () =>
+      authSessionSeqRef.current === requestSession &&
+      localStorage.getItem(TOKEN_KEY) === requestToken;
+    const snapshotTable = tables.find((table) => table.id === selectedTableId) || null;
+    const candidateSnapshot: SendSnapshot = {
+      tableId: selectedTableId,
+      tableName: snapshotTable ? snapshotTable.name || snapshotTable.number : undefined,
+      orderId: currentOrder?.id ?? null,
+      orderCustomer: currentOrder?.customer ?? null,
+      existingItemIds: new Set((currentOrder?.items || []).map((item) => item.id)),
+      draftLines: draft.map((line) => ({
+        ...line,
+        addons: line.addons.map((addon) => ({ ...addon })),
+      })),
+      customerName: customerName.trim(),
+      customerPhone: customerPhone.trim(),
+      orderNotes,
+    };
     // Nonce first via the LAN-safe helper: anything thrown after the
     // sending flag is set sticks the UI on Sending... forever.
-    const signature = sendAttemptSignature(selectedTableId, draft, customerName, customerPhone);
+    const signature = sendAttemptSignature(
+      candidateSnapshot.tableId,
+      candidateSnapshot.draftLines,
+      candidateSnapshot.customerName,
+      candidateSnapshot.customerPhone,
+      candidateSnapshot.orderNotes,
+    );
     if (sendAttemptRef.current?.signature !== signature) {
-      sendAttemptRef.current = { signature, nonce: createPaymentIdempotencyKey() };
+      sendAttemptRef.current = {
+        signature,
+        nonce: createPaymentIdempotencyKey(),
+        snapshot: candidateSnapshot,
+      };
     }
-    const idempotencyKey = `server-app-${selectedTableId}-${sendAttemptRef.current.nonce}`;
+    const { nonce, snapshot } = sendAttemptRef.current;
+    const requestTableId = snapshot.requestTableId ?? snapshot.tableId;
+    const idempotencyKey = `server-app-${requestTableId}-${nonce}`;
+    sendSeqRef.current += 1;
+    orderLoadSeqRef.current += 1;
+    cancelPendingCustomerLookup();
     sendInFlightRef.current = true;
     setSending(true);
     try {
-      const customerId = await ensureCustomer();
-      const items = draft.map((line) => ({
-        product_id: line.product.id,
-        quantity: line.quantity,
-        addons: line.addons.length > 0
-          ? line.addons.map((addon) => ({ id: addon.id, name: addon.name, price: addon.price, quantity: addon.quantity || 1 }))
-          : null,
-        special_instructions: line.special_instructions.trim() || undefined,
-      }));
+      const customerId = await ensureCustomer(
+        snapshot.customerName,
+        snapshot.customerPhone,
+        requestToken,
+        isCurrent,
+      );
+      if (!isCurrent()) return;
+      const items = snapshot.draftLines.map((line) => cartItemToOrderItem(line));
+      const specialInstructions = snapshot.orderNotes.trim() || undefined;
       let orderId: number;
       let rawOrder: Record<string, unknown>;
       let newItems: OrderItem[];
-      if (currentOrder?.id) {
-        const { data } = await api.post(`/api/orders/${currentOrder.id}/items`, { items }, {
-          headers: { 'Idempotency-Key': idempotencyKey },
-        });
+      if (snapshot.orderId) {
+        const { data } = await api.post(
+          `/api/orders/${snapshot.orderId}/items`,
+          { items, special_instructions: specialInstructions },
+          {
+            headers: { 'Idempotency-Key': idempotencyKey, Authorization: `Bearer ${requestToken}` },
+          },
+        );
         orderId = data.order.id;
         rawOrder = data.order;
         // Print only what this call added — omitting items reprints every pending item on the order.
-        const existingIds = new Set((currentOrder.items || []).map((item) => item.id));
-        newItems = (data.order.items || []).filter((item: OrderItem) => !existingIds.has(item.id));
+        newItems =
+          Array.isArray(data.added_items) && data.added_items.length > 0
+            ? data.added_items
+            : (data.order.items || []).filter(
+                (item: OrderItem) => !snapshot.existingItemIds.has(item.id),
+              );
       } else {
-        const { data } = await api.post('/api/orders', {
-          table_id: selectedTableId,
-          customer_id: customerId,
-          type: 'dine_in',
-          items,
-        }, { headers: { 'Idempotency-Key': idempotencyKey } });
+        const { data } = await api.post(
+          '/api/orders',
+          {
+            table_id: requestTableId,
+            customer_id: customerId,
+            type: 'dine_in',
+            special_instructions: specialInstructions,
+            items,
+          },
+          { headers: { 'Idempotency-Key': idempotencyKey } },
+        );
         orderId = data.order.id;
         rawOrder = data.order;
         newItems = data.order.items || [];
       }
-      sendAttemptRef.current = null;
-      setDraft([]);
+      if (!isCurrent()) {
+        const suspended = suspendedDraftRef.current;
+        if (suspended?.ownerId === requestOwner && suspended.attempt?.nonce === nonce) {
+          const submitted = new Map(snapshot.draftLines.map((line) => [line.id, line.quantity]));
+          const remaining = suspended.draft.flatMap((line) => {
+            const count = submitted.get(line.id);
+            if (count === undefined) return [line];
+            return line.quantity > count ? [{ ...line, quantity: line.quantity - count }] : [];
+          });
+          suspended.draft = remaining;
+          if (suspended.orderNotes === snapshot.orderNotes) suspended.orderNotes = '';
+          suspended.attempt = null;
+          if (activeUserIdRef.current === requestOwner) {
+            setDraft(remaining);
+            setOrderNotes(suspended.orderNotes);
+            if (sendAttemptRef.current?.nonce === nonce) sendAttemptRef.current = null;
+          }
+        }
+        return;
+      }
+      if (sendAttemptRef.current?.signature === signature) {
+        sendAttemptRef.current = null;
+      }
+      const submittedQtyById = new Map(snapshot.draftLines.map((line) => [line.id, line.quantity]));
+      setDraft((currentLines) =>
+        currentLines.flatMap((line) => {
+          const ackedQty = submittedQtyById.get(line.id);
+          if (ackedQty === undefined) return [line];
+          const remainingQuantity = line.quantity - ackedQty;
+          return remainingQuantity > 0 ? [{ ...line, quantity: remainingQuantity }] : [];
+        }),
+      );
+      setOrderNotes((currentNotes) => (currentNotes === snapshot.orderNotes ? '' : currentNotes));
+      if (selectedTableIdRef.current === snapshot.tableId) {
+        setCurrentOrder(rawOrder as unknown as Order);
+        orderLoadedTableIdRef.current = snapshot.tableId;
+        setOrderLoadedTableId(snapshot.tableId);
+      }
       setMobileCartOpen(false);
-      await Promise.all([loadAll(), loadOrder(selectedTableId)]);
+      await Promise.all([
+        loadAll({ allowWhileSending: true }),
+        loadOrder(snapshot.tableId, { allowWhileSending: true }),
+      ]).catch(() => {});
+      if (!isCurrent()) return;
       toast.success(t('orderSent'));
       // rawOrder only has table_id/customer_id; the KOT/slip renderers need the nested table/customer for display.
-      const trimmedCustomerName = customerName.trim();
       const enrichedOrder = {
         ...rawOrder,
-        table: activeTable ? { name: activeTable.name || activeTable.number } : undefined,
-        customer: currentOrder?.customer || (trimmedCustomerName ? { name: trimmedCustomerName } : undefined),
+        table: snapshot.tableName ? { name: snapshot.tableName } : undefined,
+        customer:
+          snapshot.orderCustomer ||
+          (snapshot.customerName ? { name: snapshot.customerName } : undefined),
       };
       // Backgrounded so an unreachable printer can't block Send; sequenced (not concurrent)
       // since KOT and bill can share a default printer and race its socket connection.
       void (async () => {
-        await printKotForOrder(orderId, { ...enrichedOrder, items: newItems });
-        await printOrderSlip(orderId, enrichedOrder);
+        await printKotForOrder(
+          orderId,
+          { ...enrichedOrder, items: newItems },
+          requestToken,
+          isCurrent,
+        );
+        if (isCurrent()) await printOrderSlip(orderId, enrichedOrder, requestToken, isCurrent);
       })();
     } catch (error: unknown) {
-      toastApiError(error, t('couldNotSendOrder'), apiErrorT);
+      if (isCurrent()) toastApiError(error, t('couldNotSendOrder'), apiErrorT);
     } finally {
       sendInFlightRef.current = false;
       setSending(false);
@@ -477,14 +1265,15 @@ export default function ServerStandalonePage() {
   }
 
   const activeTable = tables.find((table) => table.id === selectedTableId) || null;
-  const filteredProducts = products.filter((product) => {
-    const matchesCategory = selectedCategoryId === 'all' || product.category_id === selectedCategoryId;
-    const matchesQuery = !query || product.name.toLowerCase().includes(query.toLowerCase());
-    return matchesCategory && matchesQuery;
-  });
+  const canMoveTable = tenantCan(user as unknown as Tenant, 'tables.orders.move');
   const draftTotal = draft.reduce((sum, line) => {
-    const addonTotal = line.addons.reduce((addonSum, addon) => addonSum + Number(addon.price || 0) * (addon.quantity || 1), 0);
-    return sum + (Number(line.product.price || 0) + addonTotal) * line.quantity;
+    const addonTotal = line.addons.reduce(
+      (addonSum, addon) => addonSum + Number(addon.price || 0) * (addon.quantity || 1),
+      0,
+    );
+    return (
+      sum + ((Number(line.variant?.price ?? line.product.price) || 0) + addonTotal) * line.quantity
+    );
   }, 0);
   const draftQuantities = useMemo(() => {
     const quantities = new Map<string, number>();
@@ -496,7 +1285,11 @@ export default function ServerStandalonePage() {
   const draftItemCount = draft.reduce((sum, line) => sum + line.quantity, 0);
 
   if (loading) {
-    return <div className="flex h-screen items-center justify-center bg-background"><div className="h-10 w-10 animate-spin rounded-full border-4 border-brand border-t-transparent" /></div>;
+    return (
+      <div className="flex h-screen items-center justify-center bg-background">
+        <div className="h-10 w-10 animate-spin rounded-full border-4 border-brand border-t-transparent" />
+      </div>
+    );
   }
 
   if (disabled) {
@@ -510,58 +1303,342 @@ export default function ServerStandalonePage() {
   }
 
   if (!user) {
+    const activeSignInMode =
+      pinUsers.length > 0 && (signInMode ?? 'pin') === 'pin' && !email && !password
+        ? 'pin'
+        : 'password';
     return (
       <div className="flex min-h-screen items-center justify-center bg-background p-4">
-        <form onSubmit={handleLogin} className="w-full max-w-sm rounded-xl border border-border bg-card p-6 shadow-sm">
+        <div className="w-full max-w-sm rounded-xl border border-border bg-card p-6 shadow-sm">
           <div className="mb-6 text-center">
             <UserRound size={42} className="mx-auto mb-3 text-brand" />
             <h1 className="text-2xl font-bold text-foreground">{t('title')}</h1>
             <p className="mt-1 text-sm text-muted-foreground">{t('loginSubtitle')}</p>
           </div>
-          <div className="space-y-3">
-            <input value={email} onChange={(event) => setEmail(event.target.value)} type="email" dir="ltr" placeholder={t('emailPlaceholder')} required className="h-11 w-full rounded-lg border border-border bg-background px-3 text-sm text-foreground placeholder:text-muted-foreground focus:border-brand focus:outline-none focus:ring-2 focus:ring-brand/20" />
-            <input value={password} onChange={(event) => setPassword(event.target.value)} type="password" placeholder={tAuth('password')} required className="h-11 w-full rounded-lg border border-border bg-background px-3 text-sm text-foreground placeholder:text-muted-foreground focus:border-brand focus:outline-none focus:ring-2 focus:ring-brand/20" />
-            <label className="flex items-center gap-2 text-sm text-muted-foreground">
-              <input type="checkbox" checked={rememberMe} onChange={(event) => setRememberMe(event.target.checked)} className="rounded border-border text-brand focus:ring-brand" />
-              {tAuth('rememberMe')}
-            </label>
-            <button disabled={loginLoading} className="h-11 w-full rounded-lg bg-brand font-semibold text-white disabled:opacity-60">
-              {loginLoading ? tAuth('signingIn') : tAuth('signIn')}
-            </button>
-          </div>
+
+          {pinUsers.length > 0 && (
+            <div
+              data-testid="signin-mode-toggle"
+              role="tablist"
+              aria-label={tAuth('signIn')}
+              className="mb-5 grid grid-cols-2 gap-1 rounded-xl border border-border bg-muted p-1"
+            >
+              <button
+                type="button"
+                role="tab"
+                aria-selected={activeSignInMode === 'pin'}
+                data-testid="signin-mode-pin"
+                onClick={() => {
+                  setSignInMode('pin');
+                  setEmail('');
+                  setPassword('');
+                  setPinError('');
+                }}
+                className={`flex items-center justify-center gap-1.5 rounded-lg px-3 py-2 text-sm font-medium transition-all ${
+                  activeSignInMode === 'pin'
+                    ? 'bg-card text-foreground shadow-sm'
+                    : 'text-muted-foreground hover:text-foreground'
+                }`}
+              >
+                <KeyRound className="size-4 shrink-0" />
+                <span className="truncate">{tAuth('quickSwitchTitle')}</span>
+              </button>
+              <button
+                type="button"
+                role="tab"
+                aria-selected={activeSignInMode === 'password'}
+                data-testid="signin-mode-password"
+                onClick={() => {
+                  setSignInMode('password');
+                  setSelectedPinUser(null);
+                  setPin('');
+                  setPinError('');
+                }}
+                className={`flex items-center justify-center gap-1.5 rounded-lg px-3 py-2 text-sm font-medium transition-all ${
+                  activeSignInMode === 'password'
+                    ? 'bg-card text-foreground shadow-sm'
+                    : 'text-muted-foreground hover:text-foreground'
+                }`}
+              >
+                <Mail className="size-4 shrink-0" />
+                <span className="truncate">{tAuth('password')}</span>
+              </button>
+            </div>
+          )}
+
+          {activeSignInMode === 'pin' ? (
+            <div data-testid="pin-user-picker" className="space-y-4">
+              <div className="flex items-center gap-2">
+                <KeyRound size={18} className="text-brand" />
+                <div>
+                  <h2 className="text-sm font-semibold text-foreground">
+                    {tAuth('quickSwitchTitle')}
+                  </h2>
+                  <p className="text-xs text-muted-foreground">{tAuth('quickSwitchSubtitle')}</p>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-2 gap-2">
+                {pinUsers.map((u) => {
+                  const isSelected = selectedPinUser?.id === u.id;
+                  const roleKey = ROLE_LABEL_KEYS[u.role];
+                  const roleLabel = roleKey ? tStaff(roleKey) : u.role;
+                  return (
+                    <button
+                      key={u.id}
+                      type="button"
+                      data-testid={`pin-user-tile-${u.id}`}
+                      onClick={() => {
+                        setSelectedPinUser(u);
+                        setPin('');
+                        setPinError('');
+                      }}
+                      className={`flex items-center gap-2.5 rounded-xl border p-2.5 text-start transition-all ${
+                        isSelected
+                          ? 'border-brand bg-brand-light dark:bg-[var(--color-brand-light)] ring-2 ring-brand/30'
+                          : 'border-border hover:border-brand/50 hover:bg-muted/60'
+                      }`}
+                    >
+                      <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-brand/15 text-brand dark:text-indigo-300">
+                        <UserRound size={16} />
+                      </div>
+                      <div className="min-w-0 flex-1">
+                        <p className="truncate text-sm font-medium text-foreground">{u.name}</p>
+                        <p className="truncate text-xs text-slate-700 dark:text-slate-300">
+                          {roleLabel}
+                        </p>
+                      </div>
+                    </button>
+                  );
+                })}
+              </div>
+
+              {selectedPinUser && (
+                <form
+                  onSubmit={handlePinLogin}
+                  data-testid="pin-login-form"
+                  className="space-y-3 border-t border-border pt-3"
+                >
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs font-medium text-muted-foreground">
+                      {tAuth('enterPinFor', { name: selectedPinUser.name })}
+                    </span>
+                    <span className="font-mono text-xs text-muted-foreground">{pin.length}/6</span>
+                  </div>
+
+                  <input
+                    type="password"
+                    inputMode="numeric"
+                    pattern="\d*"
+                    maxLength={6}
+                    dir="ltr"
+                    autoFocus
+                    data-testid="pin-login-input"
+                    value={pin}
+                    onChange={(e) => {
+                      setPinError('');
+                      setPin(e.target.value.replace(/\D/g, '').slice(0, 6));
+                    }}
+                    placeholder="••••"
+                    className="h-11 w-full rounded-lg border border-input bg-card px-3 text-center font-mono text-lg tracking-[0.5em] text-foreground focus:outline-none focus:ring-2 focus:ring-ring"
+                  />
+
+                  <div className="grid grid-cols-3 gap-2" dir="ltr">
+                    {['1', '2', '3', '4', '5', '6', '7', '8', '9'].map((digit) => (
+                      <button
+                        key={digit}
+                        type="button"
+                        data-testid={`pin-pad-digit-${digit}`}
+                        onClick={() => appendPinDigit(digit)}
+                        className="h-11 rounded-lg border border-border bg-muted/50 text-base font-semibold text-foreground transition-colors hover:bg-muted"
+                      >
+                        {digit}
+                      </button>
+                    ))}
+                    <button
+                      type="button"
+                      data-testid="pin-pad-clear"
+                      onClick={clearPin}
+                      className="h-11 rounded-lg border border-border bg-muted/50 text-xs font-medium text-muted-foreground transition-colors hover:bg-muted"
+                    >
+                      {tCommon('clear')}
+                    </button>
+                    <button
+                      type="button"
+                      data-testid="pin-pad-digit-0"
+                      onClick={() => appendPinDigit('0')}
+                      className="h-11 rounded-lg border border-border bg-muted/50 text-base font-semibold text-foreground transition-colors hover:bg-muted"
+                    >
+                      0
+                    </button>
+                    <button
+                      type="button"
+                      data-testid="pin-pad-backspace"
+                      onClick={backspacePin}
+                      aria-label={tCommon('delete')}
+                      className="flex h-11 items-center justify-center rounded-lg border border-border bg-muted/50 text-muted-foreground transition-colors hover:bg-muted"
+                    >
+                      <Delete size={16} />
+                    </button>
+                  </div>
+
+                  {pinError && (
+                    <p
+                      role="alert"
+                      data-testid="pin-login-error"
+                      className="text-center text-xs font-medium text-destructive"
+                    >
+                      {pinError}
+                    </p>
+                  )}
+
+                  <label className="flex items-center gap-2 text-sm text-muted-foreground">
+                    <input
+                      type="checkbox"
+                      checked={rememberMe}
+                      onChange={(event) => setRememberMe(event.target.checked)}
+                      className="rounded border-border text-brand focus:ring-brand"
+                    />
+                    {tAuth('rememberMe')}
+                  </label>
+
+                  <div className="flex gap-2">
+                    <button
+                      type="button"
+                      data-testid="pin-login-cancel"
+                      onClick={() => {
+                        setSelectedPinUser(null);
+                        setPin('');
+                        setPinError('');
+                      }}
+                      className="flex-1 rounded-lg border border-border py-2.5 text-sm font-medium text-muted-foreground transition-colors hover:bg-muted/50 hover:text-foreground"
+                    >
+                      {tCommon('cancel')}
+                    </button>
+                    <button
+                      type="submit"
+                      data-testid="pin-login-submit"
+                      disabled={loginLoading || pin.length < 4}
+                      className="flex-1 rounded-lg bg-brand py-2.5 text-sm font-semibold text-white transition-colors hover:bg-brand/90 disabled:opacity-50"
+                    >
+                      {loginLoading ? tAuth('signingIn') : tAuth('signIn')}
+                    </button>
+                  </div>
+                </form>
+              )}
+            </div>
+          ) : (
+            <form onSubmit={handleLogin} className="space-y-3">
+              <input
+                value={email}
+                onFocus={() => setSignInMode('password')}
+                onChange={(event) => setEmail(event.target.value)}
+                type="email"
+                dir="ltr"
+                placeholder={t('emailPlaceholder')}
+                required
+                className="h-11 w-full rounded-lg border border-border bg-background px-3 text-sm text-foreground placeholder:text-muted-foreground focus:border-brand focus:outline-none focus:ring-2 focus:ring-brand/20"
+              />
+              <input
+                value={password}
+                onFocus={() => setSignInMode('password')}
+                onChange={(event) => setPassword(event.target.value)}
+                type="password"
+                placeholder={tAuth('password')}
+                required
+                className="h-11 w-full rounded-lg border border-border bg-background px-3 text-sm text-foreground placeholder:text-muted-foreground focus:border-brand focus:outline-none focus:ring-2 focus:ring-brand/20"
+              />
+              <label className="flex items-center gap-2 text-sm text-muted-foreground">
+                <input
+                  type="checkbox"
+                  checked={rememberMe}
+                  onChange={(event) => setRememberMe(event.target.checked)}
+                  className="rounded border-border text-brand focus:ring-brand"
+                />
+                {tAuth('rememberMe')}
+              </label>
+              <button
+                disabled={loginLoading}
+                className="h-11 w-full rounded-lg bg-brand font-semibold text-white disabled:opacity-60"
+              >
+                {loginLoading ? tAuth('signingIn') : tAuth('signIn')}
+              </button>
+            </form>
+          )}
+
           <p className="mt-4 text-center text-xs text-muted-foreground">{t('loginHint')}</p>
-        </form>
+        </div>
       </div>
     );
   }
 
   const ticketPanelBody = (
     <>
-      <h2 className="text-sm font-semibold">{t('currentTicket')}</h2>
+      <div className="flex items-center justify-between">
+        <h2 className="text-sm font-semibold">{t('currentTicket')}</h2>
+        {currentOrder && activeTable && canMoveTable && (
+          <button
+            type="button"
+            disabled={sending}
+            onClick={() => {
+              if (sendInFlightRef.current) return;
+              setMobileCartOpen(false);
+              setMoveTableModalOpen(true);
+            }}
+            className="flex items-center gap-1 text-xs font-medium text-brand hover:underline disabled:opacity-50"
+          >
+            <ArrowRightLeft size={13} />
+            {tTables('moveTable')}
+          </button>
+        )}
+      </div>
       <div className="mt-3 grid grid-cols-2 gap-2">
-        <input value={customerPhone} onChange={(event) => handleCustomerPhoneChange(event.target.value)} dir="ltr" placeholder={t('phonePlaceholder')} className="h-10 rounded-lg border border-border bg-background px-3 text-sm text-foreground placeholder:text-muted-foreground focus:border-brand focus:outline-none" />
+        <input
+          value={customerPhone}
+          disabled={sending}
+          onChange={(event) => handleCustomerPhoneChange(event.target.value)}
+          dir="ltr"
+          placeholder={t('phonePlaceholder')}
+          className="h-10 rounded-lg border border-border bg-background px-3 text-sm text-foreground placeholder:text-muted-foreground focus:border-brand focus:outline-none disabled:opacity-50"
+        />
         <input
           value={customerName}
-          onChange={customerMatch ? undefined : (event) => setCustomerName(event.target.value)}
+          disabled={sending}
+          onChange={
+            customerMatch ? undefined : (event) => handleCustomerNameChange(event.target.value)
+          }
           readOnly={!!customerMatch}
-          placeholder={customerSearched ? (customerMatch ? '' : t('customerNamePlaceholder')) : t('customerNamePlaceholder')}
-          className={`h-10 rounded-lg border px-3 text-sm text-foreground placeholder:text-muted-foreground focus:border-brand focus:outline-none ${customerMatch ? 'border-border bg-muted' : 'border-border bg-background'}`}
+          placeholder={
+            customerSearched
+              ? customerMatch
+                ? ''
+                : t('customerNamePlaceholder')
+              : t('customerNamePlaceholder')
+          }
+          className={`h-10 rounded-lg border px-3 text-sm text-foreground placeholder:text-muted-foreground focus:border-brand focus:outline-none disabled:opacity-50 ${customerMatch ? 'border-border bg-muted' : 'border-border bg-background'}`}
         />
       </div>
       {customerSearched && (
-        <p className={`mt-1 text-xs font-medium ${customerMatch ? 'text-green-600 dark:text-green-400' : 'text-red-500 dark:text-red-400'}`}>
+        <p
+          className={`mt-1 text-xs font-medium ${customerMatch ? 'text-green-600 dark:text-green-400' : 'text-red-500 dark:text-red-400'}`}
+        >
           {customerMatch ? tPos('customerFound') : tPos('newCustomerEnterName')}
         </p>
       )}
 
       {currentOrder?.items && currentOrder.items.length > 0 && (
         <div className="mt-4 border-t border-border pt-3">
-          <p className="mb-2 text-xs font-semibold uppercase text-muted-foreground">{t('kitchen')}</p>
+          <p className="mb-2 text-xs font-semibold uppercase text-muted-foreground">
+            {t('kitchen')}
+          </p>
           <div className="space-y-2">
             {currentOrder.items.map((item) => (
               <div key={item.id} className="flex items-center gap-2 text-sm">
                 {itemStatusIcon(item.status, t)}
-                <span className="min-w-0 flex-1 truncate"><Ltr>{item.quantity}</Ltr> x {item.product_name}</span>
+                <span className="min-w-0 flex-1 truncate">
+                  <Ltr>{item.quantity}</Ltr> x{' '}
+                  {formatItemHeading(item.product_name, item.variant_selection)}
+                </span>
               </div>
             ))}
           </div>
@@ -569,7 +1646,9 @@ export default function ServerStandalonePage() {
       )}
 
       <div className="mt-4 border-t border-border pt-3">
-        <p className="mb-2 text-xs font-semibold uppercase text-muted-foreground">{t('newItems')}</p>
+        <p className="mb-2 text-xs font-semibold uppercase text-muted-foreground">
+          {t('newItems')}
+        </p>
         {draft.length === 0 ? (
           <p className="py-6 text-center text-sm text-muted-foreground">{t('emptyDraft')}</p>
         ) : (
@@ -578,31 +1657,61 @@ export default function ServerStandalonePage() {
               <div key={line.id} className="rounded-lg border border-border p-2">
                 <div className="flex items-start justify-between gap-2">
                   <div className="min-w-0 flex-1">
-                    <span className="block truncate text-sm font-medium">{line.product.name}</span>
+                    <span className="block truncate text-sm font-medium">
+                      {line.variant
+                        ? `${line.product.name} (${line.variant.name})`
+                        : line.product.name}
+                    </span>
                     {line.addons.length > 0 && (
                       <div className="mt-0.5 space-y-0.5">
                         {line.addons.map((addon) => (
                           <p key={addon.id} className="truncate text-xs text-muted-foreground">
-                            + {addon.name}{(addon.quantity || 1) > 1 ? ` x${addon.quantity}` : ''}
+                            + {addon.name}
+                            {(addon.quantity || 1) > 1 ? ` x${addon.quantity}` : ''}
                           </p>
                         ))}
                       </div>
                     )}
                     {line.special_instructions && (
-                      <p className="mt-0.5 truncate text-xs italic text-muted-foreground">{line.special_instructions}</p>
+                      <p className="mt-0.5 truncate text-xs italic text-muted-foreground">
+                        {line.special_instructions}
+                      </p>
                     )}
                   </div>
-                  <button onClick={() => removeDraftLine(line.id)} aria-label={tCommon('removeItem')}
-                    className="shrink-0 rounded-md p-1 text-muted-foreground hover:text-red-500"><Trash2 size={14} /></button>
+                  <button
+                    disabled={sending}
+                    onClick={() => removeDraftLine(line.id)}
+                    aria-label={tCommon('removeItem')}
+                    className="shrink-0 rounded-md p-1 text-muted-foreground hover:text-red-500 disabled:opacity-50"
+                  >
+                    <Trash2 size={14} />
+                  </button>
                 </div>
                 <div className="mt-2 flex items-center justify-between gap-2">
                   <div className="flex items-center gap-2">
-                    <button onClick={() => changeQty(line.id, -1)} className="rounded-md border border-border bg-card p-1"><Minus size={14} /></button>
-                    <span className="w-6 text-center text-sm font-semibold"><Ltr>{line.quantity}</Ltr></span>
-                    <button onClick={() => changeQty(line.id, 1)} className="rounded-md border border-border bg-card p-1"><Plus size={14} /></button>
+                    <button
+                      disabled={sending}
+                      onClick={() => changeQty(line.id, -1)}
+                      className="rounded-md border border-border bg-card p-1 disabled:opacity-50"
+                    >
+                      <Minus size={14} />
+                    </button>
+                    <span className="w-6 text-center text-sm font-semibold">
+                      <Ltr>{line.quantity}</Ltr>
+                    </span>
+                    <button
+                      disabled={sending}
+                      onClick={() => changeQty(line.id, 1)}
+                      className="rounded-md border border-border bg-card p-1 disabled:opacity-50"
+                    >
+                      <Plus size={14} />
+                    </button>
                   </div>
-                  <button onClick={() => setEditingDraftLine(line)}
-                    className="flex items-center gap-1 rounded-full bg-amber-100 px-2 py-1 text-xs font-medium text-amber-700 hover:bg-amber-200 dark:bg-amber-950/40 dark:text-amber-300 dark:hover:bg-amber-950/60">
+                  <button
+                    disabled={sending}
+                    onClick={() => openEditDraftModal(line)}
+                    className="flex items-center gap-1 rounded-full bg-amber-100 px-2 py-1 text-xs font-medium text-amber-700 hover:bg-amber-200 disabled:opacity-50 dark:bg-amber-950/40 dark:text-amber-300 dark:hover:bg-amber-950/60"
+                  >
                     <SquarePen size={12} />
                     {tCommon('edit')}
                   </button>
@@ -613,12 +1722,39 @@ export default function ServerStandalonePage() {
         )}
       </div>
 
+      {draft.length > 0 && (
+        <div className="mt-3">
+          <textarea
+            value={orderNotes}
+            disabled={sending}
+            onChange={(event) => handleOrderNotesChange(event.target.value)}
+            placeholder={tPos('orderNotesPlaceholder')}
+            rows={2}
+            maxLength={200}
+            className="w-full resize-none rounded-lg border border-border bg-background px-3 py-2 text-sm text-foreground placeholder:text-muted-foreground focus:border-brand focus:outline-none disabled:opacity-50"
+          />
+          <p className="mt-0.5 text-end text-xs text-muted-foreground">
+            <Ltr>{orderNotes.length}/200</Ltr>
+          </p>
+        </div>
+      )}
+
       <div className="mt-4 flex items-center justify-between border-t border-border pt-3">
         <span className="text-sm text-muted-foreground">{t('draftTotal')}</span>
-        <span className="text-lg font-bold"><Ltr>{money(draftTotal, regional)}</Ltr></span>
+        <span className="text-lg font-bold">
+          <Ltr>{money(draftTotal, regional)}</Ltr>
+        </span>
       </div>
-      <button onClick={sendDraft} disabled={!selectedTableId || draft.length === 0 || sending}
-        className="mt-3 flex h-12 w-full items-center justify-center gap-2 rounded-lg bg-brand font-semibold text-white disabled:opacity-50">
+      <button
+        onClick={sendDraft}
+        disabled={
+          !selectedTableId ||
+          orderLoadedTableId !== selectedTableId ||
+          draft.length === 0 ||
+          sending
+        }
+        className="mt-3 flex h-12 w-full items-center justify-center gap-2 rounded-lg bg-brand font-semibold text-white disabled:opacity-50"
+      >
         <Send size={17} />
         {sending ? t('sending') : currentOrder ? t('addToOrder') : t('sendToKitchen')}
       </button>
@@ -629,77 +1765,131 @@ export default function ServerStandalonePage() {
     <div className="min-h-screen bg-background text-foreground">
       <header className="sticky top-0 z-20 border-b border-border bg-card/95 px-3 py-2 backdrop-blur">
         <div className="mx-auto flex max-w-6xl items-center gap-3">
-          <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-brand text-white"><ChefHat size={18} /></div>
+          <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-brand text-white">
+            <ChefHat size={18} />
+          </div>
           <div className="min-w-0 flex-1">
             <h1 className="truncate text-base font-semibold">{t('title')}</h1>
-            <p className="truncate text-xs text-muted-foreground">{activeTable ? t('tableLabel', { name: activeTable.name ?? String(activeTable.number) }) : t('selectTable')}</p>
+            <p className="truncate text-xs text-muted-foreground">
+              {activeTable
+                ? t('tableLabel', {
+                    name: activeTable.name ?? String(activeTable.number),
+                  })
+                : t('selectTable')}
+            </p>
           </div>
-          <button onClick={() => loadAll().catch(() => toast.error(t('refreshFailed')))} className="rounded-lg border border-border p-2 text-muted-foreground"><RefreshCw size={17} /></button>
-          <button onClick={logout} className="rounded-lg border border-border p-2 text-muted-foreground"><LogOut size={17} /></button>
+          <button
+            disabled={sending}
+            onClick={handleRefresh}
+            aria-label={tSettings('refresh')}
+            className="flex min-h-11 min-w-11 items-center justify-center rounded-lg border border-border p-2 text-muted-foreground disabled:opacity-50"
+          >
+            <RefreshCw size={17} />
+          </button>
+          <button
+            type="button"
+            data-testid="server-app-change-credentials-button"
+            disabled={sending}
+            onClick={() => setCredentialsOpen(true)}
+            aria-label={tAuth('changePasswordAndPin')}
+            title={tAuth('changePasswordAndPin')}
+            className="flex min-h-11 min-w-11 items-center justify-center rounded-lg border border-border p-2 text-muted-foreground disabled:opacity-50"
+          >
+            <KeyRound size={17} />
+          </button>
+          <button
+            onClick={logout}
+            aria-label={tNav('logout')}
+            className="flex min-h-11 min-w-11 items-center justify-center rounded-lg border border-border p-2 text-muted-foreground"
+          >
+            <LogOut size={17} />
+          </button>
         </div>
       </header>
 
-      <main className="mx-auto grid max-w-6xl gap-3 p-3 lg:grid-cols-[220px_1fr_340px]">
-        <section className="rounded-lg border border-border bg-card p-3">
-          <h2 className="mb-2 text-xs font-semibold uppercase text-muted-foreground">{t('tables')}</h2>
-          <div className="grid grid-cols-3 gap-2 lg:grid-cols-1">
-            {tables.map((table) => {
-              const selected = table.id === selectedTableId;
-              const order = table.activeOrder || table.current_order;
-              return (
-                <button key={table.id} onClick={() => setSelectedTableId(table.id)}
-                  className={`min-h-14 rounded-lg border px-2 py-2 text-start ${selected ? 'border-brand bg-brand/10' : 'border-border bg-card'}`}>
-                  <span className="block truncate text-sm font-semibold">{table.name || table.number}</span>
-                  <span className="text-xs text-muted-foreground">{order ? t('openOrder') : tTables('statusAvailable')}</span>
-                </button>
-              );
-            })}
-          </div>
-        </section>
-
-        <section className="rounded-lg border border-border bg-card p-3">
-          <div className="mb-3 flex gap-2">
-            <div className="relative flex-1">
-              <Search size={16} className="absolute start-3 top-3 text-muted-foreground" />
-              <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder={t('searchMenu')} className="h-10 w-full rounded-lg border border-border bg-background ps-9 pe-3 text-sm text-foreground placeholder:text-muted-foreground focus:border-brand focus:outline-none" />
-            </div>
-          </div>
-          <div className="mb-3 flex gap-2 overflow-x-auto pb-1">
-            <button onClick={() => setSelectedCategoryId('all')} className={`h-9 shrink-0 rounded-lg px-3 text-sm ${selectedCategoryId === 'all' ? 'bg-brand text-white' : 'bg-muted text-foreground'}`}>{tOrders('all')}</button>
-            {categories.map((category) => (
-              <button key={category.id} onClick={() => setSelectedCategoryId(category.id)}
-                className={`h-9 shrink-0 rounded-lg px-3 text-sm ${selectedCategoryId === category.id ? 'bg-brand text-white' : 'bg-muted text-foreground'}`}>
-                {category.name}
-              </button>
-            ))}
-          </div>
-          <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 xl:grid-cols-4">
-            {filteredProducts.map((product) => {
-              const inCartQty = draftQuantities.get(product.id) || 0;
-              return (
-                <button key={product.id} onClick={() => setAddonModalProduct(product)}
-                  className="relative min-h-24 rounded-lg border border-border bg-card p-3 text-start hover:border-brand">
-                  {inCartQty > 0 && (
-                    <span className="absolute top-0 end-0 z-10 flex h-6 w-6 items-center justify-center rounded-es-lg bg-brand text-xs font-bold text-white">
-                      <Ltr>{inCartQty}</Ltr>
+      {tablesLoaded && tables.length === 0 ? (
+        <div className="flex min-h-[70vh] flex-col items-center justify-center gap-3 px-6 text-center">
+          <LayoutGrid size={44} className="text-muted-foreground" />
+          <h2 className="text-lg font-semibold">{t('noTablesTitle')}</h2>
+          <p className="max-w-sm text-sm text-muted-foreground">{t('noTablesHint')}</p>
+        </div>
+      ) : (
+        <main className="mx-auto grid max-w-6xl min-w-0 gap-3 p-3 lg:grid-cols-[220px_1fr_340px]">
+          <section className="min-w-0 rounded-lg border border-border bg-card p-3">
+            <h2 className="mb-2 text-xs font-semibold uppercase text-muted-foreground">
+              {t('tables')}
+            </h2>
+            <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-1">
+              {tables.map((table) => {
+                const selected = table.id === selectedTableId;
+                const order = table.activeOrder || table.current_order;
+                return (
+                  <button
+                    key={table.id}
+                    disabled={sending}
+                    onClick={() => selectTable(table.id)}
+                    className={`min-h-14 rounded-lg border px-2 py-2 text-start disabled:opacity-50 ${selected ? 'border-brand bg-brand/10' : 'border-border bg-card'}`}
+                  >
+                    <span className="block truncate text-sm font-semibold">
+                      {table.name || table.number}
                     </span>
-                  )}
-                  <span className="line-clamp-2 text-sm font-semibold">{product.name}</span>
-                  <span className="mt-2 block text-sm text-muted-foreground"><Ltr>{money(product.price, regional)}</Ltr></span>
-                </button>
-              );
-            })}
-          </div>
-        </section>
+                    <span className="text-xs text-muted-foreground">
+                      {order ? t('openOrder') : tTables('statusAvailable')}
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
+          </section>
 
-        <section className="hidden rounded-lg border border-border bg-card p-3 md:block md:sticky md:top-16 md:self-start">
-          {ticketPanelBody}
-        </section>
-      </main>
+          <section className="flex h-[calc(100dvh-5rem)] min-h-96 min-w-0 flex-col rounded-lg border border-border bg-card p-3">
+            <ProductGrid
+              categories={categories}
+              products={products}
+              selectedCategory={selectedCategoryId}
+              setSelectedCategory={setSelectedCategoryId}
+              search={query}
+              setSearch={setQuery}
+              currency={regional?.currency || ''}
+              categorySort={regional?.category_sort}
+              itemSort={regional?.item_sort}
+              disabled={sending}
+              onProductClick={(product, quantity) => {
+                if (sendInFlightRef.current) return;
+                if (productNeedsCustomizer(product)) {
+                  openAddonModal(product, quantity, null);
+                } else addDraftLine(product, quantity, [], '');
+              }}
+              onScannedVariant={(product, variant, quantity) => {
+                if (sendInFlightRef.current) return;
+                if (scannedVariantNeedsCustomizer(product, variant)) {
+                  openAddonModal(product, quantity, variant);
+                } else addDraftLine(product, quantity, [], '', variant);
+              }}
+              onScaledProduct={(product, quantity) => {
+                if (sendInFlightRef.current) return;
+                addDraftLine(product, quantity, [], '');
+              }}
+              cartQuantities={draftQuantities}
+              formatPrice={(amount) => money(amount, regional)}
+              showImages={true}
+              gridClassName="grid-cols-2 sm:grid-cols-3 xl:grid-cols-4"
+              searchPlaceholder={t('searchMenu')}
+            />
+          </section>
+
+          <section className="hidden min-w-0 rounded-lg border border-border bg-card p-3 md:block md:sticky md:top-16 md:self-start">
+            {ticketPanelBody}
+          </section>
+        </main>
+      )}
 
       <Drawer open={mobileCartOpen} onOpenChange={setMobileCartOpen}>
         <DrawerTrigger asChild>
-          <button className="fixed bottom-5 end-5 z-40 flex h-14 w-14 items-center justify-center rounded-full bg-brand text-white shadow-lg hover:bg-brand-hover active:bg-brand-hover md:hidden" aria-label={t('currentTicket')}>
+          <button
+            className="fixed bottom-5 end-5 z-40 flex h-14 w-14 items-center justify-center rounded-full bg-brand text-white shadow-lg hover:bg-brand-hover active:bg-brand-hover md:hidden"
+            aria-label={t('currentTicket')}
+          >
             <ShoppingCart size={22} />
             {draftItemCount > 0 && (
               <span className="absolute -top-0.5 -end-0.5 flex h-5 w-5 items-center justify-center rounded-full bg-red-500 text-xs font-bold text-white">
@@ -709,33 +1899,117 @@ export default function ServerStandalonePage() {
           </button>
         </DrawerTrigger>
         <DrawerContent className="max-h-[85vh] text-foreground">
-          <div className="max-h-[80vh] overflow-y-auto px-3 pb-3">
-            {ticketPanelBody}
-          </div>
+          <div className="max-h-[80vh] overflow-y-auto px-3 pb-3">{ticketPanelBody}</div>
         </DrawerContent>
       </Drawer>
 
       {addonModalProduct && (
         <AddonModal
           product={addonModalProduct}
-          currency={regional?.currency || 'INR'}
+          currency={regional?.currency || ''}
           country={regional?.country}
-          onAdd={(addedProduct, quantity, addons, instructions) => addDraftLine(addedProduct, quantity, addons, instructions)}
-          onClose={() => setAddonModalProduct(null)}
+          initialQuantity={addonModalQuantity}
+          initialVariant={addonModalVariant}
+          onAdd={(addedProduct, quantity, addons, instructions, variant) => {
+            if (sendInFlightRef.current || addonModalSendSeqRef.current !== sendSeqRef.current) {
+              return;
+            }
+            addDraftLine(addedProduct, quantity, addons, instructions, variant);
+          }}
+          onClose={() => {
+            setAddonModalProduct(null);
+            setAddonModalQuantity(1);
+            setAddonModalVariant(null);
+          }}
         />
       )}
 
       {editingDraftLine && (
         <AddonModal
           product={editingDraftLine.product}
-          currency={regional?.currency || 'INR'}
+          currency={regional?.currency || ''}
           country={regional?.country}
           mode="edit"
           initialQuantity={editingDraftLine.quantity}
           initialAddons={editingDraftLine.addons}
           initialInstructions={editingDraftLine.special_instructions}
-          onAdd={(_editedProduct, quantity, addons, instructions) => updateDraftLine(editingDraftLine.id, quantity, addons, instructions)}
+          initialVariant={editingDraftLine.variant}
+          onAdd={(_editedProduct, quantity, addons, instructions, variant) => {
+            if (sendInFlightRef.current || editingDraftSendSeqRef.current !== sendSeqRef.current) {
+              return;
+            }
+            updateDraftLine(editingDraftLine.id, quantity, addons, instructions, variant);
+          }}
           onClose={() => setEditingDraftLine(null)}
+        />
+      )}
+
+      {moveTableModalOpen && activeTable && currentOrder && canMoveTable && (
+        <MoveTableModal
+          sourceTable={
+            {
+              ...activeTable,
+              activeOrder: currentOrder,
+            } as unknown as FullTable
+          }
+          apiClient={api || undefined}
+          formatPrice={(amount) => money(amount, regional)}
+          onClose={() => setMoveTableModalOpen(false)}
+          onSuccess={async (movedData) => {
+            const sourceTableId = String(
+              (movedData.sourceTable as Table | undefined)?.id ?? activeTable.id,
+            );
+            const targetTable = movedData.targetTable as Table;
+            const targetTableId = String(targetTable.id);
+            const targetTableName = targetTable.name || targetTable.number;
+            if (sendAttemptRef.current?.snapshot.tableId === sourceTableId) {
+              const prevAttempt = sendAttemptRef.current;
+              const nextSnapshot: SendSnapshot = {
+                ...prevAttempt.snapshot,
+                tableId: targetTableId,
+                requestTableId: prevAttempt.snapshot.requestTableId ?? prevAttempt.snapshot.tableId,
+                tableName: targetTableName ?? prevAttempt.snapshot.tableName,
+              };
+              sendAttemptRef.current = {
+                signature: sendAttemptSignature(
+                  targetTableId,
+                  nextSnapshot.draftLines,
+                  nextSnapshot.customerName,
+                  nextSnapshot.customerPhone,
+                  nextSnapshot.orderNotes,
+                ),
+                nonce: prevAttempt.nonce,
+                snapshot: nextSnapshot,
+              };
+            }
+            setMoveTableModalOpen(false);
+            if (selectedTableIdRef.current === sourceTableId) {
+              selectTable(targetTableId);
+            }
+            await loadAll().catch(() => {});
+          }}
+        />
+      )}
+      {api && (
+        <AccountCredentialsDialog
+          open={credentialsOpen}
+          onOpenChange={setCredentialsOpen}
+          apiClient={api}
+          endpoints={{
+            me: '/api/auth/me',
+            passwordChange: '/api/auth/password/change',
+            pinChange: '/api/auth/pin/change',
+          }}
+          initialHasPin={user.has_pin}
+          userId={user.id}
+          getSessionToken={() => localStorage.getItem(TOKEN_KEY)}
+          onSessionUpdated={({ token: freshToken, hasPin }) => {
+            if (!localStorage.getItem(TOKEN_KEY)) return;
+            localStorage.setItem(TOKEN_KEY, freshToken);
+            setUser((prev) =>
+              prev ? { ...prev, ...(hasPin !== undefined ? { has_pin: hasPin } : {}) } : prev,
+            );
+          }}
         />
       )}
     </div>

@@ -1,13 +1,27 @@
 'use client';
 
+import { useState } from 'react';
+import { AccountCredentialsDialog } from '@/components/auth/AccountCredentialsDialog';
 import { KdsHeader } from '@/components/kds/KdsHeader';
 import { KdsKanbanBoard } from '@/components/kds/KdsKanbanBoard';
 import { KdsTabsView } from '@/components/kds/KdsTabsView';
 import { useKdsView } from '@/hooks/useKdsView';
 import type { UseKdsConnectionResult } from '@/hooks/useKdsConnection';
 
-export function KdsWorkspace({ conn, serverDefault }: { conn: UseKdsConnectionResult; serverDefault: 'tabs' | 'kanban' | null }) {
+/** Renders the KDS header, active view mode, and self-service credentials dialog. */
+export function KdsWorkspace({
+  conn,
+  serverDefault,
+}: {
+  conn: UseKdsConnectionResult;
+  serverDefault: 'tabs' | 'kanban' | null;
+}) {
   const { viewMode, setViewMode } = useKdsView(serverDefault);
+  const [credentialsOpen, setCredentialsOpen] = useState(false);
+  const handleChangeView = (nextView: 'tabs' | 'kanban') => {
+    setViewMode(nextView);
+    conn.persistViewMode?.(nextView);
+  };
 
   return (
     <div data-testid="kds-workspace" className="h-full flex flex-col">
@@ -17,12 +31,17 @@ export function KdsWorkspace({ conn, serverDefault }: { conn: UseKdsConnectionRe
         connected={conn.connected}
         connectionMode={conn.connectionMode}
         viewMode={viewMode}
-        onChangeView={setViewMode}
+        onChangeView={handleChangeView}
+        onOpenCredentials={() => setCredentialsOpen(true)}
         onLogout={conn.handleLogout}
       />
       <div className="flex-1 min-h-0 flex flex-col">
         {viewMode === 'kanban' ? (
-          <KdsKanbanBoard orders={conn.orders} updating={conn.updating} updateItemStatus={conn.updateItemStatus} />
+          <KdsKanbanBoard
+            orders={conn.orders}
+            updating={conn.updating}
+            updateItemStatus={conn.updateItemStatus}
+          />
         ) : (
           <KdsTabsView
             orders={conn.orders}
@@ -32,6 +51,20 @@ export function KdsWorkspace({ conn, serverDefault }: { conn: UseKdsConnectionRe
         )}
       </div>
       {conn.ConfirmDialog}
+      {conn.api && (
+        <AccountCredentialsDialog
+          open={credentialsOpen}
+          onOpenChange={setCredentialsOpen}
+          apiClient={conn.api}
+          endpoints={conn.credentialEndpoints}
+          initialHasPin={conn.user?.has_pin}
+          userId={conn.user?.id}
+          getSessionToken={() =>
+            typeof window !== 'undefined' ? window.localStorage.getItem('token') : null
+          }
+          onSessionUpdated={({ token, hasPin }) => conn.replaceSessionToken?.(token, hasPin)}
+        />
+      )}
     </div>
   );
 }

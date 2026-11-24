@@ -1,29 +1,60 @@
-import { ipcMain, dialog, app, BrowserWindow, shell } from 'electron';
-import { randomUUID } from 'node:crypto';
+import { ipcMain, dialog, app, BrowserWindow, Menu, shell } from 'electron';
 import * as path from 'path';
 import * as fs from 'fs';
-import { getDatabase, createBackup, restoreBackup, now, getCurrentSchemaVersion, getSchemaVersionFromBackup, resetDatabaseWithBackup, withDatabaseMaintenanceLock, withDatabaseRequest, isManagedBackupFile } from './db';
+import {
+  getDatabase,
+  createBackup,
+  restoreBackup,
+  now,
+  getCurrentSchemaVersion,
+  getSchemaVersionFromBackup,
+  resetDatabaseWithBackup,
+  withDatabaseMaintenanceLock,
+  withDatabaseRequest,
+  isManagedBackupFile,
+} from './db';
 import { clearInMemoryRevokedTokens, clearUserAuthCache } from './middleware/security';
 import { getLocalIP } from './server';
-import { clearJWTSecretCache } from './routes/auth';
+import { getServerPort } from './server-state';
+import { clearJWTSecretCache } from './security/jwt-secret';
 import { getKdsPort } from './kds-server';
 import { authorizeMasterPin, isMasterPinAvailable, isMasterPinSet } from './services/master-pin';
+import {
+  clearRestoreFileSelection,
+  rememberRestoreFileSelection,
+} from './services/restore-file-selection';
 import { runHealthCheck, applySafeFixes } from './services/schema-health';
 import { getStatus as getWhatsAppStatus, sanitizeLogText } from './services/whatsapp';
 import { createKdsWindow, applyWindowControlAction } from './window-options';
+import {
+  isApplicationMenuSender,
+  listApplicationMenuEntries,
+  openApplicationMenuSubmenu,
+} from './application-menu';
 import {
   isCurrentRendererFrame,
   markWindowRendererReady,
   registerRendererDocument,
 } from './window-readiness';
 import { isThemeMode, appendThemeQueryParam } from './title-bar-theme';
-import { getTenantCurrency } from './services/refund';
-import { getCurrencyMinorUnitFactor } from './countries';
+import { isOrdersLayout } from './routes/settings';
+import { googleDrive } from './services/google-drive';
 import { rasterizeKotDocumentForWebUsb, rasterizePrintDocumentForWebUsb } from './printers/thermal';
 import { isKotDocument, isPrintDocument } from '../shared/print/document';
-import { sendEvent as sendTelemetryEvent } from './services/telemetry';
+import { isPrinterTextSize } from '../shared/print/text-size';
 import { isSafeWhatsAppShareUrl } from './security/url-allowlist';
+import { authorizeRendererPermission } from './security/ipc-auth';
 import log from 'electron-log/main';
+import { randomUUID } from 'crypto';
+import { cloudSync } from './services/cloud-sync';
+import {
+  isLocalBackupEnabled,
+  retainBackupLocally,
+  setLocalBackupEnabled,
+} from './services/local-backup';
+import { readPostHogBootstrap } from './services/posthog';
+import { MAX_PDF_HTML_BYTES, renderHtmlToPdfBuffer } from './services/html-to-pdf';
+import { sanitizeLogTail } from './lib/log-sanitizer';
 
 // Cap on the log content attached to a support ticket (most recent bytes only).
 const LOG_TAIL_MAX_BYTES = 200_000;
@@ -49,10 +80,12 @@ function readRecentLogTail(): { text: string; truncated: boolean } {
     }
   }
   const filteredText = (cutIndex === -1 ? lines : lines.slice(cutIndex)).join('\n');
-  const buffer = Buffer.from(filteredText, 'utf8');
+  // Sanitize before slicing so a credential crossing the truncation boundary cannot lose its prefix.
+  const sanitizedText = sanitizeLogTail(filteredText);
+  const buffer = Buffer.from(sanitizedText, 'utf8');
   const overCap = buffer.length > LOG_TAIL_MAX_BYTES;
   return {
-    text: overCap ? buffer.subarray(-LOG_TAIL_MAX_BYTES).toString('utf8') : filteredText,
+    text: overCap ? buffer.subarray(-LOG_TAIL_MAX_BYTES).toString('utf8') : sanitizedText,
     truncated: overCap || cutIndex > 0,
   };
 }
@@ -98,23 +131,13 @@ function createErrorLogEmailDraft(logText: string): string {
   return draftPath;
 }
 
-// Settings keys the renderer is allowed to write via IPC.
-// Must stay in sync with routes/settings.ts ALLOWED_WILDCARD_KEYS.
-const ALLOWED_IPC_KEYS = new Set([
-  'business_name', 'timezone', 'currency', 'country',
-  'state_code', 'business_address', 'business_phone',
-  'billing_type', 'bill_show_name', 'bill_show_address',
-  'bill_show_phone', 'bill_show_tax_id', 'bill_show_tax_breakdown',
-  'bill_show_customer_name', 'bill_show_customer_phone', 'bill_show_table_number',
-  'tax_scheme',
-  'loyalty_enabled',
-  'printer_method', 'paper_size', 'bill_template', 'bill_footer_message',
-  'telemetry_enabled',
-  'theme_mode',
-]);
+// Settings keys exposed via Electron IPC; writes require `settings.manage`
+// once setup has completed.
+const ALLOWED_IPC_KEYS = new Set(['theme_mode', 'orders_layout']);
 
 const SENSITIVE_SETTING_KEYS = new Set([
   'jwt_secret',
+  'auth_clock_high_water_ms',
   'cloud_api_key',
   'cloud_device_secret',
   'cloud_deletion_status_token',
@@ -135,10 +158,34 @@ const MIN_RASTER_COLUMNS = 32;
 const MAX_RASTER_COLUMNS = 48;
 
 function isValidRasterColumns(value: unknown): value is number {
-  return typeof value === 'number'
-    && Number.isSafeInteger(value)
-    && value >= MIN_RASTER_COLUMNS
-    && value <= MAX_RASTER_COLUMNS;
+  return (
+    typeof value === 'number' &&
+    Number.isSafeInteger(value) &&
+    value >= MIN_RASTER_COLUMNS &&
+    value <= MAX_RASTER_COLUMNS
+  );
+}
+
+const TRUSTED_LOOPBACK_HOSTNAMES = new Set(['localhost', '127.0.0.1', '::1', '[::1]']);
+
+/** Verifies that a URL has http: scheme, no credentials, loopback host, and matches the configured port. */
+export function isTrustedLoopbackUrl(rawUrl: string, port: number): boolean {
+  if (typeof port !== 'number' || !Number.isSafeInteger(port) || port <= 0) {
+    return false;
+  }
+  try {
+    const parsed = new URL(rawUrl);
+    if (parsed.protocol !== 'http:' || parsed.username || parsed.password) {
+      return false;
+    }
+    const parsedPort = parsed.port ? Number(parsed.port) : 80;
+    if (parsedPort !== port) {
+      return false;
+    }
+    return TRUSTED_LOOPBACK_HOSTNAMES.has(parsed.hostname);
+  } catch {
+    return false;
+  }
 }
 
 /** Verifies that IPC sender origin is the localhost-served POS renderer. */
@@ -153,16 +200,71 @@ export function isTrustedSender(event: Pick<Electron.IpcMainInvokeEvent, 'sender
 }
 
 type MainWindowGetter = () => BrowserWindow | null;
-type IpcHandler<Args extends unknown[] = unknown[]> =
-  (event: Electron.IpcMainInvokeEvent, ...args: Args) => unknown | Promise<unknown>;
+type IpcHandler<Args extends unknown[] = unknown[]> = (
+  event: Electron.IpcMainInvokeEvent,
+  ...args: Args
+) => unknown | Promise<unknown>;
 
-interface IpcPrinterInput {
-  id?: string;
-  name: string;
-  connection_type: 'network' | 'usb' | 'webusb';
-  ip_address?: string | null;
-  port?: number | null;
-  is_default?: boolean | number;
+let activeMainWindowGetter: MainWindowGetter | undefined;
+
+/** Verifies that IPC sender is the active main BrowserWindow, current top-level frame, and exact local app origin. */
+export function isTrustedMainWindowSender(
+  event: Pick<Electron.IpcMainInvokeEvent, 'sender' | 'senderFrame'>,
+  mainWindowOrGetter:
+    | BrowserWindow
+    | null
+    | (() => BrowserWindow | null)
+    | undefined = activeMainWindowGetter,
+  port: number = getServerPort(),
+  browserWindowClass: {
+    fromWebContents: (sender: Electron.WebContents) => BrowserWindow | null;
+  } = BrowserWindow,
+): boolean {
+  if (typeof port !== 'number' || !Number.isSafeInteger(port) || port <= 0) {
+    return false;
+  }
+
+  const mainWindow =
+    typeof mainWindowOrGetter === 'function' ? mainWindowOrGetter() : mainWindowOrGetter;
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    return false;
+  }
+
+  if (!event || !event.sender) {
+    return false;
+  }
+
+  let senderWindow: BrowserWindow | null = null;
+  try {
+    senderWindow = browserWindowClass.fromWebContents(event.sender);
+  } catch {
+    return false;
+  }
+  if (!senderWindow || senderWindow !== mainWindow) {
+    return false;
+  }
+
+  let currentFrame: Electron.WebFrameMain | null = null;
+  try {
+    currentFrame = event.sender.mainFrame;
+  } catch {
+    return false;
+  }
+  if (!isCurrentRendererFrame(event.senderFrame, currentFrame)) {
+    return false;
+  }
+
+  const senderUrl = event.sender?.getURL?.() ?? '';
+  if (!isTrustedLoopbackUrl(senderUrl, port)) {
+    return false;
+  }
+
+  const frameUrl = (event.senderFrame as { url?: string } | null | undefined)?.url;
+  if (typeof frameUrl === 'string' && !isTrustedLoopbackUrl(frameUrl, port)) {
+    return false;
+  }
+
+  return true;
 }
 
 /** Preload origin check before Chromium has committed localhost URL. */
@@ -176,9 +278,9 @@ function isEarlyMainWindowSender(
     if (url !== '' && url !== 'about:blank') return false;
     const expectedWindow = getMainWindow();
     return Boolean(
-      expectedWindow
-      && !expectedWindow.isDestroyed()
-      && BrowserWindow.fromWebContents(event.sender) === expectedWindow,
+      expectedWindow &&
+      !expectedWindow.isDestroyed() &&
+      BrowserWindow.fromWebContents(event.sender) === expectedWindow,
     );
   } catch {
     return false;
@@ -187,7 +289,7 @@ function isEarlyMainWindowSender(
 
 function handle<Args extends unknown[]>(channel: string, listener: IpcHandler<Args>): void {
   ipcMain.handle(channel, (event: Electron.IpcMainInvokeEvent, ...args: Args) => {
-    if (!isTrustedSender(event)) return { error: 'Unauthorized sender' };
+    if (!isTrustedMainWindowSender(event)) return { error: 'Unauthorized sender' };
     return listener(event, ...args);
   });
 }
@@ -198,6 +300,7 @@ export function registerIpcHandlers(
   showMainWindow: (window: BrowserWindow) => boolean = () => false,
   getCurrentEffectiveIsDark?: () => boolean,
 ): void {
+  activeMainWindowGetter = getMainWindow;
   ipcMain.on('window-document', (event, documentNonce: unknown) => {
     let currentFrame: Electron.WebFrameMain | null = null;
     try {
@@ -219,8 +322,22 @@ export function registerIpcHandlers(
       : { success: false, error: 'Invalid document nonce' };
   });
 
+  // Opens the native picker for "Restore from a file...". It only chooses a
+  // path; the restore itself is authorised over HTTP by the session that holds
+  // database.manage, so this handler performs no destructive step and is not
+  // Master-PIN gated. The picked path is bound to a single-use token.
+  handle('pick-restore-file', async () => {
+    const result = await dialog.showOpenDialog({
+      filters: [{ name: 'SQLite Database', extensions: ['db'] }],
+      properties: ['openFile'],
+    });
+    if (result.canceled || !result.filePaths.length) return { canceled: true };
+    const selection = rememberRestoreFileSelection(result.filePaths[0]);
+    return { canceled: false, path: selection.path, token: selection.token };
+  });
+
   // Database backup/restore
-  ipcMain.handle('backup-database', async (event, pin?: string) => {
+  handle('backup-database', async (event, pin?: string) => {
     const auth = authorizeMasterPin(pin, 'ipc:backup');
     if (!auth.ok) return { success: false, error: auth.error };
 
@@ -237,14 +354,17 @@ export function registerIpcHandlers(
         return { success: false, error: 'Cancelled' };
       }
 
-      const { path: backupPath, schemaVersion } = await createBackup(result.filePath, shutdownSignal);
+      const { path: backupPath, schemaVersion } = await createBackup(
+        result.filePath,
+        shutdownSignal,
+      );
 
       console.log('[IPC] backup-database: Complete:', backupPath);
       return {
         success: true,
         path: backupPath,
         schemaVersion,
-        message: `Backup saved (Schema v${schemaVersion})`
+        message: `Backup saved (Schema v${schemaVersion})`,
       };
     } catch (error: unknown) {
       console.error('[IPC] backup-database: Error:', error);
@@ -252,7 +372,8 @@ export function registerIpcHandlers(
     }
   });
 
-  ipcMain.handle('restore-backup', async (event, pin?: string, presetBackupPath?: string) => {
+  handle('restore-backup', async (event, pin?: string, presetBackupPath?: string) => {
+    clearRestoreFileSelection();
     const auth = authorizeMasterPin(pin, 'ipc:restore');
     if (!auth.ok) return { success: false, error: auth.error };
 
@@ -281,33 +402,41 @@ export function registerIpcHandlers(
       if (backupVersion === null) {
         return {
           success: false,
-          error: 'Invalid backup file: missing schema version metadata. This backup may have been created with an older version of FloDesktop.'
+          error:
+            'Invalid backup file: missing schema version metadata. This backup may have been created with an older version of FloDesktop.',
         };
       }
 
-      const versionMismatch = backupVersion !== getCurrentSchemaVersion();
+      const currentVersion = getCurrentSchemaVersion();
+      const versionMismatch = backupVersion !== currentVersion;
 
-      if (versionMismatch) {
+      if (backupVersion < currentVersion) {
         const confirmResult = await dialog.showMessageBox({
           type: 'warning',
           buttons: ['Restore Anyway', 'Cancel'],
           defaultId: 1,
           title: 'Schema Version Mismatch',
           message: `Backup was created with Schema v${backupVersion}`,
-          detail: `Current database uses Schema v${getCurrentSchemaVersion()}.\n\nRestoring will import data only (common fields) to preserve new database structure.\n\nDo you want to continue?`
+          detail: `Current database uses Schema v${currentVersion}.\n\nRestoring will replace the current database with this backup and migrate its schema to v${currentVersion}.\n\nDo you want to continue?`,
         });
 
         if (confirmResult.response !== 0) {
           return { success: false, error: 'Cancelled' };
         }
+      }
 
+      await googleDrive.prepareForDatabaseRestore();
+      try {
         const restoreResult = await withDatabaseMaintenanceLock(
-          (signal) => restoreBackup(backupPath, false, signal),
+          (signal) => restoreBackup(backupPath, !versionMismatch, signal),
           shutdownSignal,
         );
+        const cleanup = restoreResult.success ? googleDrive.completeDatabaseRestore() : null;
         clearUserAuthCache();
         clearInMemoryRevokedTokens();
         clearJWTSecretCache();
+        const cleanupPending =
+          restoreResult.cleanupPending === true || cleanup?.cleanupPending === true;
         return {
           success: restoreResult.success,
           mode: restoreResult.mode,
@@ -315,28 +444,14 @@ export function registerIpcHandlers(
           currentVersion: getCurrentSchemaVersion(),
           tablesRestored: restoreResult.tablesRestored,
           message: restoreResult.success
-            ? `Restored ${restoreResult.tablesRestored} tables (data-only mode due to version mismatch)`
+            ? 'Database restored successfully'
             : `Restore failed: ${restoreResult.error}`,
-          error: restoreResult.error
+          error: restoreResult.error,
+          cleanupPending,
         };
+      } finally {
+        googleDrive.releaseDatabaseRestore();
       }
-
-      const restoreResult = await withDatabaseMaintenanceLock(
-        (signal) => restoreBackup(backupPath, true, signal),
-        shutdownSignal,
-      );
-      clearUserAuthCache();
-      clearInMemoryRevokedTokens();
-      clearJWTSecretCache();
-      return {
-        success: restoreResult.success,
-        mode: restoreResult.mode,
-        backupVersion,
-        currentVersion: getCurrentSchemaVersion(),
-        tablesRestored: restoreResult.tablesRestored,
-        message: restoreResult.success ? 'Database restored successfully' : `Restore failed: ${restoreResult.error}`,
-        error: restoreResult.error
-      };
     } catch (error: unknown) {
       console.error('[IPC] restore-backup: Error:', error);
       return { success: false, error: getErrorMessage(error) };
@@ -346,21 +461,23 @@ export function registerIpcHandlers(
   // DB health check / master PIN / initialize (menu + tray triggered)
   handle('db-health-check', async () => {
     return withDatabaseRequest(async () => {
-    try {
-      return runHealthCheck();
-    } catch (error: unknown) {
-      return { error: getErrorMessage(error) };
-    }
+      try {
+        return runHealthCheck();
+      } catch (error: unknown) {
+        return { error: getErrorMessage(error) };
+      }
     });
   });
 
-  handle('db-apply-safe-fixes', async (event, findingIds?: string[]) => {
+  handle('db-apply-safe-fixes', async (event, pin?: string, findingIds?: string[]) => {
+    const auth = authorizeMasterPin(pin, 'ipc:apply-safe-fixes');
+    if (!auth.ok) return { success: false, error: auth.error };
     return withDatabaseRequest(async () => {
-    try {
-      return applySafeFixes(findingIds);
-    } catch (error: unknown) {
-      return { applied: [], skipped: [], errors: [{ id: 'all', error: getErrorMessage(error) }] };
-    }
+      try {
+        return applySafeFixes(findingIds);
+      } catch (error: unknown) {
+        return { applied: [], skipped: [], errors: [{ id: 'all', error: getErrorMessage(error) }] };
+      }
     });
   });
 
@@ -368,30 +485,86 @@ export function registerIpcHandlers(
     return { available: isMasterPinAvailable(), isSet: isMasterPinSet() };
   });
 
-  ipcMain.handle('db-initialize', async (event, { pin, confirmationPhrase }: { pin?: string; confirmationPhrase?: string }) => {
-    const auth = authorizeMasterPin(pin, 'ipc:initialize');
-    if (!auth.ok) return { success: false, error: auth.error };
-    if (confirmationPhrase !== 'INITIALIZE') {
-      return { success: false, error: 'Confirmation phrase does not match' };
-    }
+  handle(
+    'db-initialize',
+    async (event, { pin, confirmationPhrase }: { pin?: string; confirmationPhrase?: string }) => {
+      const auth = authorizeMasterPin(pin, 'ipc:initialize');
+      if (!auth.ok) return { success: false, error: auth.error };
+      if (confirmationPhrase !== 'INITIALIZE') {
+        return { success: false, error: 'Confirmation phrase does not match' };
+      }
 
-    try {
-      const { backupPath } = await resetDatabaseWithBackup(shutdownSignal);
-      clearUserAuthCache();
-      clearInMemoryRevokedTokens();
-      clearJWTSecretCache();
-      return { success: true, backupPath };
-    } catch (error: unknown) {
-      console.error('[IPC] db-initialize: Error:', error);
-      return { success: false, error: getErrorMessage(error) };
-    }
-  });
+      let restorePrepared = false;
+      try {
+        // The owner's typed INITIALIZE may discard a Drive restore boundary that can
+        // never resolve on its own; the reset invalidates Drive state either way.
+        await googleDrive.prepareForDatabaseRestore({ discardUnresolvedBoundary: true });
+        restorePrepared = true;
+        const keepLocalBackup = isLocalBackupEnabled();
+        const { backupPath } = await resetDatabaseWithBackup(shutdownSignal);
+        let localBackupFailed = false;
+        if (keepLocalBackup) {
+          localBackupFailed = retainBackupLocally(backupPath) === null;
+        } else {
+          setLocalBackupEnabled(false);
+        }
+        const cleanup = googleDrive.completeDatabaseRestore();
+        clearUserAuthCache();
+        clearInMemoryRevokedTokens();
+        clearJWTSecretCache();
+        return {
+          success: true,
+          backupPath,
+          cleanupPending: cleanup.cleanupPending,
+          localBackupFailed,
+        };
+      } catch (error: unknown) {
+        console.error('[IPC] db-initialize: Error:', error);
+        return { success: false, error: getErrorMessage(error) };
+      } finally {
+        if (restorePrepared) googleDrive.releaseDatabaseRestore();
+      }
+    },
+  );
 
   // Window-control surface for renderer title bar HTML fallback controls.
   handle('window-action', (event, action: unknown) => {
     const win = BrowserWindow.fromWebContents(event.sender);
     if (!win || win.isDestroyed()) return { error: 'Window unavailable' };
     return applyWindowControlAction(win, action);
+  });
+
+  // Application menu for the frameless Windows/Linux title bar. Electron does
+  // not draw a menu bar on a frameless window, so the renderer renders the
+  // top-level labels and main pops the matching submenu from the same Menu
+  // object createMenu() already applied (accelerators keep working). macOS
+  // keeps its authoritative native menu bar and has no title-bar menu.
+  handle('get-application-menu', () => {
+    if (process.platform === 'darwin') return { entries: [] };
+    const menu = Menu.getApplicationMenu() ?? null;
+    return { entries: menu ? listApplicationMenuEntries(menu.items) : [] };
+  });
+
+  handle('open-application-menu', (event, key: unknown, x: unknown, y: unknown) => {
+    if (process.platform === 'darwin') return { error: 'Application menu is native on macOS' };
+    // Bind the popup to the main window's own current renderer frame.
+    let currentFrame: Electron.WebFrameMain | null = null;
+    try {
+      currentFrame = event.sender.mainFrame;
+    } catch {
+      return { error: 'Unauthorized sender' };
+    }
+    const mainWindow = getMainWindow?.() ?? null;
+    if (
+      !isApplicationMenuSender(mainWindow, {
+        window: BrowserWindow.fromWebContents(event.sender),
+        currentFrame,
+        senderFrame: event.senderFrame,
+      })
+    ) {
+      return { error: 'Unauthorized sender' };
+    }
+    return openApplicationMenuSubmenu(Menu.getApplicationMenu() ?? null, key, mainWindow, x, y);
   });
 
   handle('get-window-state', (event) => {
@@ -427,50 +600,67 @@ export function registerIpcHandlers(
   // Settings
   handle('get-settings', async () => {
     return withDatabaseRequest(async () => {
-    try {
-      const db = getDatabase();
-      const rows = db.prepare('SELECT key, value FROM settings').all() as { key: string; value: string }[];
-      const settings: Record<string, string> = {};
-      rows.forEach((row) => {
-        settings[row.key] = maskSetting(row.key, row.value);
-      });
-      return settings;
-    } catch (error: unknown) {
-      return { error: getErrorMessage(error) };
-    }
+      try {
+        const db = getDatabase();
+        const rows = db.prepare('SELECT key, value FROM settings').all() as {
+          key: string;
+          value: string;
+        }[];
+        const settings: Record<string, string> = {};
+        rows.forEach((row) => {
+          settings[row.key] = maskSetting(row.key, row.value);
+        });
+        return settings;
+      } catch (error: unknown) {
+        return { error: getErrorMessage(error) };
+      }
     });
   });
 
-  handle('set-setting', async (event, key: string, value: string) => {
+  handle('set-setting', async (event, key: string, value: string, authToken?: unknown) => {
     return withDatabaseRequest(async () => {
-    try {
-      if (typeof key !== 'string' || typeof value !== 'string' || value.length > 10_000) {
-        return { success: false, error: 'Invalid setting value' };
+      try {
+        const auth = await authorizeRendererPermission(event, authToken, 'settings.manage', {
+          allowPreSetup: key === 'theme_mode',
+        });
+        if (!auth.ok) {
+          return { success: false, error: auth.error || 'Insufficient permissions' };
+        }
+        if (typeof key !== 'string' || typeof value !== 'string' || value.length > 10_000) {
+          return { success: false, error: 'Invalid setting value' };
+        }
+        if (!ALLOWED_IPC_KEYS.has(key)) {
+          return { success: false, error: 'Setting not allowed via IPC' };
+        }
+        if (key === 'theme_mode' && !isThemeMode(value)) {
+          return { success: false, error: 'Invalid theme_mode value' };
+        }
+        if (key === 'orders_layout' && !isOrdersLayout(value)) {
+          return { success: false, error: 'orders_layout must be "split" or "cards"' };
+        }
+        const db = getDatabase();
+        db.prepare('INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES (?, ?, ?)').run(
+          key,
+          value,
+          now(),
+        );
+        return { success: true };
+      } catch (error: unknown) {
+        return { success: false, error: getErrorMessage(error) };
       }
-      if (!ALLOWED_IPC_KEYS.has(key)) {
-        return { success: false, error: 'Setting not allowed via IPC' };
-      }
-      if (key === 'theme_mode' && !isThemeMode(value)) {
-        return { success: false, error: 'Invalid theme_mode value' };
-      }
-      const db = getDatabase();
-      db.prepare('INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES (?, ?, ?)')
-        .run(key, value, now());
-      return { success: true };
-    } catch (error: unknown) {
-      return { success: false, error: getErrorMessage(error) };
-    }
     });
   });
 
   // WhatsApp status snapshot for renderer polling on app focus
-  handle('whatsapp-get-status', async () => withDatabaseRequest(async () => {
-    try {
-      return getWhatsAppStatus();
-    } catch (err: unknown) {
-      return { error: getErrorMessage(err) };
-    }
-  }));
+  handle('whatsapp-get-status', async () =>
+    withDatabaseRequest(async () => {
+      try {
+        return getWhatsAppStatus();
+      } catch (err: unknown) {
+        return { error: getErrorMessage(err) };
+      }
+    }),
+  );
 
   handle('whatsapp-open-share', async (_event, rawUrl: unknown) => {
     if (typeof rawUrl !== 'string' || !isSafeWhatsAppShareUrl(rawUrl)) {
@@ -556,98 +746,119 @@ export function registerIpcHandlers(
     }
   });
 
+  // FactorPOS: opens a local email draft with the recent (sanitized) log attached.
   handle('email-error-log', async () => {
     try {
       const { text } = readRecentLogTail();
       const draftPath = createErrorLogEmailDraft(text);
       const openError = await shell.openPath(draftPath);
-      return openError
-        ? { success: false, error: openError }
-        : { success: true };
+      return openError ? { success: false, error: openError } : { success: true };
     } catch (error: unknown) {
       return { success: false, error: getErrorMessage(error) };
     }
   });
 
-  // Reports a caught renderer-side exception via anonymous telemetry.
-  handle('report-renderer-error', async (event, report: unknown) => {
-    const r = report as { message?: unknown; stack?: unknown; digest?: unknown; route?: unknown } | null;
-    const clamp = (value: unknown, max: number): string | undefined =>
-      typeof value === 'string' ? value.slice(0, max) : undefined;
-    const sent = await sendTelemetryEvent('renderer_error', {
-      message: clamp(r?.message, 500),
-      stack: clamp(r?.stack, 4000),
-      digest: clamp(r?.digest, 200),
-      route: clamp(r?.route, 200),
+  // Renderer failures are classified locally; message, stack, digest and route
+  // can contain business data and are never sent automatically.
+  handle('report-renderer-error', async () => {
+    cloudSync.captureOperationFailure({
+      capture_point: 'fc.electron.renderer.exception',
+      outcome: 'unknown',
+      correlation_id: randomUUID(),
     });
-    return { success: sent };
+    return { success: true };
+  });
+
+  handle('get-posthog-bootstrap', async () => {
+    try {
+      return readPostHogBootstrap();
+    } catch {
+      return { enabled: false };
+    }
   });
 
   // Printers
   handle('get-printers', async () => {
     return withDatabaseRequest(async () => {
-    try {
-      const db = getDatabase();
-      const printers = db.prepare('SELECT * FROM printers ORDER BY name').all();
-      return printers;
-    } catch (error: unknown) {
-      return { error: getErrorMessage(error) };
-    }
+      try {
+        const db = getDatabase();
+        const printers = db.prepare('SELECT * FROM printers ORDER BY name').all();
+        return printers;
+      } catch (error: unknown) {
+        return { error: getErrorMessage(error) };
+      }
     });
   });
 
-  handle('save-printer', async (event, printer: IpcPrinterInput) => {
-    return withDatabaseRequest(async () => {
+  // Saves renderer-built print HTML (the menu, and future documents) as a PDF
+  // through an offscreen window, so a merchant can share it without a printer.
+  handle('save-html-as-pdf', async (_event, payload: unknown) => {
+    if (!payload || typeof payload !== 'object')
+      return { success: false, error: 'Invalid PDF request' };
+    const { html, defaultFileName, pageSize } = payload as {
+      html?: unknown;
+      defaultFileName?: unknown;
+      pageSize?: unknown;
+    };
+    if (typeof html !== 'string' || html.length === 0) {
+      return { success: false, error: 'Invalid PDF request' };
+    }
+    if (Buffer.byteLength(html, 'utf8') > MAX_PDF_HTML_BYTES) {
+      return { success: false, error: 'Document too large to export' };
+    }
+    const resolvedPageSize = pageSize === 'Letter' ? 'Letter' : 'A4';
+    const requestedName = typeof defaultFileName === 'string' ? defaultFileName.trim() : '';
+    const baseName = requestedName.replace(/[^\w.\- ]+/g, '-').slice(0, 80) || 'document.pdf';
+    const saveResult = await dialog.showSaveDialog({
+      defaultPath: path.join(
+        app.getPath('documents'),
+        baseName.endsWith('.pdf') ? baseName : `${baseName}.pdf`,
+      ),
+      filters: [{ name: 'PDF', extensions: ['pdf'] }],
+    });
+    if (saveResult.canceled || !saveResult.filePath) return { success: false, canceled: true };
+
     try {
-      // Validate printer name — reject names with shell metacharacters (command injection defense)
-      const PRINTER_NAME_REGEX = /^[a-zA-Z0-9\s\-_.()]+$/;
-      if (printer.name && !PRINTER_NAME_REGEX.test(printer.name)) {
-        return { success: false, error: 'Printer name contains invalid characters' };
-      }
-      const db = getDatabase();
-      const port = printer.port === null ? null : (printer.port || 9100);
-      if (printer.id) {
-        db.prepare(`
-          UPDATE printers SET name = ?, connection_type = ?, ip_address = ?,
-            port = ?, is_default = ?, updated_at = ?
-          WHERE id = ?
-        `).run(printer.name, printer.connection_type, printer.ip_address ?? null,
-          port, printer.is_default ? 1 : 0, now(), printer.id);
-      } else {
-        db.prepare(`
-          INSERT INTO printers (id, name, connection_type, ip_address, port, is_default, created_at, updated_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        `).run(randomUUID(), printer.name, printer.connection_type, printer.ip_address ?? null,
-          port, printer.is_default ? 1 : 0, now(), now());
-      }
-      return { success: true };
-    } catch (error: unknown) {
+      const pdfData = await renderHtmlToPdfBuffer({ html, pageSize: resolvedPageSize });
+      await fs.promises.writeFile(saveResult.filePath, pdfData);
+      return { success: true, path: saveResult.filePath };
+    } catch (error) {
       return { success: false, error: getErrorMessage(error) };
     }
-    });
   });
 
   handle('rasterize-print-document', async (_event, payload: unknown) => {
-    if (!payload || typeof payload !== 'object') return { ok: false, error: 'Invalid raster document request' };
+    if (!payload || typeof payload !== 'object')
+      return { ok: false, error: 'Invalid raster document request' };
     const request = payload as {
       document?: unknown;
       template?: unknown;
       profileId?: unknown;
       options?: unknown;
     };
-    if (!isPrintDocument(request.document)
-      || (request.template !== 'classic' && request.template !== 'compact')
-      || typeof request.profileId !== 'string' || request.profileId.length === 0
-      || !request.options || typeof request.options !== 'object') {
+    if (
+      !isPrintDocument(request.document) ||
+      (request.template !== 'classic' && request.template !== 'compact') ||
+      typeof request.profileId !== 'string' ||
+      request.profileId.length === 0 ||
+      !request.options ||
+      typeof request.options !== 'object'
+    ) {
       return { ok: false, error: 'Invalid raster document request' };
     }
     const options = request.options as Record<string, unknown>;
-    if (!isValidRasterColumns(options.columns)
-      || typeof options.language !== 'string' || typeof options.locale !== 'string'
-      || typeof options.currency !== 'string' || typeof options.currencySymbol !== 'string'
-      || typeof options.trimDecimals !== 'boolean' || typeof options.useUnicode !== 'boolean'
-      || typeof options.arabicShaping !== 'boolean'
-      || (options.timezone !== undefined && typeof options.timezone !== 'string')) {
+    if (
+      !isValidRasterColumns(options.columns) ||
+      typeof options.language !== 'string' ||
+      typeof options.locale !== 'string' ||
+      typeof options.currency !== 'string' ||
+      typeof options.currencySymbol !== 'string' ||
+      typeof options.trimDecimals !== 'boolean' ||
+      typeof options.useUnicode !== 'boolean' ||
+      typeof options.arabicShaping !== 'boolean' ||
+      (options.timezone !== undefined && typeof options.timezone !== 'string') ||
+      (options.textSize !== undefined && !isPrinterTextSize(options.textSize))
+    ) {
       return { ok: false, error: 'Invalid raster document options' };
     }
     try {
@@ -663,22 +874,32 @@ export function registerIpcHandlers(
   });
 
   handle('rasterize-kot-document', async (_event, payload: unknown) => {
-    if (!payload || typeof payload !== 'object') return { ok: false, error: 'Invalid raster KOT request' };
+    if (!payload || typeof payload !== 'object')
+      return { ok: false, error: 'Invalid raster KOT request' };
     const request = payload as {
       document?: unknown;
       profileId?: unknown;
       options?: unknown;
     };
-    if (!isKotDocument(request.document)
-      || typeof request.profileId !== 'string'
-      || request.profileId.length === 0 || !request.options || typeof request.options !== 'object') {
+    if (
+      !isKotDocument(request.document) ||
+      typeof request.profileId !== 'string' ||
+      request.profileId.length === 0 ||
+      !request.options ||
+      typeof request.options !== 'object'
+    ) {
       return { ok: false, error: 'Invalid raster KOT request' };
     }
     const options = request.options as Record<string, unknown>;
-    if (!isValidRasterColumns(options.columns)
-      || typeof options.language !== 'string' || typeof options.locale !== 'string'
-      || (options.timezone !== undefined && typeof options.timezone !== 'string')
-      || typeof options.useUnicode !== 'boolean' || typeof options.arabicShaping !== 'boolean') {
+    if (
+      !isValidRasterColumns(options.columns) ||
+      typeof options.language !== 'string' ||
+      typeof options.locale !== 'string' ||
+      (options.timezone !== undefined && typeof options.timezone !== 'string') ||
+      (options.textSize !== undefined && !isPrinterTextSize(options.textSize)) ||
+      typeof options.useUnicode !== 'boolean' ||
+      typeof options.arabicShaping !== 'boolean'
+    ) {
       return { ok: false, error: 'Invalid raster KOT options' };
     }
     try {
@@ -690,43 +911,6 @@ export function registerIpcHandlers(
     } catch (error: unknown) {
       return { ok: false, error: getErrorMessage(error) };
     }
-  });
-
-  // Reports
-  handle('get-daily-summary', async () => {
-    return withDatabaseRequest(async () => {
-    try {
-      const db = getDatabase();
-      const today = new Date().toISOString().slice(0, 10);
-      const minorFactor = getCurrencyMinorUnitFactor(getTenantCurrency(db));
-
-      const bills = db.prepare(`
-        SELECT
-          (SELECT COUNT(*) FROM bills WHERE date(paid_at) = date(?)) as bill_count,
-          COALESCE((SELECT SUM(paid_amount) FROM bills WHERE date(paid_at) = date(?)), 0)
-          - COALESCE((SELECT SUM(CAST(amount_cents AS REAL)) / ? FROM refunds WHERE date(created_at) = date(?)), 0) as revenue
-      `).get(today, today, minorFactor, today) as { bill_count: number; revenue: number };
-
-      const covers = db.prepare(`
-        SELECT COALESCE(SUM(guest_count), 0) as covers FROM orders
-        WHERE date(created_at) = date(?) AND status != 'cancelled'
-      `).get(today) as { covers: number };
-
-      const pendingOrders = db.prepare(`
-        SELECT COUNT(*) as count FROM orders WHERE status IN ('pending', 'preparing')
-      `).get() as { count: number };
-
-      return {
-        date: today,
-        revenue: bills.revenue,
-        bill_count: bills.bill_count,
-        covers: covers.covers,
-        pending_orders: pendingOrders.count,
-      };
-    } catch (error: unknown) {
-      return { error: getErrorMessage(error) };
-    }
-    });
   });
 
   console.log('[IPC] Handlers registered');

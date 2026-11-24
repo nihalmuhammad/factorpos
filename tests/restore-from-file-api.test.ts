@@ -1,0 +1,404 @@
+/**
+ * Restore-from-file API tests.
+ *
+ * Pins the authorised alternative to the Master PIN gate: a restore over HTTP is
+ * allowed for a session holding database.manage, it requires the typed
+ * confirmation phrase, and it only accepts a file the operator actually picked in
+ * the native dialog — never an arbitrary renderer-supplied path.
+ *
+ * Usage: node tests/run-electron-node-test.cjs tests/restore-from-file-api.test.ts
+ */
+
+import * as assert from 'node:assert/strict';
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
+
+const Module = require('module');
+const originalLoad = Module._load;
+const testDir = fs.mkdtempSync(path.join(os.tmpdir(), 'flo-restore-from-file-api-'));
+
+const mockApp = { isPackaged: true, getPath: () => testDir, getVersion: () => 'test' };
+const mockSafeStorage = {
+  isEncryptionAvailable: () => true,
+  encryptString: (s: string) => Buffer.from(s, 'utf8'),
+  decryptString: (b: Buffer) => b.toString('utf8'),
+};
+
+Module._load = function (request: string, parent: unknown, isMain: boolean) {
+  if (request === 'electron') return { app: mockApp, safeStorage: mockSafeStorage };
+  return originalLoad.apply(this, arguments as any);
+};
+
+process.env.JWT_SECRET = 'test-secret-restore-from-file';
+
+const express = require('express');
+const expressRateLimit = require('express-rate-limit');
+const jwt = require('jsonwebtoken');
+const request = require('supertest');
+const Database = require('better-sqlite3');
+const { API_JSON_BODY_LIMIT } = require('../main/http-limits');
+const {
+  initDatabase,
+  getDatabase,
+  closeDatabase,
+  createBackup,
+  nextTokenIatSeconds,
+  now,
+} = require('../main/db');
+const { isAllowedPrivateIp } = require('../main/middleware/security');
+const { getJWTSecret } = require('../main/routes/auth');
+const { databaseRoutes } = require('../main/routes/database');
+const {
+  rememberRestoreFileSelection,
+  consumeRestoreFileSelection,
+  clearRestoreFileSelection,
+} = require('../main/services/restore-file-selection');
+
+const RESTORE_CONFIRMATION = 'RESTORE BACKUP';
+
+function ownerToken(): string {
+  return jwt.sign(
+    { userId: 'restore-owner', role: 'owner', iat: nextTokenIatSeconds() },
+    getJWTSecret(),
+    { expiresIn: '10m' },
+  );
+}
+
+function serverToken(): string {
+  return jwt.sign(
+    { userId: 'restore-server', role: 'server', iat: nextTokenIatSeconds() },
+    getJWTSecret(),
+    {
+      expiresIn: '10m',
+    },
+  );
+}
+
+async function run() {
+  try {
+    fs.mkdirSync(path.join(testDir, 'backups'), { recursive: true });
+    initDatabase();
+
+    const { databaseMaintenanceMiddleware } = require('../main/db');
+    const { authRoutes } = require('../main/routes/auth');
+    const { requireAuth } = require('../main/server');
+    const app = express();
+    // Same chain main/server.ts mounts, in the same order, so this test exercises
+    // the route the way production reaches it rather than a quieter variant.
+    app.use(express.json({ limit: API_JSON_BODY_LIMIT }));
+    app.use('/api', databaseMaintenanceMiddleware);
+    app.use(
+      '/api',
+      expressRateLimit({
+        windowMs: 60 * 1000,
+        limit: 100,
+        standardHeaders: true,
+        legacyHeaders: false,
+        skip: (req: any) => isAllowedPrivateIp(req.ip || req.socket.remoteAddress || ''),
+      }),
+    );
+    app.use(requireAuth);
+    app.use('/api/auth', authRoutes);
+    app.use('/api/db', databaseRoutes);
+
+    const seedUser = (id: string, role: string) =>
+      getDatabase()
+        .prepare(`
+      INSERT INTO users (id, name, email, password, role, is_active, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, 1, ?, ?)
+    `)
+        .run(id, id, `${id}@test.local`, 'not-a-real-hash', role, now(), now());
+    seedUser('restore-owner', 'owner');
+    seedUser('restore-server', 'server');
+
+    const backupSource = (await createBackup()).path;
+    getDatabase()
+      .prepare('INSERT INTO categories (id, name) VALUES (?, ?)')
+      .run('api-post-backup', 'Added After Backup');
+
+    // --- confirmation phrase is required --------------------------------------
+    const noConfirmSelection = rememberRestoreFileSelection(backupSource);
+    const missingPhrase = await request(app)
+      .post('/api/db/restore')
+      .set('Authorization', `Bearer ${ownerToken()}`)
+      .send({ selection_token: noConfirmSelection.token });
+    assert.equal(missingPhrase.status, 400, 'restore without the confirmation phrase is refused');
+    clearRestoreFileSelection();
+
+    // --- an unpicked path is refused ------------------------------------------
+    const noSelection = await request(app)
+      .post('/api/db/restore')
+      .set('Authorization', `Bearer ${ownerToken()}`)
+      .send({ confirmation: RESTORE_CONFIRMATION, selection_token: 'invented-token' });
+    assert.equal(noSelection.status, 400, 'restore with a token that was never issued is refused');
+    assert.match(
+      noSelection.body.error,
+      /Choose a backup file/,
+      'the refusal explains the file must be chosen first',
+    );
+
+    // --- a session without database.manage is refused -------------------------
+    const unprivilegedSelection = rememberRestoreFileSelection(backupSource);
+    const unprivileged = await request(app)
+      .post('/api/db/restore')
+      .set('Authorization', `Bearer ${serverToken()}`)
+      .send({ confirmation: RESTORE_CONFIRMATION, selection_token: unprivilegedSelection.token });
+    assert.equal(
+      unprivileged.status,
+      403,
+      'restore is refused for a session without database.manage',
+    );
+    clearRestoreFileSelection();
+
+    // --- an unauthenticated caller is refused ---------------------------------
+    const anonymousSelection = rememberRestoreFileSelection(backupSource);
+    const anonymous = await request(app)
+      .post('/api/db/restore')
+      .send({ confirmation: RESTORE_CONFIRMATION, selection_token: anonymousSelection.token });
+    assert.equal(anonymous.status, 401, 'restore is refused without a session');
+    clearRestoreFileSelection();
+
+    // --- failed pre-validation (missing or invalid backup) does not consume token ---
+    const missingBackupPath = path.join(testDir, 'missing-backup.db');
+    const missingSelection = rememberRestoreFileSelection(missingBackupPath);
+    const missingRes = await request(app)
+      .post('/api/db/restore')
+      .set('Authorization', `Bearer ${ownerToken()}`)
+      .send({ confirmation: RESTORE_CONFIRMATION, selection_token: missingSelection.token });
+    assert.equal(missingRes.status, 404, 'restore of missing file returns 404');
+    assert.equal(
+      consumeRestoreFileSelection(missingSelection.token),
+      missingBackupPath,
+      'missing-file failure does not consume the selection token',
+    );
+
+    const invalidBackupPath = path.join(testDir, 'invalid-backup.db');
+    fs.writeFileSync(invalidBackupPath, 'not a valid backup');
+    const invalidSelection = rememberRestoreFileSelection(invalidBackupPath);
+    const invalidRes = await request(app)
+      .post('/api/db/restore')
+      .set('Authorization', `Bearer ${ownerToken()}`)
+      .send({ confirmation: RESTORE_CONFIRMATION, selection_token: invalidSelection.token });
+    assert.equal(invalidRes.status, 400, 'restore of invalid backup file returns 400');
+    assert.equal(
+      consumeRestoreFileSelection(invalidSelection.token),
+      invalidBackupPath,
+      'invalid-file failure does not consume the selection token',
+    );
+    clearRestoreFileSelection();
+
+    // --- a valid single-use selection restores --------------------------------
+    const selection = rememberRestoreFileSelection(backupSource);
+    const restored = await request(app)
+      .post('/api/db/restore')
+      .set('Authorization', `Bearer ${ownerToken()}`)
+      .send({ confirmation: RESTORE_CONFIRMATION, selection_token: selection.token });
+    assert.equal(
+      restored.status,
+      200,
+      `restore from a picked file succeeds (got ${restored.status}: ${JSON.stringify(restored.body)})`,
+    );
+    assert.equal(restored.body.success, true, 'restore reports success');
+    assert.equal(
+      getDatabase().prepare('SELECT id FROM categories WHERE id = ?').get('api-post-backup'),
+      undefined,
+      'the restore replaced the data added after the backup was taken',
+    );
+
+    // The token is single use: replaying it must not restore again.
+    const replay = await request(app)
+      .post('/api/db/restore')
+      .set('Authorization', `Bearer ${ownerToken()}`)
+      .send({ confirmation: RESTORE_CONFIRMATION, selection_token: selection.token });
+    assert.equal(replay.status, 400, 'a restore selection token cannot be replayed');
+
+    // --- the selection service itself -----------------------------------------
+    clearRestoreFileSelection();
+    assert.equal(
+      consumeRestoreFileSelection('anything'),
+      null,
+      'no selection means nothing to consume',
+    );
+    const reused = rememberRestoreFileSelection(backupSource);
+    assert.equal(
+      consumeRestoreFileSelection('wrong-token'),
+      null,
+      'a mismatched token does not yield the path',
+    );
+    assert.equal(
+      consumeRestoreFileSelection(reused.token),
+      backupSource,
+      'the matching token yields the picked path once',
+    );
+    assert.equal(
+      consumeRestoreFileSelection(reused.token),
+      null,
+      'the selection is consumed after one use',
+    );
+
+    // --- backup endpoint and trailing slash support ---------------------------
+    const { setMasterPin } = require('../main/services/master-pin');
+    setMasterPin('1234');
+
+    const noSlashBackup = await request(app)
+      .post('/api/db/backup')
+      .set('Authorization', `Bearer ${ownerToken()}`)
+      .send({ master_pin: '1234' });
+    assert.equal(
+      noSlashBackup.status,
+      200,
+      'no-slash backup succeeds without maintenance deadlock',
+    );
+    assert.equal(noSlashBackup.body.success, true, 'no-slash backup reports success');
+
+    const trailingSlashBackup = await request(app)
+      .post('/api/db/backup/')
+      .set('Authorization', `Bearer ${ownerToken()}`)
+      .send({ master_pin: '1234' });
+    assert.equal(
+      trailingSlashBackup.status,
+      200,
+      'trailing-slash backup succeeds without maintenance deadlock',
+    );
+    assert.equal(trailingSlashBackup.body.success, true, 'trailing-slash backup reports success');
+
+    // --- fresh install: no session needed, but only while no account exists ---
+    const guardedSelection = rememberRestoreFileSelection(backupSource);
+    const guarded = await request(app)
+      .post('/api/auth/setup/restore')
+      .send({ confirmation: RESTORE_CONFIRMATION, selection_token: guardedSelection.token });
+    assert.equal(guarded.status, 403, 'fresh-install restore is refused once accounts exist');
+    clearRestoreFileSelection();
+
+    getDatabase().pragma('foreign_keys = OFF');
+    getDatabase().prepare('DELETE FROM users').run();
+    getDatabase().pragma('foreign_keys = ON');
+    const unversionedBackup = path.join(testDir, 'unversioned.db');
+    fs.copyFileSync(
+      path.join(__dirname, 'fixtures/upgrade-snapshots/pre-migration-scheme-v1.5.0.db'),
+      unversionedBackup,
+    );
+    const unversionedSelection = rememberRestoreFileSelection(unversionedBackup);
+    const unversioned = await request(app)
+      .post('/api/auth/setup/restore')
+      .send({ confirmation: RESTORE_CONFIRMATION, selection_token: unversionedSelection.token });
+    assert.equal(unversioned.status, 400, 'a backup without a usable version is not guessed');
+    assert.equal(
+      consumeRestoreFileSelection(unversionedSelection.token),
+      unversionedBackup,
+      'unversioned preflight does not consume the selection',
+    );
+
+    const zeroMetaBackup = path.join(testDir, 'zero-meta.db');
+    fs.copyFileSync(backupSource, zeroMetaBackup);
+    {
+      const zeroMetaDb = new Database(zeroMetaBackup);
+      zeroMetaDb.prepare("UPDATE _flo_meta SET value = '0' WHERE key = 'schema_version'").run();
+      zeroMetaDb.close();
+    }
+    const zeroMetaSelection = rememberRestoreFileSelection(zeroMetaBackup);
+    const zeroMeta = await request(app)
+      .post('/api/auth/setup/restore')
+      .send({ confirmation: RESTORE_CONFIRMATION, selection_token: zeroMetaSelection.token });
+    assert.equal(zeroMeta.status, 400, 'zero metadata schema_version fails preflight with 400');
+    assert.equal(
+      consumeRestoreFileSelection(zeroMetaSelection.token),
+      zeroMetaBackup,
+      'zero metadata preflight does not consume the selection',
+    );
+
+    const legacyBackup = path.join(testDir, 'legacy-v56.db');
+    fs.copyFileSync(
+      path.join(__dirname, 'fixtures/upgrade-snapshots/schema-v56-pre-tax-registration-rename.db'),
+      legacyBackup,
+    );
+    const legacyDb = new Database(legacyBackup);
+    legacyDb
+      .prepare(
+        "INSERT INTO users (id, name, email, password, role) VALUES ('legacy-owner', 'Legacy Owner', 'legacy@test.local', 'test-hash', 'owner')",
+      )
+      .run();
+    legacyDb
+      .prepare("INSERT INTO categories (id, name) VALUES ('legacy-category', 'Legacy Category')")
+      .run();
+    legacyDb.close();
+    assert.equal(
+      fs.existsSync(`${legacyBackup}-wal`),
+      false,
+      'the historical fixture is self-contained before selection',
+    );
+    assert.equal(
+      fs.existsSync(`${legacyBackup}-shm`),
+      false,
+      'the historical fixture has no shared-memory sidecar',
+    );
+    const legacyBytes = fs.readFileSync(legacyBackup);
+    const freshSelection = rememberRestoreFileSelection(legacyBackup);
+    const fresh = await request(app)
+      .post('/api/auth/setup/restore')
+      .send({ confirmation: RESTORE_CONFIRMATION, selection_token: freshSelection.token });
+    assert.equal(
+      fresh.status,
+      200,
+      `fresh-install restore needs no session (got ${fresh.status}: ${JSON.stringify(fresh.body)})`,
+    );
+    assert.equal(
+      (
+        getDatabase()
+          .prepare("SELECT COUNT(*) AS n FROM users WHERE role = 'owner' AND is_active = 1")
+          .get() as { n: number }
+      ).n > 0,
+      true,
+      'an active owner can sign in after the fresh-install restore',
+    );
+    assert.equal(fresh.body.backupVersion, 56, 'the SQLite header identifies the legacy version');
+    assert.ok(
+      getDatabase().prepare("SELECT id FROM categories WHERE id = 'legacy-category'").get(),
+      'legacy data survives migration',
+    );
+    assert.ok(
+      getDatabase()
+        .prepare('PRAGMA table_info(printers)')
+        .all()
+        .some((column: { name: string }) => column.name === 'profile_id'),
+      'the restored database runs forward migrations',
+    );
+    assert.equal(
+      Number(
+        getDatabase().prepare("SELECT value FROM _flo_meta WHERE key = 'schema_version'").get()
+          .value,
+      ),
+      fresh.body.currentVersion,
+      'the migrated database is stamped with its current version',
+    );
+    assert.deepEqual(
+      fs.readFileSync(legacyBackup),
+      legacyBytes,
+      'restoring does not modify the selected file',
+    );
+    assert.equal(
+      fs.existsSync(`${legacyBackup}-wal`),
+      false,
+      'restore leaves no WAL beside the selected file',
+    );
+    assert.equal(
+      fs.existsSync(`${legacyBackup}-shm`),
+      false,
+      'restore leaves no shared-memory sidecar beside the selected file',
+    );
+
+    console.log('✅ Restore-from-file API and authorisation tests passed');
+  } finally {
+    try {
+      closeDatabase();
+    } catch {}
+    Module._load = originalLoad;
+    fs.rmSync(testDir, { recursive: true, force: true });
+  }
+}
+
+run().catch((error) => {
+  console.error(error);
+  process.exit(1);
+});

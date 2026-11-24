@@ -44,10 +44,26 @@ const mockApp = {
   getName: () => 'FloCafe',
   getVersion: () => '0.0.0-test',
 };
+const mainFrame = { frameToken: 'frame-main', detached: false };
 const mockBrowserWindow = class {
   loadURL() {}
   on() {}
-  webContents = { send: () => {}, on: () => {} };
+  isDestroyed() {
+    return false;
+  }
+  webContents = { send: () => {}, on: () => {}, mainFrame };
+  static fromWebContents(sender: any) {
+    return sender?.ownerWindow ?? null;
+  }
+};
+const mainWin = new mockBrowserWindow();
+const trustedSender = {
+  sender: {
+    ownerWindow: mainWin,
+    mainFrame,
+    getURL: () => 'http://localhost:3001/',
+  },
+  senderFrame: mainFrame,
 };
 
 Module._load = function (request: string, parent: any, isMain: boolean) {
@@ -70,7 +86,11 @@ Module._load = function (request: string, parent: any, isMain: boolean) {
   }
   // Stubs required by main/ipc.ts imports (mirrors tests/printer-ipc.test.ts).
   if (request === './middleware/security') {
-    return { clearInMemoryRevokedTokens: () => {}, clearUserAuthCache: () => {} };
+    return {
+      clearInMemoryRevokedTokens: () => {},
+      clearUserAuthCache: () => {},
+      isTokenStale: () => false,
+    };
   }
   if (request === './routes/auth') return { clearJWTSecretCache: () => {} };
   if (request === './server') return { getLocalIP: () => '127.0.0.1' };
@@ -131,7 +151,7 @@ async function main() {
   console.log('  theme_mode Write-Path Tests (gh-513)');
   console.log('═══════════════════════════════════════════════════════════\n');
 
-  const { initDatabase, getDatabase, closeDatabase } = require('../main/db');
+  const { initDatabase, getDatabase, closeDatabase, now } = require('../main/db');
   const { settingsRoutes } = require('../main/routes/settings');
   const { registerIpcHandlers } = require('../main/ipc');
 
@@ -145,15 +165,32 @@ async function main() {
     throw e;
   }
 
+  // requirePermission() resolves effective permissions from a real users row
+  // keyed by req.user.userId — seed an active owner so settings checks pass.
+  getDatabase()
+    .prepare(`
+    INSERT INTO users (id, name, email, password, role, is_active, created_at, updated_at)
+    VALUES ('theme-mode-owner', 'Test Owner', 'theme-mode-owner@test.local', 'unused', 'owner', 1, ?, ?)
+    ON CONFLICT(id) DO NOTHING
+  `)
+    .run(now(), now());
+
+  const jwt = require('jsonwebtoken');
+  const { getJWTSecret } = require('../main/security/jwt-secret');
+  const ownerToken = jwt.sign(
+    { userId: 'theme-mode-owner', role: 'owner', iat: Math.floor(Date.now() / 1000) },
+    getJWTSecret(),
+    { algorithm: 'HS256' },
+  );
+
   // Register IPC handlers against the mocked ipcMain (printer-ipc pattern).
-  registerIpcHandlers();
+  registerIpcHandlers(undefined, () => mainWin as any);
 
   // Mount a minimal Express app with the real settings router + auth-mock
-  // (owner role satisfies requireRole(...ROLE_ACCESS.ownerManager)).
   const app = express();
   app.use(express.json());
   app.use((req: any, _res: any, next: any) => {
-    req.user = { id: 1, role: 'owner', name: 'Test Owner' };
+    req.user = { userId: 'theme-mode-owner', role: 'owner', name: 'Test Owner' };
     next();
   });
   app.use('/api/settings', settingsRoutes);
@@ -185,7 +222,10 @@ async function main() {
         body: JSON.stringify({ value: 'bogus' }),
       });
       assert.equal(res.status, 400, 'returns 400');
-      assert.ok(String(res.data?.error).includes('Invalid theme_mode value'), 'error mentions theme_mode');
+      assert.ok(
+        String(res.data?.error).includes('Invalid theme_mode value'),
+        'error mentions theme_mode',
+      );
     }
 
     // ── HTTP wildcard PUT — also rejects non-string non-mode values ──
@@ -208,9 +248,9 @@ async function main() {
       });
       assert.equal(res.status, 200, 'returns 200');
       const db = getDatabase();
-      const row = db
-        .prepare("SELECT value FROM settings WHERE key = 'theme_mode'")
-        .get() as { value: string } | undefined;
+      const row = db.prepare("SELECT value FROM settings WHERE key = 'theme_mode'").get() as
+        | { value: string }
+        | undefined;
       assert.equal(row?.value, 'dark', 'row persisted to SQLite as "dark"');
     }
 
@@ -219,8 +259,7 @@ async function main() {
     {
       const handler = registered.get('set-setting');
       assert.ok(!!handler, 'set-setting IPC handler is registered');
-      const trustedSender = { sender: { getURL: () => 'http://localhost:3001/' } };
-      const result = await handler!(trustedSender, 'theme_mode', 'bogus');
+      const result = await handler!(trustedSender, 'theme_mode', 'bogus', ownerToken);
       assert.equal(result?.success, false, 'returns success: false');
       assert.equal(result?.error, 'Invalid theme_mode value', 'returns the expected error');
     }
@@ -229,13 +268,12 @@ async function main() {
     console.log('\n5. IPC set-setting("theme_mode", "light") → { success: true } and persists');
     {
       const handler = registered.get('set-setting');
-      const trustedSender = { sender: { getURL: () => 'http://localhost:3001/' } };
-      const result = await handler!(trustedSender, 'theme_mode', 'light');
+      const result = await handler!(trustedSender, 'theme_mode', 'light', ownerToken);
       assert.equal(result?.success, true, 'returns success: true');
       const db = getDatabase();
-      const row = db
-        .prepare("SELECT value FROM settings WHERE key = 'theme_mode'")
-        .get() as { value: string } | undefined;
+      const row = db.prepare("SELECT value FROM settings WHERE key = 'theme_mode'").get() as
+        | { value: string }
+        | undefined;
       assert.equal(row?.value, 'light', 'IPC write also persisted (overwrote prior "dark")');
     }
 
@@ -243,12 +281,18 @@ async function main() {
     console.log('\n6. IPC set-setting("theme_mode", "DARK") → rejected (case-sensitive)');
     {
       const handler = registered.get('set-setting');
-      const trustedSender = { sender: { getURL: () => 'http://localhost:3001/' } };
-      const result = await handler!(trustedSender, 'theme_mode', 'DARK');
+      const result = await handler!(trustedSender, 'theme_mode', 'DARK', ownerToken);
       assert.equal(result?.success, false, 'uppercase is not a valid ThemeMode');
     }
 
-
+    // ── IPC set-setting — requires authentication ───────────────────────
+    console.log('\n7. IPC set-setting("theme_mode", "light") without token → rejected');
+    {
+      const handler = registered.get('set-setting');
+      const result = await handler!(trustedSender, 'theme_mode', 'light');
+      assert.equal(result?.success, false, 'returns success: false without token');
+      assert.equal(result?.error, 'Authentication required', 'fails closed without token');
+    }
   } finally {
     if (server) server.close();
     closeDatabase();

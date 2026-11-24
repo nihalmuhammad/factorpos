@@ -22,12 +22,20 @@ import { useTranslations, type AppConfig } from 'use-intl';
 import { Ltr } from '@/components/layout/Ltr';
 import { Toggle } from '@/components/settings/Toggle';
 import { SettingsTabShell } from '@/components/settings/SettingsTabShell';
+import { LanPrinterDiscovery } from '@/components/settings/LanPrinterDiscovery';
+import { PrinterStatusBadge } from '@/components/settings/PrinterStatusBadge';
+import { printFailureHint } from '@/lib/printer/print-failure-help';
+import { extractPrintErrorToastOptions } from '@/lib/printer/warnings';
 import { LANGUAGES, type Language } from '@/lib/i18n';
-import { isTemplateCardSelected, type BillTemplateSelectionSource } from '@/lib/bill-template-picker';
+import {
+  isTemplateCardSelected,
+  type BillTemplateSelectionSource,
+} from '@/lib/bill-template-picker';
 import { type PaperSize, type BillTemplate } from '@/store/pos-settings';
 import { usePrinterStore } from '@/hooks/usePrinter';
 import api from '@/lib/api';
 import toast from 'react-hot-toast';
+import type { PrinterTextSize } from '@print/text-size';
 
 const SELECTABLE_LANGUAGES: Language[] = (Object.keys(LANGUAGES) as Language[]).filter(
   (lang) => LANGUAGES[lang].selectable,
@@ -41,7 +49,9 @@ export type HwPrinter = {
   port?: number;
   cash_drawer_pulse_enabled: number;
   paper_width: string;
+  text_size?: PrinterTextSize;
   is_default: number;
+  configured_profile_id?: string | null;
   profile_id?: string;
   profile_name?: string;
 };
@@ -58,6 +68,7 @@ export type DetectedPrinter = {
   port?: number;
   paperWidth?: string;
   profileId?: string;
+  compatibility?: 'escpos_thermal' | 'escpos_impact' | 'driver_only';
 };
 
 export type PrinterForm = {
@@ -66,6 +77,8 @@ export type PrinterForm = {
   ip_address: string;
   port: string;
   paper_width: string;
+  text_size: PrinterTextSize;
+  profile_id: string;
 };
 
 export type PrintingForm = {
@@ -85,6 +98,7 @@ export type PrintingForm = {
   zReportPrimaryLanguage: string;
   zReportSecondLanguage: string;
   kotLanguage: string;
+  billShowLogo: boolean;
   billShowName: boolean;
   billShowAddress: boolean;
   billShowPhone: boolean;
@@ -92,7 +106,9 @@ export type PrintingForm = {
   billShowTaxBreakdown: boolean;
   billShowCustomerName: boolean;
   billShowCustomerPhone: boolean;
+  billDeliveryShowCustomerPhoneAlways: boolean;
   billShowTableNumber: boolean;
+  billShowLargeOrderNumber: boolean;
 };
 
 export type BillTemplateForm = {
@@ -111,8 +127,19 @@ export interface TemplateCard {
   source: 'core' | 'plugin' | 'merchant';
   selectionSource: BillTemplateSelectionSource;
   description?: string;
-  originBadgeKey?: 'billTemplateMerchantCreated' | 'billTemplateMerchantImported' | 'billTemplateMerchantCloned';
+  originBadgeKey?:
+    | 'billTemplateMerchantCreated'
+    | 'billTemplateMerchantImported'
+    | 'billTemplateMerchantCloned';
 }
+
+const SHIPPED_PROFILE_IDS = new Set([
+  'escpos-impact-76',
+  'epson-tm-series',
+  'xprinter-xp-v320m-v330m',
+  'generic-escpos-80',
+  'generic-escpos-58',
+]);
 
 const emptyPrinterForm: PrinterForm = {
   name: '',
@@ -120,10 +147,16 @@ const emptyPrinterForm: PrinterForm = {
   ip_address: '',
   port: '9100',
   paper_width: 'cols-42',
+  text_size: 'normal',
+  profile_id: '',
 };
 
 export interface PrintersSettingsTabProps {
   isActive: boolean;
+  isAdmin?: boolean;
+  canManagePrinters?: boolean;
+  printingHydrated?: boolean;
+  printingHydrationFailed?: boolean;
   hwPrinters: HwPrinter[];
   setHwPrinters: React.Dispatch<React.SetStateAction<HwPrinter[]>>;
   printingForm: PrintingForm;
@@ -137,11 +170,19 @@ export interface PrintersSettingsTabProps {
   kdsEnabledSetting: boolean;
   pulseCustomMethods: string[];
   markHydrationTouched: (field: string) => void;
-  confirm: (message: string, options?: { title?: string; confirmLabel?: string; destructive?: boolean }) => Promise<boolean>;
+  onPersistPrintMethod?: (method: 'escpos' | 'browser') => void | Promise<void>;
+  confirm: (
+    message: string,
+    options?: { title?: string; confirmLabel?: string; destructive?: boolean },
+  ) => Promise<boolean>;
 }
 
 export function PrintersSettingsTab({
   isActive,
+  isAdmin = true,
+  canManagePrinters = true,
+  printingHydrated = true,
+  printingHydrationFailed = false,
   hwPrinters,
   setHwPrinters,
   printingForm,
@@ -155,19 +196,27 @@ export function PrintersSettingsTab({
   kdsEnabledSetting,
   pulseCustomMethods,
   markHydrationTouched,
+  onPersistPrintMethod,
   confirm,
 }: PrintersSettingsTabProps) {
   const t = useTranslations('settings');
   const tCommon = useTranslations('common');
-  const { refreshHardwarePrinter } = usePrinterStore();
+  const tAll = useTranslations();
+  const { refreshHardwarePrinter, setPrintMethod } = usePrinterStore();
+  const canEditPrintingOptions = canManagePrinters && printingHydrated && !printingHydrationFailed;
 
   const [printerForm, setPrinterForm] = useState<PrinterForm>(emptyPrinterForm);
+  const [paperWidthTouched, setPaperWidthTouched] = useState(false);
   const [showPrinterForm, setShowPrinterForm] = useState(false);
   const [editingPrinterId, setEditingPrinterId] = useState<string | null>(null);
   const [savingPrinter, setSavingPrinter] = useState(false);
   const [testingPrinterId, setTestingPrinterId] = useState<string | null>(null);
+  const [statusVersion, setStatusVersion] = useState(0);
+  const [discoveryVersion, setDiscoveryVersion] = useState(0);
+  const [editingProfileName, setEditingProfileName] = useState<string | null>(null);
   const [detectedPrinters, setDetectedPrinters] = useState<DetectedPrinter[]>([]);
   const [detectingPrinters, setDetectingPrinters] = useState(false);
+  const [detectionSucceeded, setDetectionSucceeded] = useState(false);
   const [addingDetectedName, setAddingDetectedName] = useState<string | null>(null);
   const [installedPrintersOpen, setInstalledPrintersOpen] = useState(false);
   const [cashDrawerMethodsOpen, setCashDrawerMethodsOpen] = useState(false);
@@ -186,6 +235,11 @@ export function PrintersSettingsTab({
   };
 
   const printerErrorMessage = (err: unknown, fallback: string): string => {
+    const hint = printFailureHint(
+      { ...extractPrintErrorToastOptions(err), platform: window.electronAPI?.platform },
+      tAll,
+    );
+    if (hint) return hint;
     if (axios.isAxiosError(err)) {
       const apiError = err.response?.data?.error;
       if (typeof apiError === 'string' && apiError.trim()) return `${fallback}: ${apiError}`;
@@ -196,45 +250,66 @@ export function PrintersSettingsTab({
   const fetchPrinters = async (signal?: AbortSignal) => {
     try {
       const res = await api.get('/printers', signal ? { signal } : undefined);
-      if (!signal?.aborted) setHwPrinters(res.data.printers || []);
+      if (signal?.aborted) return;
+      setHwPrinters(res.data.printers || []);
+      setStatusVersion((version) => version + 1);
     } catch {
       // ignore
     }
   };
 
-  const fetchDetectedPrinters = useCallback(async (signal?: AbortSignal) => {
-    setDetectingPrinters(true);
-    try {
-      const res = await api.get('/printers/detect', signal ? { signal } : undefined);
-      if (!signal?.aborted) setDetectedPrinters(res.data.printers || []);
-    } catch {
-      if (!signal?.aborted) setDetectedPrinters([]);
-    } finally {
-      if (!signal?.aborted) setDetectingPrinters(false);
-    }
-  }, []);
+  const fetchDetectedPrinters = useCallback(
+    async (signal?: AbortSignal) => {
+      if (!canManagePrinters) return;
+      setDetectingPrinters(true);
+      try {
+        const res = await api.get('/printers/detect', signal ? { signal } : undefined);
+        if (!signal?.aborted) {
+          setDetectedPrinters(res.data.printers || []);
+          setDetectionSucceeded(true);
+        }
+      } catch {
+        if (!signal?.aborted) {
+          setDetectedPrinters([]);
+          setDetectionSucceeded(false);
+        }
+      } finally {
+        if (!signal?.aborted) setDetectingPrinters(false);
+      }
+    },
+    [canManagePrinters],
+  );
 
   useEffect(() => {
-    if (!isActive) return;
+    if (!isActive || !canManagePrinters) return;
     const controller = new AbortController();
     void Promise.resolve().then(() => fetchDetectedPrinters(controller.signal));
     return () => controller.abort();
-  }, [fetchDetectedPrinters, isActive]);
+  }, [canManagePrinters, fetchDetectedPrinters, isActive]);
 
-  const quickAddDetected = async (p: DetectedPrinter) => {
+  const quickAddDetected = async (
+    p: Partial<DetectedPrinter> & Pick<DetectedPrinter, 'name' | 'connectionType'>,
+  ): Promise<boolean> => {
+    if (!canManagePrinters) return false;
     setAddingDetectedName(p.name);
     try {
       const payload: {
         name: string;
+        model?: string;
         connection_type: 'network' | 'usb';
-        paper_width: string;
+        paper_width?: string;
+        profile_id?: string;
         ip_address?: string;
         port?: number;
       } = {
         name: p.name,
         connection_type: p.connectionType === 'network' ? 'network' : 'usb',
-        paper_width: normalizePrinterWidthValue(p.paperWidth),
+        ...(p.model ? { model: p.model } : {}),
+        ...(p.paperWidth ? { paper_width: normalizePrinterWidthValue(p.paperWidth) } : {}),
       };
+      if (p.profileId && SHIPPED_PROFILE_IDS.has(p.profileId)) {
+        payload.profile_id = p.profileId;
+      }
       if (p.connectionType === 'network') {
         payload.ip_address = p.ipAddress || '';
         payload.port = p.port || 9100;
@@ -243,32 +318,43 @@ export function PrintersSettingsTab({
       toast.success(t('printerQuickAdded', { name: p.name }));
       fetchPrinters();
       refreshHardwarePrinter();
+      return true;
     } catch {
       toast.error(t('printerAddFailed'));
+      return false;
     } finally {
       setAddingDetectedName(null);
     }
   };
 
   const openAddPrinter = () => {
+    if (!canManagePrinters) return;
     setPrinterForm(emptyPrinterForm);
+    setPaperWidthTouched(false);
+    setEditingProfileName(null);
     setEditingPrinterId(null);
     setShowPrinterForm(true);
   };
 
   const openEditPrinter = (p: HwPrinter) => {
+    if (!canManagePrinters) return;
     setPrinterForm({
       name: p.name,
       connection_type: p.connection_type,
       ip_address: p.ip_address || '',
       port: String(p.port || 9100),
       paper_width: normalizePrinterWidthValue(p.paper_width),
+      text_size: p.text_size ?? 'normal',
+      profile_id: p.configured_profile_id || '',
     });
+    setPaperWidthTouched(false);
+    setEditingProfileName(p.profile_name || null);
     setEditingPrinterId(p.id);
     setShowPrinterForm(true);
   };
 
   const savePrinterHw = async () => {
+    if (!canManagePrinters) return;
     if (!printerForm.name) {
       toast.error(t('printerNameRequired'));
       return;
@@ -280,7 +366,12 @@ export function PrintersSettingsTab({
         connection_type: printerForm.connection_type,
         ip_address: printerForm.connection_type === 'network' ? printerForm.ip_address : undefined,
         port: printerForm.connection_type === 'network' ? Number(printerForm.port) : undefined,
-        paper_width: printerForm.paper_width,
+        paper_width:
+          !editingPrinterId && !paperWidthTouched && !printerForm.profile_id
+            ? undefined
+            : printerForm.paper_width,
+        text_size: printerForm.text_size,
+        profile_id: printerForm.profile_id || null,
       };
       if (editingPrinterId) {
         await api.put(`/printers/${editingPrinterId}`, payload);
@@ -300,18 +391,27 @@ export function PrintersSettingsTab({
   };
 
   const deletePrinterHw = async (id: string) => {
-    if (!await confirm(t('printerDeleteConfirm'), { destructive: true, confirmLabel: tCommon('delete') })) return;
+    if (!canManagePrinters) return;
+    if (
+      !(await confirm(t('printerDeleteConfirm'), {
+        destructive: true,
+        confirmLabel: tCommon('delete'),
+      }))
+    )
+      return;
     try {
       await api.delete(`/printers/${id}`);
       toast.success(t('printerDeleted'));
       fetchPrinters();
       refreshHardwarePrinter();
+      setDiscoveryVersion((version) => version + 1);
     } catch {
       toast.error(t('printerDeleteFailed'));
     }
   };
 
   const setDefaultPrinter = async (id: string) => {
+    if (!canManagePrinters) return;
     try {
       await api.post(`/printers/${id}/set-default`);
       toast.success(t('defaultPrinterSet'));
@@ -323,6 +423,7 @@ export function PrintersSettingsTab({
   };
 
   const testPrinterHw = async (printer: HwPrinter) => {
+    if (!canManagePrinters) return;
     if (printer.connection_type === 'webusb') {
       toast(t('webusbTestHint'));
       return;
@@ -335,27 +436,36 @@ export function PrintersSettingsTab({
       toast.error(printerErrorMessage(err, t('testPrintFailed')));
     } finally {
       setTestingPrinterId(null);
+      setStatusVersion((version) => version + 1);
     }
   };
 
   return (
     <SettingsTabShell maxWidth="wide">
       <div className="space-y-6">
-        <div className="bg-card rounded-xl border border-border p-6">
+        <div
+          data-setting-section="printers-hardware"
+          className="bg-card rounded-xl border border-border p-6"
+        >
           <div className="flex items-center justify-between mb-4">
             <div className="flex items-center gap-2">
               <Printer size={20} className="text-muted-foreground" />
               <h2 className="font-semibold text-foreground">{t('printers')}</h2>
             </div>
-            {!showPrinterForm && (
+            {canManagePrinters && !showPrinterForm && (
               <div className="flex items-center gap-2">
                 <button
-                  onClick={() => { void fetchDetectedPrinters(); }}
+                  onClick={() => {
+                    void fetchDetectedPrinters();
+                    setStatusVersion((version) => version + 1);
+                    setDiscoveryVersion((version) => version + 1);
+                  }}
                   disabled={detectingPrinters}
                   title={t('refreshList')}
                   className="flex items-center gap-2 px-3 py-2 text-sm border border-border text-muted-foreground rounded-lg hover:bg-muted font-medium disabled:opacity-50"
                 >
-                  <RefreshCw size={14} className={detectingPrinters ? 'animate-spin' : ''} /> {t('refresh')}
+                  <RefreshCw size={14} className={detectingPrinters ? 'animate-spin' : ''} />{' '}
+                  {t('refresh')}
                 </button>
                 <button
                   onClick={openAddPrinter}
@@ -367,8 +477,16 @@ export function PrintersSettingsTab({
             )}
           </div>
 
+          {canManagePrinters && !showPrinterForm && (
+            <LanPrinterDiscovery
+              enabled={isActive}
+              refreshKey={discoveryVersion}
+              onAdd={quickAddDetected}
+            />
+          )}
+
           {/* Detected (OS-installed) printers - one-click add */}
-          {!showPrinterForm && (
+          {canManagePrinters && !showPrinterForm && (
             <div className="mb-5">
               <button
                 type="button"
@@ -399,21 +517,23 @@ export function PrintersSettingsTab({
                   <div className="mt-2 space-y-2">
                     {detectedPrinters.map((p) => {
                       const alreadyAdded = hwPrinters.some(
-                        (h) => h.name.toLowerCase() === p.name.toLowerCase()
+                        (h) => h.name.toLowerCase() === p.name.toLowerCase(),
                       );
                       const isAdding = addingDetectedName === p.name;
+                      const isDriverOnly = p.compatibility === 'driver_only';
+                      const isImpact = p.compatibility === 'escpos_impact';
                       const dotColor =
                         p.status === 'idle'
                           ? 'bg-green-500'
                           : p.status === 'printing'
-                          ? 'bg-yellow-500'
-                          : 'bg-gray-300 dark:bg-muted';
+                            ? 'bg-yellow-500'
+                            : 'bg-gray-300 dark:bg-muted';
                       const statusLabel =
                         p.status === 'idle'
                           ? t('printerOnline')
                           : p.status === 'printing'
-                          ? t('printerPrinting')
-                          : t('printerOffline');
+                            ? t('printerPrinting')
+                            : t('printerOffline');
                       return (
                         <div
                           key={p.name}
@@ -427,12 +547,25 @@ export function PrintersSettingsTab({
                             )}
                           </div>
                           <div className="flex-1 min-w-0">
-                            <div className="flex items-center gap-2">
-                              <span className="font-medium text-foreground text-sm truncate">{p.name}</span>
+                            <div className="flex flex-wrap items-center gap-2">
+                              <span className="font-medium text-foreground text-sm truncate">
+                                {p.name}
+                              </span>
                               <span className="flex items-center gap-1 text-[11px] text-muted-foreground">
                                 <span className={`w-1.5 h-1.5 rounded-full ${dotColor}`} />
                                 {statusLabel}
                               </span>
+                              {isImpact && (
+                                <span className="inline-flex items-center gap-1 rounded-full bg-blue-50 dark:bg-blue-950/40 px-2 py-0.5 text-[10px] font-medium text-blue-700 dark:text-blue-300">
+                                  {t('printerCompatibilityImpact')}
+                                </span>
+                              )}
+                              {isDriverOnly && (
+                                <span className="inline-flex items-center gap-1 rounded-full bg-amber-100 dark:bg-amber-950/60 px-2 py-0.5 text-[10px] font-medium text-amber-800 dark:text-amber-300">
+                                  <AlertTriangle size={11} />
+                                  {t('printerCompatibilityDriverOnly')}
+                                </span>
+                              )}
                             </div>
                             <p className="text-xs text-muted-foreground mt-0.5 truncate">
                               {p.make !== 'Unknown' ? `${p.make} ${p.model}` : p.model}
@@ -447,13 +580,42 @@ export function PrintersSettingsTab({
                               ) : (
                                 ''
                               )}
-                              {p.paperWidth ? ` · ${printWidthLabel(p.paperWidth)}` : ''}
-                              {p.profileId ? ` · ${t('printerSupportedProfile')}` : ''}
+                              {!isDriverOnly && p.paperWidth
+                                ? ` · ${printWidthLabel(p.paperWidth)}`
+                                : ''}
+                              {!isDriverOnly && p.profileId
+                                ? ` · ${t('printerSupportedProfile')}`
+                                : ''}
                             </p>
+                            {isDriverOnly && (
+                              <p className="text-[11px] text-amber-700 dark:text-amber-300 mt-1">
+                                {t('printerDriverOnlyWarning')}
+                              </p>
+                            )}
                           </div>
-                          {alreadyAdded ? (
+                          {isDriverOnly ? (
+                            <button
+                              type="button"
+                              disabled={!canManagePrinters}
+                              onClick={async () => {
+                                if (!canManagePrinters) return;
+                                markHydrationTouched('printMethod');
+                                setPrintingForm((prev) => ({
+                                  ...prev,
+                                  printMethod: 'browser',
+                                }));
+                                setPrintMethod('browser');
+                                await onPersistPrintMethod?.('browser');
+                                toast.success(t('printerSwitchedToBrowserPrint'));
+                              }}
+                              className="px-3 py-1.5 text-xs border border-amber-300 dark:border-amber-700 bg-amber-50 dark:bg-amber-950/40 text-amber-800 dark:text-amber-200 rounded-lg hover:bg-amber-100 dark:hover:bg-amber-900/50 font-medium shrink-0"
+                            >
+                              {t('printerSwitchToBrowserPrint')}
+                            </button>
+                          ) : alreadyAdded ? (
                             <span className="text-xs text-muted-foreground px-3 py-1.5 flex items-center gap-1">
-                              <CheckCircle2 size={14} className="text-green-500" /> {t('printerAdded')}
+                              <CheckCircle2 size={14} className="text-green-500" />{' '}
+                              {t('printerAdded')}
                             </span>
                           ) : (
                             <button
@@ -510,6 +672,14 @@ export function PrintersSettingsTab({
                         {t('defaultPrinter')}
                       </span>
                     )}
+                    {canManagePrinters && (
+                      <PrinterStatusBadge
+                        printerId={p.id}
+                        connectionType={p.connection_type}
+                        enabled={isActive}
+                        refreshKey={statusVersion}
+                      />
+                    )}
                   </div>
                   <p className="text-xs text-muted-foreground mt-0.5">
                     {p.connection_type === 'network' ? (
@@ -526,52 +696,56 @@ export function PrintersSettingsTab({
                     {p.profile_name ? ` · ${p.profile_name}` : ''}
                   </p>
                 </div>
-                <div className="flex items-center gap-1 shrink-0">
-                  <button
-                    onClick={() => testPrinterHw(p)}
-                    disabled={testingPrinterId === p.id}
-                    title={t('testPrint')}
-                    className="p-2 rounded-lg hover:bg-muted text-muted-foreground hover:text-foreground disabled:opacity-40"
-                  >
-                    <TestTube2 size={15} />
-                  </button>
-                  {p.is_default !== 1 && (
+                {canManagePrinters && (
+                  <div className="flex items-center gap-1 shrink-0">
                     <button
-                      onClick={() => setDefaultPrinter(p.id)}
-                      title={t('setAsDefault')}
-                      className="p-2 rounded-lg hover:bg-yellow-50 dark:hover:bg-yellow-950/40 text-muted-foreground hover:text-yellow-600 dark:hover:text-yellow-400"
+                      onClick={() => testPrinterHw(p)}
+                      disabled={testingPrinterId === p.id}
+                      title={t('testPrint')}
+                      className="p-2 rounded-lg hover:bg-muted text-muted-foreground hover:text-foreground disabled:opacity-40"
                     >
-                      <Star size={15} />
+                      <TestTube2 size={15} />
                     </button>
-                  )}
-                  <button
-                    onClick={() => openEditPrinter(p)}
-                    title={t('edit')}
-                    className="p-2 rounded-lg hover:bg-muted text-muted-foreground hover:text-foreground"
-                  >
-                    <Settings size={15} />
-                  </button>
-                  <button
-                    onClick={() => deletePrinterHw(p.id)}
-                    title={t('delete')}
-                    className="p-2 rounded-lg hover:bg-red-50 text-red-600 hover:text-red-700"
-                  >
-                    <Trash2 size={15} />
-                  </button>
-                </div>
+                    {p.is_default !== 1 && (
+                      <button
+                        onClick={() => setDefaultPrinter(p.id)}
+                        title={t('setAsDefault')}
+                        className="p-2 rounded-lg hover:bg-yellow-50 dark:hover:bg-yellow-950/40 text-muted-foreground hover:text-yellow-600 dark:hover:text-yellow-400"
+                      >
+                        <Star size={15} />
+                      </button>
+                    )}
+                    <button
+                      onClick={() => openEditPrinter(p)}
+                      title={t('edit')}
+                      className="p-2 rounded-lg hover:bg-muted text-muted-foreground hover:text-foreground"
+                    >
+                      <Settings size={15} />
+                    </button>
+                    <button
+                      onClick={() => deletePrinterHw(p.id)}
+                      title={t('delete')}
+                      className="p-2 rounded-lg hover:bg-red-50 text-red-600 hover:text-red-700"
+                    >
+                      <Trash2 size={15} />
+                    </button>
+                  </div>
+                )}
               </div>
             ))}
           </div>
 
           {/* Add / Edit form */}
-          {showPrinterForm && (
+          {canManagePrinters && showPrinterForm && (
             <div className="mt-5 pt-5 border-t border-border">
               <h3 className="font-semibold text-foreground text-sm mb-4">
                 {editingPrinterId ? t('editPrinter') : t('addPrinter')}
               </h3>
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                 <div>
-                  <label className="block text-xs text-muted-foreground mb-1">{t('printerName')}</label>
+                  <label className="block text-xs text-muted-foreground mb-1">
+                    {t('printerName')}
+                  </label>
                   <input
                     type="text"
                     value={printerForm.name}
@@ -587,13 +761,19 @@ export function PrintersSettingsTab({
                   </datalist>
                   {printerForm.connection_type !== 'webusb' &&
                     printerForm.name.trim() &&
-                    detectedPrinters.length > 0 &&
+                    !detectingPrinters &&
+                    detectionSucceeded &&
+                    (printerForm.connection_type === 'usb' || detectedPrinters.length > 0) &&
                     !detectedPrinters.some((dp) => dp.name === printerForm.name) && (
-                      <p className="mt-1 text-xs text-amber-600">{t('printerNameMismatchWarning')}</p>
+                      <p className="mt-1 text-xs text-amber-600">
+                        {t('printerNameMismatchWarning')}
+                      </p>
                     )}
                 </div>
                 <div>
-                  <label className="block text-xs text-muted-foreground mb-1">{t('connectionType')}</label>
+                  <label className="block text-xs text-muted-foreground mb-1">
+                    {t('connectionType')}
+                  </label>
                   <select
                     value={printerForm.connection_type}
                     onChange={(e) =>
@@ -613,18 +793,24 @@ export function PrintersSettingsTab({
                 {printerForm.connection_type === 'network' && (
                   <>
                     <div>
-                      <label className="block text-xs text-muted-foreground mb-1">{t('ipAddress')}</label>
+                      <label className="block text-xs text-muted-foreground mb-1">
+                        {t('ipAddress')}
+                      </label>
                       <input
                         type="text"
                         value={printerForm.ip_address}
-                        onChange={(e) => setPrinterForm((p) => ({ ...p, ip_address: e.target.value }))}
+                        onChange={(e) =>
+                          setPrinterForm((p) => ({ ...p, ip_address: e.target.value }))
+                        }
                         placeholder={t('ipAddressPlaceholder')}
                         className="w-full px-3 py-2 text-sm border border-border rounded-lg outline-none focus:ring-2 focus:ring-brand"
                         dir="ltr"
                       />
                     </div>
                     <div>
-                      <label className="block text-xs text-muted-foreground mb-1">{t('port')}</label>
+                      <label className="block text-xs text-muted-foreground mb-1">
+                        {t('port')}
+                      </label>
                       <input
                         type="number"
                         value={printerForm.port}
@@ -642,11 +828,64 @@ export function PrintersSettingsTab({
                   </div>
                 )}
 
+                <div className="md:col-span-2">
+                  <label className="block text-xs text-muted-foreground mb-1">
+                    {t('printerProfile')}
+                  </label>
+                  <select
+                    value={printerForm.profile_id}
+                    onChange={(e) => {
+                      const nextProfileId = e.target.value;
+                      setPrinterForm((p) => ({
+                        ...p,
+                        profile_id: nextProfileId,
+                        paper_width:
+                          !paperWidthTouched && nextProfileId === 'escpos-impact-76'
+                            ? 'cols-32'
+                            : !paperWidthTouched && nextProfileId === 'generic-escpos-58'
+                              ? 'cols-32'
+                              : !paperWidthTouched &&
+                                  (nextProfileId === 'epson-tm-series' ||
+                                    nextProfileId === 'xprinter-xp-v320m-v330m')
+                                ? 'cols-48'
+                                : !paperWidthTouched && nextProfileId === 'generic-escpos-80'
+                                  ? 'cols-42'
+                                  : p.paper_width,
+                      }));
+                    }}
+                    className="w-full px-3 py-2 text-sm border border-border rounded-lg outline-none focus:ring-2 focus:ring-brand"
+                  >
+                    <option value="">{t('printerProfileAuto')}</option>
+                    {editingPrinterId &&
+                      printerForm.profile_id &&
+                      !SHIPPED_PROFILE_IDS.has(printerForm.profile_id) && (
+                        <option value={printerForm.profile_id}>
+                          {editingProfileName || printerForm.profile_id}
+                        </option>
+                      )}
+                    <option value="escpos-impact-76">{t('printerProfileImpact76')}</option>
+                    <option value="epson-tm-series">{t('printerProfileEpsonTm')}</option>
+                    <option value="xprinter-xp-v320m-v330m">{t('printerProfileXprinter')}</option>
+                    <option value="generic-escpos-80">{t('printerProfileGeneric80')}</option>
+                    <option value="generic-escpos-58">{t('printerProfileGeneric58')}</option>
+                  </select>
+                  {printerForm.profile_id === 'escpos-impact-76' && (
+                    <p className="mt-1 text-xs text-muted-foreground">
+                      {t('printerProfileImpactHint')}
+                    </p>
+                  )}
+                </div>
+
                 <div>
-                  <label className="block text-xs text-muted-foreground mb-1">{t('paperWidth')}</label>
+                  <label className="block text-xs text-muted-foreground mb-1">
+                    {t('paperWidth')}
+                  </label>
                   <select
                     value={printerForm.paper_width}
-                    onChange={(e) => setPrinterForm((p) => ({ ...p, paper_width: e.target.value }))}
+                    onChange={(e) => {
+                      setPaperWidthTouched(true);
+                      setPrinterForm((p) => ({ ...p, paper_width: e.target.value }));
+                    }}
                     className="w-full px-3 py-2 text-sm border border-border rounded-lg outline-none focus:ring-2 focus:ring-brand"
                   >
                     <option value="cols-32">{t('printColumns32')}</option>
@@ -657,6 +896,26 @@ export function PrintersSettingsTab({
                     <option value="cols-48">{t('printColumns48')}</option>
                   </select>
                 </div>
+
+                <div>
+                  <label className="block text-xs text-muted-foreground mb-1">
+                    {t('printerTextSize')}
+                  </label>
+                  <select
+                    value={printerForm.text_size}
+                    onChange={(e) =>
+                      setPrinterForm((p) => ({
+                        ...p,
+                        text_size: e.target.value as PrinterTextSize,
+                      }))
+                    }
+                    className="w-full px-3 py-2 text-sm border border-border rounded-lg outline-none focus:ring-2 focus:ring-brand"
+                  >
+                    <option value="normal">{t('printerTextSizeNormal')}</option>
+                    <option value="large">{t('printerTextSizeLarge')}</option>
+                    <option value="extra_large">{t('printerTextSizeExtraLarge')}</option>
+                  </select>
+                </div>
               </div>
 
               <div className="mt-4 flex gap-2">
@@ -665,7 +924,11 @@ export function PrintersSettingsTab({
                   disabled={savingPrinter}
                   className="px-5 py-2 text-sm bg-brand text-white rounded-lg hover:opacity-90 disabled:opacity-50 font-medium"
                 >
-                  {savingPrinter ? t('saving') : editingPrinterId ? tCommon('update') : t('addPrinter')}
+                  {savingPrinter
+                    ? t('saving')
+                    : editingPrinterId
+                      ? tCommon('update')
+                      : t('addPrinter')}
                 </button>
                 <button
                   onClick={() => setShowPrinterForm(false)}
@@ -689,7 +952,21 @@ export function PrintersSettingsTab({
           </h2>
         </div>
 
-        <div className="bg-card rounded-xl border border-border p-6">
+        {printingHydrationFailed && (
+          <div
+            role="alert"
+            data-testid="printing-hydration-error"
+            className="flex items-start gap-2 rounded-xl border border-red-300 bg-red-50 p-4 text-sm text-red-800 dark:border-red-800/50 dark:bg-red-950/40 dark:text-red-200"
+          >
+            <AlertTriangle size={16} className="mt-0.5 shrink-0" />
+            <span>{t('reloadFailed')}</span>
+          </div>
+        )}
+
+        <div
+          data-setting-section="printing-options"
+          className="bg-card rounded-xl border border-border p-6"
+        >
           <div className="flex items-center gap-2 mb-4">
             <Printer size={20} className="text-muted-foreground" />
             <h2 className="font-semibold text-foreground">{t('printing')}</h2>
@@ -703,13 +980,18 @@ export function PrintersSettingsTab({
               <Toggle
                 value={printingForm.printerEnabled}
                 label={t('enablePrinter')}
+                disabled={!canEditPrintingOptions}
                 onChange={(v) => {
+                  if (!canEditPrintingOptions) return;
                   markHydrationTouched('printerEnabled');
                   setPrintingForm((p) => ({ ...p, printerEnabled: v }));
                 }}
               />
             </div>
-            <div className="border-t border-border pt-4">
+            <div
+              data-setting-section="cash-drawer"
+              className="border-t border-border pt-4 rounded-lg"
+            >
               <div className="flex items-center justify-between gap-4">
                 <div className="flex-1 min-w-0">
                   <p className="font-medium text-foreground">{t('sendPulseToCashDrawer')}</p>
@@ -718,7 +1000,9 @@ export function PrintersSettingsTab({
                 <Toggle
                   value={!!printingForm.cashDrawerPulseEnabled}
                   label={t('sendPulseToCashDrawer')}
+                  disabled={!canEditPrintingOptions}
                   onChange={(v) => {
+                    if (!canEditPrintingOptions) return;
                     markHydrationTouched('cashDrawerPulseEnabled');
                     setPrintingForm((p) => ({ ...p, cashDrawerPulseEnabled: v }));
                   }}
@@ -741,16 +1025,23 @@ export function PrintersSettingsTab({
                   </button>
                   {cashDrawerMethodsOpen && (
                     <div className="border-t border-border bg-muted/30 px-3 py-2 space-y-2">
-                      {([
-                        ['cash', t('paymentMethodCash')],
-                        ['card', t('paymentMethodCard')],
-                        ...pulseCustomMethods.map((name): [string, string] => [name, name]),
-                      ] as [string, string][]).map(([value, label]) => (
-                        <label key={value} className="flex items-center gap-2 text-sm text-foreground">
+                      {(
+                        [
+                          ['cash', t('paymentMethodCash')],
+                          ['card', t('paymentMethodCard')],
+                          ...pulseCustomMethods.map((name): [string, string] => [name, name]),
+                        ] as [string, string][]
+                      ).map(([value, label]) => (
+                        <label
+                          key={value}
+                          className="flex items-center gap-2 text-sm text-foreground"
+                        >
                           <input
                             type="checkbox"
+                            disabled={!canEditPrintingOptions}
                             checked={printingForm.cashDrawerPulseMethods.includes(value)}
                             onChange={(e) => {
+                              if (!canEditPrintingOptions) return;
                               markHydrationTouched('cashDrawerPulseMethods');
                               setPrintingForm((p) => ({
                                 ...p,
@@ -759,7 +1050,7 @@ export function PrintersSettingsTab({
                                   : p.cashDrawerPulseMethods.filter((method) => method !== value),
                               }));
                             }}
-                            className="h-4 w-4 rounded border-border text-brand focus:ring-brand"
+                            className="h-4 w-4 rounded border-border text-brand focus:ring-brand disabled:cursor-not-allowed"
                           />
                           {label}
                         </label>
@@ -776,11 +1067,16 @@ export function PrintersSettingsTab({
               <p className="font-medium text-foreground mb-2">{t('printMethod')}</p>
               <select
                 value={printingForm.printMethod}
+                disabled={!canEditPrintingOptions}
                 onChange={(e) => {
+                  if (!canEditPrintingOptions) return;
                   markHydrationTouched('printMethod');
-                  setPrintingForm((p) => ({ ...p, printMethod: e.target.value as 'escpos' | 'browser' }));
+                  setPrintingForm((p) => ({
+                    ...p,
+                    printMethod: e.target.value as 'escpos' | 'browser',
+                  }));
                 }}
-                className="w-full px-3 py-2 text-sm border border-border rounded-lg outline-none focus:ring-2 focus:ring-brand"
+                className="w-full px-3 py-2 text-sm border border-border rounded-lg outline-none focus:ring-2 focus:ring-brand disabled:bg-muted disabled:cursor-not-allowed"
               >
                 <option value="escpos">{t('printMethodEscpos')}</option>
                 <option value="browser">{t('printMethodBrowser')}</option>
@@ -791,7 +1087,10 @@ export function PrintersSettingsTab({
                   : t('printMethodBrowserHint')}
               </p>
             </div>
-            <div className="flex items-center justify-between gap-4 border-t border-border pt-4">
+            <div
+              data-setting-section="kot-printing"
+              className="flex items-center justify-between gap-4 border-t border-border pt-4 rounded-lg"
+            >
               <div className="flex-1 min-w-0">
                 <p className="font-medium text-foreground">{t('kotPrintingEnabledToggle')}</p>
                 <p className="text-sm text-muted-foreground">{t('kotPrintingEnabledToggleHint')}</p>
@@ -799,8 +1098,10 @@ export function PrintersSettingsTab({
               <Toggle
                 value={kotPrintingEnabledSetting}
                 label={t('kotPrintingEnabledToggle')}
+                disabled={!isAdmin || savingKotPrintingEnabled}
                 onChange={(v) => {
-                  if (!savingKotPrintingEnabled) saveKotPrintingEnabled(v);
+                  if (!isAdmin || savingKotPrintingEnabled) return;
+                  void saveKotPrintingEnabled(v);
                 }}
               />
             </div>
@@ -812,23 +1113,28 @@ export function PrintersSettingsTab({
               <div className="flex-1 min-w-0">
                 <p className="font-medium text-foreground">{t('autoPrintKot')}</p>
                 <p className="text-sm text-muted-foreground">
-                  {kotPrintingEnabledSetting ? t('autoPrintKotHint') : t('autoPrintKotDisabledHint')}
+                  {kotPrintingEnabledSetting
+                    ? t('autoPrintKotHint')
+                    : t('autoPrintKotDisabledHint')}
                 </p>
               </div>
               <Toggle
                 value={printingForm.autoPrintKot && kotPrintingEnabledSetting}
                 label={t('autoPrintKot')}
+                disabled={!canEditPrintingOptions || !kotPrintingEnabledSetting}
                 onChange={(v) => {
-                  if (kotPrintingEnabledSetting) {
-                    markHydrationTouched('autoPrintKot');
-                    setPrintingForm((p) => ({ ...p, autoPrintKot: v }));
-                  }
+                  if (!canEditPrintingOptions || !kotPrintingEnabledSetting) return;
+                  markHydrationTouched('autoPrintKot');
+                  setPrintingForm((p) => ({ ...p, autoPrintKot: v }));
                 }}
               />
             </div>
             {!kdsEnabledSetting && !kotPrintingEnabledSetting && (
               <div className="flex items-start gap-2 p-3 bg-amber-50 dark:bg-amber-950/40 border border-amber-200 dark:border-amber-800/40 rounded-lg">
-                <AlertTriangle size={16} className="text-amber-600 dark:text-amber-300 shrink-0 mt-0.5" />
+                <AlertTriangle
+                  size={16}
+                  className="text-amber-600 dark:text-amber-300 shrink-0 mt-0.5"
+                />
                 <p className="text-xs text-amber-800 dark:text-amber-300">
                   {t('kitchenWorkflowBothOffNote')}
                 </p>
@@ -842,7 +1148,9 @@ export function PrintersSettingsTab({
               <Toggle
                 value={printingForm.autoPrintBill}
                 label={t('autoPrintBill')}
+                disabled={!canEditPrintingOptions}
                 onChange={(v) => {
+                  if (!canEditPrintingOptions) return;
                   markHydrationTouched('autoPrintBill');
                   setPrintingForm((p) => ({ ...p, autoPrintBill: v }));
                 }}
@@ -856,7 +1164,9 @@ export function PrintersSettingsTab({
               <Toggle
                 value={printingForm.printerUseUnicode}
                 label={t('printerUnicode')}
+                disabled={!canEditPrintingOptions}
                 onChange={(v) => {
+                  if (!canEditPrintingOptions) return;
                   markHydrationTouched('printerUseUnicode');
                   setPrintingForm((p) => ({ ...p, printerUseUnicode: v }));
                 }}
@@ -870,7 +1180,9 @@ export function PrintersSettingsTab({
               <Toggle
                 value={printingForm.printerArabicShaping}
                 label={t('printerArabicShaping')}
+                disabled={!canEditPrintingOptions}
                 onChange={(v) => {
+                  if (!canEditPrintingOptions) return;
                   markHydrationTouched('printerArabicShaping');
                   setPrintingForm((p) => ({ ...p, printerArabicShaping: v }));
                 }}
@@ -884,13 +1196,18 @@ export function PrintersSettingsTab({
               <Toggle
                 value={printingForm.printerTrimDecimals}
                 label={t('trimDecimals')}
+                disabled={!canEditPrintingOptions}
                 onChange={(v) => {
+                  if (!canEditPrintingOptions) return;
                   markHydrationTouched('printerTrimDecimals');
                   setPrintingForm((p) => ({ ...p, printerTrimDecimals: v }));
                 }}
               />
             </div>
-            <div className="pt-4 border-t border-border">
+            <div
+              data-setting-section="receipt-languages"
+              className="pt-4 border-t border-border rounded-lg"
+            >
               <p className="font-medium text-foreground mb-1">{t('receiptLanguage')}</p>
               <p className="text-sm text-muted-foreground mb-3">{t('receiptLanguageHint')}</p>
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-x-6 gap-y-3">
@@ -904,11 +1221,13 @@ export function PrintersSettingsTab({
                   <select
                     id="receipt-primary-language"
                     value={printingForm.receiptPrimaryLanguage}
+                    disabled={!canEditPrintingOptions}
                     onChange={(e) => {
+                      if (!canEditPrintingOptions) return;
                       markHydrationTouched('receiptPrimaryLanguage');
                       setPrintingForm((p) => ({ ...p, receiptPrimaryLanguage: e.target.value }));
                     }}
-                    className="block w-full rounded-md border-border shadow-sm focus:border-brand focus:ring-brand sm:text-sm px-3 py-2 border"
+                    className="block w-full rounded-md border-border shadow-sm focus:border-brand focus:ring-brand sm:text-sm px-3 py-2 border disabled:bg-muted disabled:cursor-not-allowed"
                   >
                     <option value="inherit">{t('sameAsStore')}</option>
                     {SELECTABLE_LANGUAGES.map((lang) => (
@@ -928,11 +1247,13 @@ export function PrintersSettingsTab({
                   <select
                     id="receipt-second-language"
                     value={printingForm.receiptSecondLanguage}
+                    disabled={!canEditPrintingOptions}
                     onChange={(e) => {
+                      if (!canEditPrintingOptions) return;
                       markHydrationTouched('receiptSecondLanguage');
                       setPrintingForm((p) => ({ ...p, receiptSecondLanguage: e.target.value }));
                     }}
-                    className="block w-full rounded-md border-border shadow-sm focus:border-brand focus:ring-brand sm:text-sm px-3 py-2 border"
+                    className="block w-full rounded-md border-border shadow-sm focus:border-brand focus:ring-brand sm:text-sm px-3 py-2 border disabled:bg-muted disabled:cursor-not-allowed"
                   >
                     <option value="none">{t('secondLanguageNone')}</option>
                     {SELECTABLE_LANGUAGES.map((lang) => (
@@ -943,17 +1264,22 @@ export function PrintersSettingsTab({
                   </select>
                 </div>
                 <div>
-                  <label htmlFor="kot-language" className="block text-sm font-medium text-foreground mb-1">
+                  <label
+                    htmlFor="kot-language"
+                    className="block text-sm font-medium text-foreground mb-1"
+                  >
                     {t('kotPrintLanguage')}
                   </label>
                   <select
                     id="kot-language"
                     value={printingForm.kotLanguage}
+                    disabled={!canEditPrintingOptions}
                     onChange={(e) => {
+                      if (!canEditPrintingOptions) return;
                       markHydrationTouched('kotLanguage');
                       setPrintingForm((p) => ({ ...p, kotLanguage: e.target.value }));
                     }}
-                    className="block w-full rounded-md border-border shadow-sm focus:border-brand focus:ring-brand sm:text-sm px-3 py-2 border"
+                    className="block w-full rounded-md border-border shadow-sm focus:border-brand focus:ring-brand sm:text-sm px-3 py-2 border disabled:bg-muted disabled:cursor-not-allowed"
                   >
                     <option value="inherit">{t('sameAsStore')}</option>
                     {SELECTABLE_LANGUAGES.map((lang) => (
@@ -973,11 +1299,13 @@ export function PrintersSettingsTab({
                   <select
                     id="z-report-primary-language"
                     value={printingForm.zReportPrimaryLanguage}
+                    disabled={!canEditPrintingOptions}
                     onChange={(e) => {
+                      if (!canEditPrintingOptions) return;
                       markHydrationTouched('zReportPrimaryLanguage');
                       setPrintingForm((p) => ({ ...p, zReportPrimaryLanguage: e.target.value }));
                     }}
-                    className="block w-full rounded-md border-border shadow-sm focus:border-brand focus:ring-brand sm:text-sm px-3 py-2 border"
+                    className="block w-full rounded-md border-border shadow-sm focus:border-brand focus:ring-brand sm:text-sm px-3 py-2 border disabled:bg-muted disabled:cursor-not-allowed"
                   >
                     <option value="inherit">{t('sameAsStore')}</option>
                     {SELECTABLE_LANGUAGES.map((lang) => (
@@ -997,11 +1325,13 @@ export function PrintersSettingsTab({
                   <select
                     id="z-report-second-language"
                     value={printingForm.zReportSecondLanguage}
+                    disabled={!canEditPrintingOptions}
                     onChange={(e) => {
+                      if (!canEditPrintingOptions) return;
                       markHydrationTouched('zReportSecondLanguage');
                       setPrintingForm((p) => ({ ...p, zReportSecondLanguage: e.target.value }));
                     }}
-                    className="block w-full rounded-md border-border shadow-sm focus:border-brand focus:ring-brand sm:text-sm px-3 py-2 border"
+                    className="block w-full rounded-md border-border shadow-sm focus:border-brand focus:ring-brand sm:text-sm px-3 py-2 border disabled:bg-muted disabled:cursor-not-allowed"
                   >
                     <option value="none">{t('secondLanguageNone')}</option>
                     {SELECTABLE_LANGUAGES.map((lang) => (
@@ -1015,12 +1345,16 @@ export function PrintersSettingsTab({
               <p className="text-xs text-muted-foreground mt-2">{t('kotPrintLanguageHint')}</p>
               <p className="text-xs text-muted-foreground mt-1">{t('zReportLanguageHint')}</p>
             </div>
-            <div className="pt-4 border-t border-border">
+            <div
+              data-setting-section="bill-content"
+              className="pt-4 border-t border-border rounded-lg"
+            >
               <p className="font-medium text-foreground mb-1">{t('billContent')}</p>
               <p className="text-sm text-muted-foreground mb-3">{t('billContentHint')}</p>
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-x-6 gap-y-1">
                 {(
                   [
+                    { label: t('showLogo'), key: 'billShowLogo' as const },
                     { label: t('showRestaurantName'), key: 'billShowName' as const },
                     { label: t('showRestaurantAddress'), key: 'billShowAddress' as const },
                     { label: t('showRestaurantPhone'), key: 'billShowPhone' as const },
@@ -1029,20 +1363,65 @@ export function PrintersSettingsTab({
                     { label: t('showCustomerName'), key: 'billShowCustomerName' as const },
                     { label: t('showCustomerPhone'), key: 'billShowCustomerPhone' as const },
                     { label: t('showTableNumber'), key: 'billShowTableNumber' as const },
+                    {
+                      label: t('showLargeOrderNumber'),
+                      hint: t('showLargeOrderNumberHint'),
+                      key: 'billShowLargeOrderNumber' as const,
+                    },
                   ] as const
                 ).map((item) => (
-                  <div key={item.key} className="flex min-h-11 items-center justify-between gap-3 py-1">
-                    <span className="text-sm text-foreground">{item.label}</span>
+                  <div
+                    key={item.key}
+                    className="flex min-h-11 items-center justify-between gap-3 py-1"
+                  >
+                    <span className="flex flex-col">
+                      <span className="text-sm text-foreground">{item.label}</span>
+                      {'hint' in item && item.hint ? (
+                        <span className="text-xs text-muted-foreground">{item.hint}</span>
+                      ) : null}
+                    </span>
                     <Toggle
                       value={printingForm[item.key]}
                       label={item.label}
+                      disabled={!canEditPrintingOptions}
                       onChange={(value) => {
+                        if (!canEditPrintingOptions) return;
                         markHydrationTouched(item.key);
                         setPrintingForm((previous) => ({ ...previous, [item.key]: value }));
                       }}
                     />
                   </div>
                 ))}
+
+                {/* Unconditional: a merchant turning Customer Number off must
+                    still see what the slip will do. Beside the toggle it contradicts. */}
+                <div className="col-span-full mt-1 rounded-lg border border-amber-300 bg-amber-50 p-3 text-xs text-amber-900 dark:border-amber-800 dark:bg-amber-950/40 dark:text-amber-200">
+                  <div className="flex items-start gap-2">
+                    <AlertTriangle size={14} className="shrink-0 mt-0.5" />
+                    <span>{t('deliveryCustomerPhoneWarning')}</span>
+                  </div>
+                  <div className="mt-3 flex min-h-11 items-center justify-between gap-3">
+                    <span className="flex flex-col">
+                      <span className="font-medium">{t('deliveryShowCustomerPhoneAlways')}</span>
+                      <span className="text-[11px] opacity-80">
+                        {t('deliveryShowCustomerPhoneAlwaysHint')}
+                      </span>
+                    </span>
+                    <Toggle
+                      value={printingForm.billDeliveryShowCustomerPhoneAlways}
+                      label={t('deliveryShowCustomerPhoneAlways')}
+                      disabled={!canEditPrintingOptions}
+                      onChange={(value) => {
+                        if (!canEditPrintingOptions) return;
+                        markHydrationTouched('billDeliveryShowCustomerPhoneAlways');
+                        setPrintingForm((previous) => ({
+                          ...previous,
+                          billDeliveryShowCustomerPhoneAlways: value,
+                        }));
+                      }}
+                    />
+                  </div>
+                </div>
               </div>
               <div className="mt-4 border-t border-border pt-4">
                 <label
@@ -1054,13 +1433,15 @@ export function PrintersSettingsTab({
                 <textarea
                   id="footer-message"
                   rows={2}
+                  disabled={!isAdmin}
                   placeholder={t('footerMessagePlaceholder')}
                   value={billForm.billFooterMessage}
                   onChange={(e) => {
+                    if (!isAdmin) return;
                     markHydrationTouched('billFooterMessage');
                     setBillForm((p) => ({ ...p, billFooterMessage: e.target.value }));
                   }}
-                  className="w-full px-3 py-2 text-sm border border-border rounded-lg outline-none focus:ring-2 focus:ring-brand resize-none"
+                  className="w-full px-3 py-2 text-sm border border-border rounded-lg outline-none focus:ring-2 focus:ring-brand resize-none disabled:bg-muted disabled:cursor-not-allowed"
                 />
                 <p className="text-xs text-muted-foreground mt-1">{t('footerMessageHint')}</p>
               </div>
@@ -1068,7 +1449,10 @@ export function PrintersSettingsTab({
           </div>
         </div>
 
-        <div className="bg-card rounded-xl border border-border p-6">
+        <div
+          data-setting-section="whatsapp-sharing"
+          className="bg-card rounded-xl border border-border p-6"
+        >
           <div className="flex items-center gap-2 mb-4">
             <Share2 size={20} className="text-muted-foreground" />
             <h2 className="font-semibold text-foreground">{t('whatsappSharing')}</h2>
@@ -1081,7 +1465,9 @@ export function PrintersSettingsTab({
             <Toggle
               value={printingForm.whatsappShareEnabled}
               label={t('enableWhatsappShare')}
+              disabled={!canEditPrintingOptions}
               onChange={(v) => {
+                if (!canEditPrintingOptions) return;
                 markHydrationTouched('whatsappShareEnabled');
                 setPrintingForm((p) => ({ ...p, whatsappShareEnabled: v }));
               }}
@@ -1091,7 +1477,10 @@ export function PrintersSettingsTab({
       </div>
 
       <div className="space-y-6">
-        <div className="bg-card rounded-xl border border-border p-6">
+        <div
+          data-setting-section="bill-template"
+          className="bg-card rounded-xl border border-border p-6"
+        >
           <div className="flex items-center gap-2 mb-4">
             <FileText size={20} className="text-muted-foreground" />
             <h2 className="font-semibold text-foreground">{t('billTemplate')}</h2>
@@ -1102,7 +1491,10 @@ export function PrintersSettingsTab({
               return (
                 <button
                   key={card.id}
+                  type="button"
+                  disabled={!isAdmin}
                   onClick={() => {
+                    if (!isAdmin) return;
                     markHydrationTouched('billTemplate');
                     markHydrationTouched('billTemplateSource');
                     setBillForm((p) => ({
@@ -1111,14 +1503,16 @@ export function PrintersSettingsTab({
                       billTemplateSource: card.selectionSource,
                     }));
                   }}
-                  className={`text-start rounded-xl border-2 p-4 transition-all ${
+                  className={`text-start rounded-xl border-2 p-4 transition-all disabled:opacity-60 disabled:cursor-not-allowed ${
                     isSelected
                       ? 'border-brand bg-brand/5'
                       : 'border-border hover:border-gray-300 dark:border-border bg-card'
                   }`}
                 >
                   <p className="font-semibold text-foreground mb-2 flex items-center gap-2">
-                    <span className="flex-1">{card.nameKey ? t(card.nameKey) : card.displayName}</span>
+                    <span className="flex-1">
+                      {card.nameKey ? t(card.nameKey) : card.displayName}
+                    </span>
                     {card.source === 'merchant' && card.originBadgeKey && (
                       <span className="shrink-0 rounded-full bg-brand/10 px-2 py-0.5 text-[10px] font-medium text-brand">
                         {t(card.originBadgeKey)}
@@ -1132,8 +1526,10 @@ export function PrintersSettingsTab({
                     {card.source === 'plugin' || card.source === 'merchant'
                       ? card.description
                       : card.id === 'classic'
-                      ? t('billTemplateClassicDesc')
-                      : t('billTemplateCompactDesc')}
+                        ? t('billTemplateClassicDesc')
+                        : card.id === 'saudi'
+                          ? t('billTemplateSaudiDesc')
+                          : t('billTemplateCompactDesc')}
                   </p>
                 </button>
               );

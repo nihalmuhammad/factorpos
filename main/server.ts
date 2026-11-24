@@ -2,17 +2,36 @@ import express, { Express, Request, Response, NextFunction } from 'express';
 import cors from 'cors';
 import { WebSocketServer } from 'ws';
 import * as http from 'http';
-import { closeServerResources, createShutdownCancellationError, installHttpShutdownTracking } from './shutdown';
+import {
+  closeServerResources,
+  createShutdownCancellationError,
+  installHttpShutdownTracking,
+} from './shutdown';
 import * as path from 'path';
 import * as fs from 'fs';
 import jwt from 'jsonwebtoken';
 import { registerRoutes } from './routes';
-import { getJWTSecret } from './routes/auth';
-import { databaseMaintenanceMiddleware, getDbHealth, isDatabaseMaintenanceActive, isKdsEnabled } from './db';
-import { setupKdsWebSocket } from './services/kds';
+import { malformedOrderBodyPayload } from './routes/orders';
+import { getJWTSecret } from './security/jwt-secret';
+import {
+  databaseMaintenanceMiddleware,
+  getDbHealth,
+  isDatabaseMaintenanceActive,
+  isKdsEnabled,
+} from './db';
+import { checkKdsWebSocketAdmission, setupKdsWebSocket } from './services/kds';
 import expressRateLimit from 'express-rate-limit';
-import { staticRouteRateLimit, corsOptions, getUserAuthStatus, isAllowedPrivateIp, isTokenRevoked, isTokenStale } from './middleware/security';
+import {
+  staticRouteRateLimit,
+  corsOptions,
+  getUserAuthStatus,
+  isAllowedPrivateIp,
+  isTokenRevoked,
+  isTokenStale,
+} from './middleware/security';
 import { initFromDb as initWhatsAppFromDb } from './services/whatsapp';
+import { startScheduledOrderSweep, stopScheduledOrderSweep } from './services/scheduled-orders';
+import { postHogApiFailureMiddleware, apiSlowRequestMiddleware } from './services/posthog';
 import { API_JSON_BODY_LIMIT } from './http-limits';
 import { buildCspHeader } from './csp';
 import { resolveContainedPath } from './lib/path-containment';
@@ -26,21 +45,58 @@ let stopPromise: Promise<void> | null = null;
 let startReject: ((error: Error) => void) | null = null;
 let stopping = false;
 
-/** JWT verification middleware protecting API routes from unauthenticated LAN access. */
-function requireAuth(req: Request, res: Response, next: NextFunction): void {
+/** JWT verification middleware protecting API routes from unauthenticated LAN access. Exported so tests can assert its path exemptions. */
+export function requireAuth(req: Request, res: Response, next: NextFunction): void {
+  // Express matches routes case-insensitively by default, so /API/pos-info
+  // reaches the same handler as /api/pos-info. Every path decision below must
+  // use one canonical lowercase form, otherwise a case-variant path skips this
+  // middleware while still routing to the protected handler behind it.
+  const reqPath = req.path.toLowerCase();
   // Only protect API routes — static files and SPA fallback must pass through
-  if (!req.path.startsWith('/api')) { next(); return; }
+  if (!reqPath.startsWith('/api')) {
+    next();
+    return;
+  }
   // Health check — unauthenticated
-  if (req.path === '/api/health') { next(); return; }
-  // Auth routes handle their own token verification
-  if (req.path.startsWith('/api/auth')) { next(); return; }
+  if (reqPath === '/api/health') {
+    next();
+    return;
+  }
+  // Auth routes handle their own token verification. Matched with a trailing
+  // slash so this doesn't also swallow /api/authorization, which relies on
+  // this middleware to populate req.user before its own permission gate runs.
+  if (reqPath === '/api/auth' || reqPath.startsWith('/api/auth/')) {
+    next();
+    return;
+  }
   // Allow unauthenticated GET requests for product images (so <img> tags work)
-  if (req.path.startsWith('/api/products/') && req.path.endsWith('/image') && req.method === 'GET') { next(); return; }
+  if (reqPath.startsWith('/api/products/') && reqPath.endsWith('/image') && req.method === 'GET') {
+    next();
+    return;
+  }
+  // Paired display devices authenticate with their own scoped token in the handler.
+  // Exact path and method, so no lookalike path can skip auth.
+  if (req.method === 'GET' && reqPath === '/api/customer-display/feed') {
+    next();
+    return;
+  }
   // Login-screen support-ticket paths, rate-limited in support-ticket.ts.
   // Matched exactly (not by prefix) so a lookalike path can't skip auth.
-  if (req.method === 'POST' && req.path === '/api/support-ticket/pre-login') { next(); return; }
-  if (req.method === 'GET' && req.path === '/api/support-ticket/pre-login/profile') { next(); return; }
-  if (req.method === 'GET' && /^\/api\/support-ticket\/pre-login\/[0-9a-f-]{36}\/status$/i.test(req.path)) { next(); return; }
+  if (req.method === 'POST' && reqPath === '/api/support-ticket/pre-login') {
+    next();
+    return;
+  }
+  if (req.method === 'GET' && reqPath === '/api/support-ticket/pre-login/profile') {
+    next();
+    return;
+  }
+  if (
+    req.method === 'GET' &&
+    /^\/api\/support-ticket\/pre-login\/[0-9a-f-]{36}\/status$/i.test(reqPath)
+  ) {
+    next();
+    return;
+  }
 
   const authHeader = req.headers.authorization;
   if (!authHeader?.startsWith('Bearer ')) {
@@ -56,9 +112,10 @@ function requireAuth(req: Request, res: Response, next: NextFunction): void {
     const decoded = jwt.verify(token, getJWTSecret()) as any;
 
     // Reject tokens for users deactivated (or deleted) since token was issued.
-    const freshKdsAuth = req.path.startsWith('/api/kds')
-      || req.path.startsWith('/api/kitchen')
-      || req.path.startsWith('/api/order-items');
+    const freshKdsAuth =
+      reqPath.startsWith('/api/kds') ||
+      reqPath.startsWith('/api/kitchen') ||
+      reqPath.startsWith('/api/order-items');
     const status = getUserAuthStatus(decoded.userId, { fresh: freshKdsAuth });
     if (!status || !status.isActive) {
       res.status(401).json({ error: 'Invalid or expired token' });
@@ -141,6 +198,8 @@ export function startServer(): Promise<void> {
     app = express();
 
     app.use(cors(corsOptions));
+    app.use(apiSlowRequestMiddleware);
+    app.use(postHogApiFailureMiddleware);
     // Scope the anonymous pre-login route to a body limit far below the
     // general API import limit, so it can't force a large allocation.
     app.use('/api/support-ticket/pre-login', express.json({ limit: '300kb' }));
@@ -148,9 +207,10 @@ export function startServer(): Promise<void> {
     app.use((error: any, req: Request, res: Response, next: NextFunction) => {
       if (error?.type === 'entity.too.large') {
         res.status(413).json({
-          error: req.path === '/api/support-ticket/pre-login'
-            ? 'Request body is too large.'
-            : `Request body is too large. JSON imports are limited to ${API_JSON_BODY_LIMIT}; use Backup/Restore for full database migration.`,
+          error:
+            req.path === '/api/support-ticket/pre-login'
+              ? 'Request body is too large.'
+              : `Request body is too large. JSON imports are limited to ${API_JSON_BODY_LIMIT}; use Backup/Restore for full database migration.`,
         });
         return;
       }
@@ -161,17 +221,20 @@ export function startServer(): Promise<void> {
       if (req.body === undefined) req.body = {};
       next();
     });
-    app.use(databaseMaintenanceMiddleware);
+    app.use('/api', databaseMaintenanceMiddleware);
 
     // ── Global API rate limiting ───────────────────────────────────────
     // Protect all API routes with express-rate-limit and LAN bypass.
-    app.use('/api', expressRateLimit({
-      windowMs: 60 * 1000,
-      limit: 100,
-      standardHeaders: true,
-      legacyHeaders: false,
-      skip: (req: Request) => isAllowedPrivateIp(req.ip || req.socket.remoteAddress || ''),
-    }));
+    app.use(
+      '/api',
+      expressRateLimit({
+        windowMs: 60 * 1000,
+        limit: 100,
+        standardHeaders: true,
+        legacyHeaders: false,
+        skip: (req: Request) => isAllowedPrivateIp(req.ip || req.socket.remoteAddress || ''),
+      }),
+    );
 
     // ── Content Security Policy ────────────────────────────────────────
     // Blocks eval() and remote code; unsafe-inline allowed for Next.js and Tailwind.
@@ -225,9 +288,13 @@ export function startServer(): Promise<void> {
       app.use(express.static(frontendDir, { dotfiles: 'allow', index: false }));
 
       // Serve each Next.js static route index directly to avoid root redirects.
-      app.get(/^(?!\/api|\/kds).*$/, staticRouteRateLimit(), (req: Request, res: Response) => {
-        res.sendFile(resolveStaticPage(frontendDir, req.path), { dotfiles: 'allow' });
-      });
+      app.get(
+        /^(?!\/api(?:\/|$)|\/kds(?:\/|$)).*$/,
+        staticRouteRateLimit(),
+        (req: Request, res: Response) => {
+          res.sendFile(resolveStaticPage(frontendDir, req.path), { dotfiles: 'allow' });
+        },
+      );
     } else {
       console.warn('[Server] Frontend build not found. Run `npm run build:frontend` first.');
       app.get('/', (_req: Request, res: Response) => {
@@ -241,16 +308,32 @@ export function startServer(): Promise<void> {
     }
 
     // ── Global error handler ───────────────────────────────────────────
-    app.use((err: Error & { status?: number; type?: string }, _req: Request, res: Response, _next: NextFunction) => {
-      if (err.type === 'entity.parse.failed') {
-        return res.status(400).json({ error: 'Malformed JSON request body' });
-      }
-      const status = typeof err.status === 'number' && err.status >= 400 && err.status < 500
-        ? err.status
-        : 500;
-      if (status >= 500) console.error('[Server] Error:', err);
-      res.status(status).json({ error: status >= 500 ? 'Internal server error' : (err.message || 'Client error') });
-    });
+    app.use(
+      (
+        err: Error & { status?: number; type?: string },
+        req: Request,
+        res: Response,
+        _next: NextFunction,
+      ) => {
+        if (err.type === 'entity.parse.failed') {
+          return res
+            .status(400)
+            .json(malformedOrderBodyPayload(req) ?? { error: 'Malformed JSON request body' });
+        }
+        const status =
+          typeof err.status === 'number' && err.status >= 400 && err.status < 500
+            ? err.status
+            : 500;
+        if (status >= 500) {
+          console.error('[Server] Error:', err);
+          // The failure middleware reads it to report the thrown error with its own stack.
+          res.locals.postHogError = err;
+        }
+        res
+          .status(status)
+          .json({ error: status >= 500 ? 'Internal server error' : err.message || 'Client error' });
+      },
+    );
 
     const basePort = parseInt(process.env.PORT || '3001', 10);
     let currentPort = basePort;
@@ -264,7 +347,11 @@ export function startServer(): Promise<void> {
       const attemptedPort = currentPort;
       const onListening = () => {
         if (stopping) {
-          try { listeningServer.close(); } catch { return; }
+          try {
+            listeningServer.close();
+          } catch {
+            return;
+          }
           return;
         }
         startReject = null;
@@ -283,13 +370,17 @@ export function startServer(): Promise<void> {
           listeningServer.on('upgrade', (request, socket, head) => {
             const pathname = (request.url || '').split('?')[0];
             if (pathname !== '/kds') {
-              socket.write('HTTP/1.1 404 Not Found\r\nConnection: close\r\nContent-Length: 0\r\n\r\n');
+              socket.write(
+                'HTTP/1.1 404 Not Found\r\nConnection: close\r\nContent-Length: 0\r\n\r\n',
+              );
               socket.destroy();
               return;
             }
 
             if (isDatabaseMaintenanceActive()) {
-              socket.write('HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 0\r\n\r\n');
+              socket.write(
+                'HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 0\r\n\r\n',
+              );
               socket.destroy();
               return;
             }
@@ -297,6 +388,15 @@ export function startServer(): Promise<void> {
             if (!isKdsEnabled()) {
               // Return 404 when disabled to avoid revealing KDS presence to LAN clients.
               socket.write('HTTP/1.1 404 Not Found\r\n\r\n');
+              socket.destroy();
+              return;
+            }
+
+            const admission = checkKdsWebSocketAdmission(request);
+            if (!admission.allowed) {
+              socket.write(
+                `HTTP/1.1 ${admission.statusCode} ${admission.statusText}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`,
+              );
               socket.destroy();
               return;
             }
@@ -320,6 +420,8 @@ export function startServer(): Promise<void> {
         } catch (error) {
           console.error('[Server] WhatsApp startup initialization failed:', error);
         }
+
+        startScheduledOrderSweep();
 
         resolve();
       };
@@ -356,6 +458,7 @@ export function stopServer(): Promise<void> {
   if (stopPromise) return stopPromise;
 
   stopping = true;
+  stopScheduledOrderSweep();
   const rejectStart = startReject;
   startReject = null;
   rejectStart?.(createShutdownCancellationError('Main server'));
@@ -366,9 +469,8 @@ export function stopServer(): Promise<void> {
   server = null;
   wss = null;
 
-  stopPromise = closeServerResources(serverToClose, wssToClose, 'Main server')
-    .then(() => {
-      console.log('[Server] HTTP/WebSocket server stopped');
-    });
+  stopPromise = closeServerResources(serverToClose, wssToClose, 'Main server').then(() => {
+    console.log('[Server] HTTP/WebSocket server stopped');
+  });
   return stopPromise;
 }

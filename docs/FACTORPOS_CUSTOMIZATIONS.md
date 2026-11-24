@@ -6,7 +6,7 @@ upstream merges do not silently remove FactorPOS behavior.
 ## Upstream baseline
 
 - Repository: `https://github.com/FreeOpenSourcePOS/FloCafe.git`
-- Release: `3.9.0`
+- Release: `3.14.0` (merged 2026-11-24; first fork point `3.9.0`)
 - Local upstream remote: `upstream`
 - Long-lived branch: `main`
 - Source and release repository (public): `https://github.com/nihalmuhammad/factorpos`
@@ -44,6 +44,19 @@ The shared source of truth for first-run defaults is
 consume it, and `tests/country-profile.test.ts` verifies Saudi currency,
 numbers, and dates do not emit Arabic-Indic digits.
 
+## Database migrations
+
+FloCafe owns the numbered `MIGRATIONS` list and SQLite `user_version`.
+FactorPOS schema changes go in `FACTORPOS_MIGRATIONS` in `main/db.ts`. They
+are tracked by id in the `_factorpos_migrations` table, run after the
+upstream list, and must be idempotent.
+
+FactorPOS 3.9.0 to 3.9.1-beta.1 shipped its token column as numbered
+migration 85, which is FloCafe's `add_inventory_movements`. On startup such a
+database is backed up and moved back to v84, and the token migration is
+recorded by id, so FloCafe's own 85 and later run after an upstream merge.
+Covered by `npm run test:factorpos-migrations`.
+
 ## Releases and updates
 
 - Shop PCs update from this repository's GitHub Releases, built by
@@ -65,7 +78,36 @@ numbers, and dates do not emit Arabic-Indic digits.
   `docs/FACTORPOS_UPSTREAM_UPDATES.md`.
 - The language picker keeps `de, en, es, fa, fil, fr, pt, tr`; new FloCafe
   languages are merged with `selectable: false`.
-- `.github/workflows/nightly-release.yml` is manual-only in FactorPOS.
+- `.github/workflows/full-cross-platform-matrix.yml` (FloCafe renamed it from
+  `nightly-release.yml`) is manual-only in FactorPOS.
+- Customer day token: `generateTokenNumber()` in order creation
+  (`main/routes/orders.ts`), reset by the day close (`main/routes/cash-closures.ts`),
+  shown on the dashboard, order cards and the compact ORDER NOTE (thermal and browser).
+- Bill formats (Settings → Printers → Bill Template) follow the setting on every print
+  path. Compact is the FactorPOS token ORDER NOTE; Classic is FloCafe's bill. Earlier
+  FactorPOS builds forced compact on browser printing, so the FactorPOS migration
+  `2026-11-24-bill-template-compact-default` moves a core `classic` setting to
+  `compact` once on shops that already have orders (a fresh install keeps FloCafe's
+  default; pack and custom formats are left alone).
+- Saudi Tax Invoice (core template `saudi`): a simplified tax invoice with seller name,
+  VAT number, the Arabic and English title, invoice number and date, items, amount
+  before VAT, VAT and total with VAT, and the ZATCA QR (TLV tags 1–5,
+  `shared/print/zatca-qr.ts`). Thermal: `main/printers/document-saudi.ts` (native
+  ESC/POS QR; Arabic labels print through raster mode or Arabic shaping, and are left
+  out on text-only printers). Browser: `frontend/src/lib/printer/saudi-web-print.ts`,
+  with the QR image from `GET /api/bills/:id/zatca-qr`. Direct-USB (WebUSB) printers
+  use system print for this format. QR tags 6–9 (hash, signature, public key) come
+  with invoice signing (roadmap phase 4). Until then `ZATCA_PREVIEW_ONLY` prints a
+  "NOT A TAX INVOICE - PREVIEW" banner: shops already on ZATCA integration e-invoicing must keep issuing
+  tax invoices from their compliant system.
+- First-run setup preselects Saudi Arabia, SAR and Asia/Riyadh, and lists the selected
+  country first (`frontend/src/lib/factorpos-setup.ts`); FloCafe pins India and Argentina
+  to the top, which hid the Saudi tick and made India a one-click mistake. FloCafe 3.14 no
+  longer has a default country; FactorPOS keeps the preselection, and the owner
+  still sees and can change it.
+- Email Error Log (Support): opens a local `.eml` draft with the recent log,
+  sanitized by FloCafe's `sanitizeLogTail` before it is attached.
+- Support-ticket subjects say FactorPOS (`frontend/src/lib/operation-failure.ts`).
 
 ## Still pending
 

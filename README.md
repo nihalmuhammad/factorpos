@@ -37,23 +37,130 @@ status](docs/FACTORPOS_CUSTOMIZATIONS.md).
 
 ### System requirements
 
-| Requirement | Minimum |
-| --- | --- |
-| Operating system | Windows 10+, macOS 12+, or a current supported Linux distribution |
-| Memory | 4 GB RAM |
-| Storage | 500 MB free space, plus room for local backups |
+| Requirement      | Minimum                                                                                        |
+| ---------------- | ---------------------------------------------------------------------------------------------- |
+| Operating system | Windows 10+, macOS 12+, or a current supported Linux distribution — 64-bit only (x64 or arm64) |
+| Memory           | 4 GB RAM                                                                                       |
+| Storage          | 500 MB free space, plus room for local backups                                                 |
 
 Node.js is only required to develop FactorPOS, not to run a packaged release.
 
-## Highlights
+## Key features
 
-- **Order workflows:** Counter, dine-in, takeaway, and delivery orders with table management and held orders.
-- **Modifiers & pricing:** Item modifiers, add-on groups, discounts, and customer loyalty points.
-- **Receipt printing:** ESC/POS thermal printing over USB, local network (TCP), and OS-managed print queues, with WebUSB supported in compatible browsers (58 mm and 80 mm paper support).
-- **Kitchen operations:** Standalone Kitchen Display System (KDS) server and category-based kitchen station routing.
-- **Catalog management:** Product images, barcode scanning, and CSV menu import/export.
-- **Administration:** Role-based staff accounts (Owner, Manager, Cashier, Chef), sales analytics, and audit logs.
-- **Data protection:** Local SQLite database with automated pre-migration backups, manual restore tools, and optional Google Drive backup.
+<table>
+  <tr>
+    <td width="50%" valign="top">
+      <h3>High-Speed Counter POS</h3>
+      <p>Fast, touch-optimized checkout built for busy café rushes. Filter menu categories with a tap, adjust item quantities on the fly, and accept cash or card payments with zero lag.</p>
+      <p><a href="https://flopos.com/documentation/getting-started">Getting started guide &rarr;</a></p>
+    </td>
+    <td width="50%">
+      <picture>
+        <source srcset="docs/assets/showcase/pos-checkout.gif" type="image/gif">
+        <img src="docs/assets/showcase/pos-checkout.poster.jpg" alt="FloCafe counter POS checkout flow with cart item selection and cash payment confirmation" width="100%">
+      </picture>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top">
+      <h3>Custom Modifiers &amp; Add-ons</h3>
+      <p>Tailor every drink and dish to customer preferences. Configure milk selections (whole, oat, almond), extra espresso shots, syrup flavors, and kitchen prep instructions effortlessly.</p>
+    </td>
+    <td width="50%">
+      <picture>
+        <source srcset="docs/assets/showcase/addon-modifiers.gif" type="image/gif">
+        <img src="docs/assets/showcase/addon-modifiers.poster.jpg" alt="FloCafe modal modifier selector choosing oat milk and espresso shots" width="100%">
+      </picture>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top">
+      <h3>Real-Time Kitchen Display (KDS)</h3>
+      <p>Keep kitchen staff and baristas in sync with a digital ticket board. Drag orders from waiting to preparing to ready, track prep times, and eliminate lost paper tickets.</p>
+      <p><a href="https://flopos.com/documentation/kitchen-display">Kitchen display guide &rarr;</a></p>
+    </td>
+    <td width="50%">
+      <picture>
+        <source srcset="docs/assets/showcase/kds-kanban.gif" type="image/gif">
+        <img src="docs/assets/showcase/kds-kanban.poster.jpg" alt="FloCafe standalone Kitchen Display System Kanban board tracking tickets across prep stages" width="100%">
+      </picture>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top">
+      <h3>Visual Tables &amp; Floor Plan</h3>
+      <p>See your entire dining area at a glance. Track occupied and open tables, check how long guests have been seated to optimize turnaround, and view checks instantly.</p>
+    </td>
+    <td width="50%">
+      <picture>
+        <source srcset="docs/assets/showcase/floorplan-tables.gif" type="image/gif">
+        <img src="docs/assets/showcase/floorplan-tables.poster.jpg" alt="FloCafe interactive floor plan and table turnover monitoring" width="100%">
+      </picture>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top">
+      <h3>Handheld Waiter App</h3>
+      <p>Take orders right at the table from any smartphone or tablet. Servers select menu items, apply modifiers, and fire tickets directly to the kitchen without walking back to the counter.</p>
+    </td>
+    <td width="50%">
+      <picture>
+        <source srcset="docs/assets/showcase/server-app.gif" type="image/gif">
+        <img src="docs/assets/showcase/server-app.poster.jpg" alt="FloCafe handheld mobile waiter app taking orders table-side" width="100%">
+      </picture>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top">
+      <h3>Split Payments &amp; Multi-Tender</h3>
+      <p>Split bills equally across guests or accept multiple payment types on a single ticket. Handle partial cash, card, and loyalty point redemptions with automatic change calculations.</p>
+    </td>
+    <td width="50%">
+      <picture>
+        <source srcset="docs/assets/showcase/split-payments.gif" type="image/gif">
+        <img src="docs/assets/showcase/split-payments.poster.jpg" alt="FloCafe equal share split payment calculator dividing check across diners" width="100%">
+      </picture>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top">
+      <h3>Supplies &amp; Stock Tracking</h3>
+      <p>Manage raw ingredients and café supplies with precision. Record stock deliveries, waste, and manual adjustments, track unit costs, and review complete movement audit logs.</p>
+    </td>
+    <td width="50%">
+      <picture>
+        <source srcset="docs/assets/showcase/recipe-inventory.gif" type="image/gif">
+        <img src="docs/assets/showcase/recipe-inventory.poster.jpg" alt="FloCafe inventory management with supplies, recipe portions, and stock movement logs" width="100%">
+      </picture>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top">
+      <h3>Thermal Receipt &amp; Kitchen Printing</h3>
+      <p>Print clean customer receipts and kitchen order slips on standard 58mm or 80mm thermal receipt printers over USB or local network, complete with itemized tax summaries.</p>
+      <p><a href="https://flopos.com/documentation/printers">Printer configuration guide &rarr;</a></p>
+    </td>
+    <td width="50%">
+      <picture>
+        <source srcset="docs/assets/showcase/thermal-printing.gif" type="image/gif">
+        <img src="docs/assets/showcase/thermal-printing.poster.jpg" alt="FloCafe thermal printer test interface for 58mm and 80mm receipts and KOT tickets" width="100%">
+      </picture>
+    </td>
+  </tr>
+</table>
+
+### Also in the box
+
+- **Offline-first architecture:** Local SQLite storage with auto-migrating schema and fail-closed safety.
+- **Granular roles & permissions:** Owner, Manager, Cashier, Server, and Chef roles with context-aware access policies.
+- **Multi-language support:** 32 localized languages with full bidirectional RTL rendering (Arabic, Persian, Urdu).
+- **245 Country profiles:** 153 world currencies with localized phone parsing, number formatting, and timezone handling.
+- **Country tax packs:** Signed regional tax pack integration and manual rule engine.
+- **Automated database backups:** Pre-migration automatic snapshots, manual exports, and optional Google Drive sync.
+- **Customer loyalty & CRM:** Customer directory, purchase histories, and point redemption.
+- **Cash drawer management:** Cash pulse on checkout and end-of-shift cash drawer reconciliations.
+- **Daily sales & accounting export:** Audit-ready CSV/Excel reporting with financial reconciliation identities.
+- **Multi-counter ordering:** Separate order capture, cashier payment, or combined counter terminals with shared LAN queue and QR ticket lookup.
 
 ## Project status
 
@@ -78,151 +185,289 @@ FactorPOS includes UI translations for:
 - Spanish
 - French
 - Brazilian Portuguese
+- Russian
 - Filipino
 - Turkish
 - Persian (Farsi), including RTL support
+- Arabic, including RTL support
+- Urdu, including RTL support
 - German
+- Italian
+- Japanese
+- Simplified Chinese
+- Traditional Chinese (Taiwan)
+- Korean
+- Bahasa Indonesia
+- Dutch
+- Hindi
+- Bengali/Bangla
+- Albanian
+- Vietnamese
+- Thai
+- Nepali
+- Hausa
+- Javanese
+- Marathi
+- Swahili
+- Punjabi
+- Telugu
+- Tamil
+- Ukrainian
 
-UI language is independent of store country and regional settings, and tax calculation rules remain a separate concern. For details on contributing translations or adding languages, see the [Internationalization and translation guide](docs/i18n.md).
+UI language is independent of store country and regional settings, and tax calculation rules remain a separate concern. For details on contributing translations or adding languages, see the [Internationalization and translation guide](docs/architecture/internationalization.md).
 
-FactorPOS ships with 131 country profiles covering 109 currencies. Each profile sets a default currency, locale, and setup timezone; store owners can override the timezone during setup or later in Settings.
+FactorPOS ships with 245 country profiles covering 153 currencies. Each profile sets a default currency, locale, and setup timezone; store owners can override the timezone during setup or later in Settings.
 
 <details>
 <summary>Supported country profiles, currencies, and default timezones</summary>
 
-| Country | Currency | Default timezone |
-| --- | --- | --- |
-| India (IN) | INR | Asia/Kolkata |
-| Argentina (AR) | ARS | America/Argentina/Buenos_Aires |
-| United States (US) | USD | America/New_York |
-| Canada (CA) | CAD | America/Toronto |
-| United Kingdom (GB) | GBP | Europe/London |
-| Thailand (TH) | THB | Asia/Bangkok |
-| Singapore (SG) | SGD | Asia/Singapore |
-| Malaysia (MY) | MYR | Asia/Kuala_Lumpur |
-| Indonesia (ID) | IDR | Asia/Jakarta |
-| Philippines (PH) | PHP | Asia/Manila |
-| Vietnam (VN) | VND | Asia/Ho_Chi_Minh |
-| Australia (AU) | AUD | Australia/Sydney |
-| New Zealand (NZ) | NZD | Pacific/Auckland |
-| United Arab Emirates (AE) | AED | Asia/Dubai |
-| Saudi Arabia (SA) | SAR | Asia/Riyadh |
-| South Africa (ZA) | ZAR | Africa/Johannesburg |
-| Morocco (MA) | MAD | Africa/Casablanca |
-| Kenya (KE) | KES | Africa/Nairobi |
-| Nigeria (NG) | NGN | Africa/Lagos |
-| Brazil (BR) | BRL | America/Sao_Paulo |
-| Mexico (MX) | MXN | America/Mexico_City |
-| Chile (CL) | CLP | America/Santiago |
-| Uruguay (UY) | UYU | America/Montevideo |
-| Paraguay (PY) | PYG | America/Asuncion |
-| Japan (JP) | JPY | Asia/Tokyo |
-| South Korea (KR) | KRW | Asia/Seoul |
-| China (CN) | CNY | Asia/Shanghai |
-| Hong Kong SAR China (HK) | HKD | Asia/Hong_Kong |
-| Taiwan (TW) | TWD | Asia/Taipei |
-| Pakistan (PK) | PKR | Asia/Karachi |
-| Bangladesh (BD) | BDT | Asia/Dhaka |
-| Sri Lanka (LK) | LKR | Asia/Colombo |
-| Nepal (NP) | NPR | Asia/Kathmandu |
-| Egypt (EG) | EGP | Africa/Cairo |
-| Israel (IL) | ILS | Asia/Jerusalem |
-| Türkiye (TR) | TRY | Europe/Istanbul |
-| Iran (IR) | IRR | Asia/Tehran |
-| Germany (DE) | EUR | Europe/Berlin |
-| France (FR) | EUR | Europe/Paris |
-| Italy (IT) | EUR | Europe/Rome |
-| Spain (ES) | EUR | Europe/Madrid |
-| Portugal (PT) | EUR | Europe/Lisbon |
-| Netherlands (NL) | EUR | Europe/Amsterdam |
-| Belgium (BE) | EUR | Europe/Brussels |
-| Ireland (IE) | EUR | Europe/Dublin |
-| Austria (AT) | EUR | Europe/Vienna |
-| Greece (GR) | EUR | Europe/Athens |
-| Finland (FI) | EUR | Europe/Helsinki |
-| Luxembourg (LU) | EUR | Europe/Luxembourg |
-| Malta (MT) | EUR | Europe/Malta |
-| Cyprus (CY) | EUR | Asia/Nicosia |
-| Slovakia (SK) | EUR | Europe/Bratislava |
-| Slovenia (SI) | EUR | Europe/Ljubljana |
-| Estonia (EE) | EUR | Europe/Tallinn |
-| Latvia (LV) | EUR | Europe/Riga |
-| Lithuania (LT) | EUR | Europe/Vilnius |
-| Croatia (HR) | EUR | Europe/Zagreb |
-| Switzerland (CH) | CHF | Europe/Zurich |
-| Sweden (SE) | SEK | Europe/Stockholm |
-| Norway (NO) | NOK | Europe/Oslo |
-| Denmark (DK) | DKK | Europe/Copenhagen |
-| Poland (PL) | PLN | Europe/Warsaw |
-| Czechia (CZ) | CZK | Europe/Prague |
-| Hungary (HU) | HUF | Europe/Budapest |
-| Romania (RO) | RON | Europe/Bucharest |
-| Bulgaria (BG) | BGN | Europe/Sofia |
-| Iceland (IS) | ISK | Atlantic/Reykjavik |
-| Serbia (RS) | RSD | Europe/Belgrade |
-| Ukraine (UA) | UAH | Europe/Kyiv |
-| Albania (AL) | ALL | Europe/Tirane |
-| North Macedonia (MK) | MKD | Europe/Skopje |
-| Bosnia & Herzegovina (BA) | BAM | Europe/Sarajevo |
-| Moldova (MD) | MDL | Europe/Chisinau |
-| Georgia (GE) | GEL | Asia/Tbilisi |
-| Armenia (AM) | AMD | Asia/Yerevan |
-| Azerbaijan (AZ) | AZN | Asia/Baku |
-| Qatar (QA) | QAR | Asia/Qatar |
-| Kuwait (KW) | KWD | Asia/Kuwait |
-| Bahrain (BH) | BHD | Asia/Bahrain |
-| Oman (OM) | OMR | Asia/Muscat |
-| Jordan (JO) | JOD | Asia/Amman |
-| Lebanon (LB) | LBP | Asia/Beirut |
-| Iraq (IQ) | IQD | Asia/Baghdad |
-| Yemen (YE) | YER | Asia/Aden |
-| Ghana (GH) | GHS | Africa/Accra |
-| Tanzania (TZ) | TZS | Africa/Dar_es_Salaam |
-| Uganda (UG) | UGX | Africa/Kampala |
-| Ethiopia (ET) | ETB | Africa/Addis_Ababa |
-| Rwanda (RW) | RWF | Africa/Kigali |
-| Côte d’Ivoire (CI) | XOF | Africa/Abidjan |
-| Senegal (SN) | XOF | Africa/Dakar |
-| Cameroon (CM) | XAF | Africa/Douala |
-| Zambia (ZM) | ZMW | Africa/Lusaka |
-| Mauritius (MU) | MUR | Indian/Mauritius |
-| Tunisia (TN) | TND | Africa/Tunis |
-| Algeria (DZ) | DZD | Africa/Algiers |
-| Botswana (BW) | BWP | Africa/Gaborone |
-| Namibia (NA) | NAD | Africa/Windhoek |
-| Mozambique (MZ) | MZN | Africa/Maputo |
-| Angola (AO) | AOA | Africa/Luanda |
-| Kazakhstan (KZ) | KZT | Asia/Almaty |
-| Uzbekistan (UZ) | UZS | Asia/Tashkent |
-| Mongolia (MN) | MNT | Asia/Ulaanbaatar |
-| Myanmar (Burma) (MM) | MMK | Asia/Yangon |
-| Cambodia (KH) | KHR | Asia/Phnom_Penh |
-| Laos (LA) | LAK | Asia/Vientiane |
-| Brunei (BN) | BND | Asia/Brunei |
-| Macao SAR China (MO) | MOP | Asia/Macau |
-| Maldives (MV) | MVR | Indian/Maldives |
-| Bhutan (BT) | BTN | Asia/Thimphu |
-| Afghanistan (AF) | AFN | Asia/Kabul |
-| Guatemala (GT) | GTQ | America/Guatemala |
-| Costa Rica (CR) | CRC | America/Costa_Rica |
-| Panama (PA) | PAB | America/Panama |
-| Dominican Republic (DO) | DOP | America/Santo_Domingo |
-| Honduras (HN) | HNL | America/Tegucigalpa |
-| El Salvador (SV) | USD | America/El_Salvador |
-| Nicaragua (NI) | NIO | America/Managua |
-| Belize (BZ) | BZD | America/Belize |
-| Jamaica (JM) | JMD | America/Jamaica |
-| Trinidad & Tobago (TT) | TTD | America/Port_of_Spain |
-| Bahamas (BS) | BSD | America/Nassau |
-| Barbados (BB) | BBD | America/Barbados |
-| Haiti (HT) | HTG | America/Port-au-Prince |
-| Bolivia (BO) | BOB | America/La_Paz |
-| Ecuador (EC) | USD | America/Guayaquil |
-| Colombia (CO) | COP | America/Bogota |
-| Peru (PE) | PEN | America/Lima |
-| Venezuela (VE) | VES | America/Caracas |
-| Fiji (FJ) | FJD | Pacific/Fiji |
-| Papua New Guinea (PG) | PGK | Pacific/Port_Moresby |
+| Country                             | Currency | Default timezone               |
+| ----------------------------------- | -------- | ------------------------------ |
+| India (IN)                          | INR      | Asia/Kolkata                   |
+| Argentina (AR)                      | ARS      | America/Argentina/Buenos_Aires |
+| United States (US)                  | USD      | America/New_York               |
+| Canada (CA)                         | CAD      | America/Toronto                |
+| United Kingdom (GB)                 | GBP      | Europe/London                  |
+| Thailand (TH)                       | THB      | Asia/Bangkok                   |
+| Singapore (SG)                      | SGD      | Asia/Singapore                 |
+| Malaysia (MY)                       | MYR      | Asia/Kuala_Lumpur              |
+| Indonesia (ID)                      | IDR      | Asia/Jakarta                   |
+| Philippines (PH)                    | PHP      | Asia/Manila                    |
+| Vietnam (VN)                        | VND      | Asia/Ho_Chi_Minh               |
+| Australia (AU)                      | AUD      | Australia/Sydney               |
+| New Zealand (NZ)                    | NZD      | Pacific/Auckland               |
+| United Arab Emirates (AE)           | AED      | Asia/Dubai                     |
+| Saudi Arabia (SA)                   | SAR      | Asia/Riyadh                    |
+| South Africa (ZA)                   | ZAR      | Africa/Johannesburg            |
+| Morocco (MA)                        | MAD      | Africa/Casablanca              |
+| Kenya (KE)                          | KES      | Africa/Nairobi                 |
+| Nigeria (NG)                        | NGN      | Africa/Lagos                   |
+| Brazil (BR)                         | BRL      | America/Sao_Paulo              |
+| Mexico (MX)                         | MXN      | America/Mexico_City            |
+| Chile (CL)                          | CLP      | America/Santiago               |
+| Uruguay (UY)                        | UYU      | America/Montevideo             |
+| Paraguay (PY)                       | PYG      | America/Asuncion               |
+| Japan (JP)                          | JPY      | Asia/Tokyo                     |
+| South Korea (KR)                    | KRW      | Asia/Seoul                     |
+| China (CN)                          | CNY      | Asia/Shanghai                  |
+| Hong Kong SAR China (HK)            | HKD      | Asia/Hong_Kong                 |
+| Taiwan (TW)                         | TWD      | Asia/Taipei                    |
+| Pakistan (PK)                       | PKR      | Asia/Karachi                   |
+| Bangladesh (BD)                     | BDT      | Asia/Dhaka                     |
+| Sri Lanka (LK)                      | LKR      | Asia/Colombo                   |
+| Nepal (NP)                          | NPR      | Asia/Kathmandu                 |
+| Egypt (EG)                          | EGP      | Africa/Cairo                   |
+| Israel (IL)                         | ILS      | Asia/Jerusalem                 |
+| Türkiye (TR)                        | TRY      | Europe/Istanbul                |
+| Iran (IR)                           | IRR      | Asia/Tehran                    |
+| Germany (DE)                        | EUR      | Europe/Berlin                  |
+| France (FR)                         | EUR      | Europe/Paris                   |
+| Italy (IT)                          | EUR      | Europe/Rome                    |
+| Spain (ES)                          | EUR      | Europe/Madrid                  |
+| Portugal (PT)                       | EUR      | Europe/Lisbon                  |
+| Netherlands (NL)                    | EUR      | Europe/Amsterdam               |
+| Belgium (BE)                        | EUR      | Europe/Brussels                |
+| Ireland (IE)                        | EUR      | Europe/Dublin                  |
+| Austria (AT)                        | EUR      | Europe/Vienna                  |
+| Greece (GR)                         | EUR      | Europe/Athens                  |
+| Finland (FI)                        | EUR      | Europe/Helsinki                |
+| Luxembourg (LU)                     | EUR      | Europe/Luxembourg              |
+| Malta (MT)                          | EUR      | Europe/Malta                   |
+| Cyprus (CY)                         | EUR      | Asia/Nicosia                   |
+| Slovakia (SK)                       | EUR      | Europe/Bratislava              |
+| Slovenia (SI)                       | EUR      | Europe/Ljubljana               |
+| Estonia (EE)                        | EUR      | Europe/Tallinn                 |
+| Latvia (LV)                         | EUR      | Europe/Riga                    |
+| Lithuania (LT)                      | EUR      | Europe/Vilnius                 |
+| Croatia (HR)                        | EUR      | Europe/Zagreb                  |
+| Andorra (AD)                        | EUR      | Europe/Andorra                 |
+| Åland Islands (AX)                  | EUR      | Europe/Mariehamn               |
+| Monaco (MC)                         | EUR      | Europe/Monaco                  |
+| Montenegro (ME)                     | EUR      | Europe/Podgorica               |
+| San Marino (SM)                     | EUR      | Europe/San_Marino              |
+| Vatican City (VA)                   | EUR      | Europe/Vatican                 |
+| Kosovo (XK)                         | EUR      | Europe/Belgrade                |
+| Switzerland (CH)                    | CHF      | Europe/Zurich                  |
+| Sweden (SE)                         | SEK      | Europe/Stockholm               |
+| Norway (NO)                         | NOK      | Europe/Oslo                    |
+| Denmark (DK)                        | DKK      | Europe/Copenhagen              |
+| Poland (PL)                         | PLN      | Europe/Warsaw                  |
+| Czechia (CZ)                        | CZK      | Europe/Prague                  |
+| Hungary (HU)                        | HUF      | Europe/Budapest                |
+| Romania (RO)                        | RON      | Europe/Bucharest               |
+| Bulgaria (BG)                       | BGN      | Europe/Sofia                   |
+| Iceland (IS)                        | ISK      | Atlantic/Reykjavik             |
+| Serbia (RS)                         | RSD      | Europe/Belgrade                |
+| Ukraine (UA)                        | UAH      | Europe/Kyiv                    |
+| Albania (AL)                        | ALL      | Europe/Tirane                  |
+| North Macedonia (MK)                | MKD      | Europe/Skopje                  |
+| Bosnia & Herzegovina (BA)           | BAM      | Europe/Sarajevo                |
+| Moldova (MD)                        | MDL      | Europe/Chisinau                |
+| Georgia (GE)                        | GEL      | Asia/Tbilisi                   |
+| Armenia (AM)                        | AMD      | Asia/Yerevan                   |
+| Azerbaijan (AZ)                     | AZN      | Asia/Baku                      |
+| Belarus (BY)                        | BYN      | Europe/Minsk                   |
+| Faroe Islands (FO)                  | DKK      | Atlantic/Faroe                 |
+| Guernsey (GG)                       | GBP      | Europe/Guernsey                |
+| Gibraltar (GI)                      | GIP      | Europe/Gibraltar               |
+| Isle of Man (IM)                    | GBP      | Europe/Isle_of_Man             |
+| Jersey (JE)                         | GBP      | Europe/Jersey                  |
+| Liechtenstein (LI)                  | CHF      | Europe/Vaduz                   |
+| Russia (RU)                         | RUB      | Europe/Moscow                  |
+| Svalbard & Jan Mayen (SJ)           | NOK      | Arctic/Longyearbyen            |
+| Qatar (QA)                          | QAR      | Asia/Qatar                     |
+| Kuwait (KW)                         | KWD      | Asia/Kuwait                    |
+| Bahrain (BH)                        | BHD      | Asia/Bahrain                   |
+| Oman (OM)                           | OMR      | Asia/Muscat                    |
+| Jordan (JO)                         | JOD      | Asia/Amman                     |
+| Lebanon (LB)                        | LBP      | Asia/Beirut                    |
+| Syria (SY)                          | SYP      | Asia/Damascus                  |
+| Iraq (IQ)                           | IQD      | Asia/Baghdad                   |
+| Yemen (YE)                          | YER      | Asia/Aden                      |
+| Palestinian Territories (PS)        | ILS      | Asia/Hebron                    |
+| Ghana (GH)                          | GHS      | Africa/Accra                   |
+| Tanzania (TZ)                       | TZS      | Africa/Dar_es_Salaam           |
+| Uganda (UG)                         | UGX      | Africa/Kampala                 |
+| Ethiopia (ET)                       | ETB      | Africa/Addis_Ababa             |
+| Rwanda (RW)                         | RWF      | Africa/Kigali                  |
+| Côte d’Ivoire (CI)                  | XOF      | Africa/Abidjan                 |
+| Senegal (SN)                        | XOF      | Africa/Dakar                   |
+| Cameroon (CM)                       | XAF      | Africa/Douala                  |
+| Zambia (ZM)                         | ZMW      | Africa/Lusaka                  |
+| Mauritius (MU)                      | MUR      | Indian/Mauritius               |
+| Tunisia (TN)                        | TND      | Africa/Tunis                   |
+| Algeria (DZ)                        | DZD      | Africa/Algiers                 |
+| Botswana (BW)                       | BWP      | Africa/Gaborone                |
+| Namibia (NA)                        | NAD      | Africa/Windhoek                |
+| Mozambique (MZ)                     | MZN      | Africa/Maputo                  |
+| Angola (AO)                         | AOA      | Africa/Luanda                  |
+| Ascension Island (AC)               | SHP      | Atlantic/St_Helena             |
+| Burkina Faso (BF)                   | XOF      | Africa/Ouagadougou             |
+| Burundi (BI)                        | BIF      | Africa/Bujumbura               |
+| Benin (BJ)                          | XOF      | Africa/Porto-Novo              |
+| Congo - Kinshasa (CD)               | CDF      | Africa/Kinshasa                |
+| Central African Republic (CF)       | XAF      | Africa/Bangui                  |
+| Congo - Brazzaville (CG)            | XAF      | Africa/Brazzaville             |
+| Cape Verde (CV)                     | CVE      | Atlantic/Cape_Verde            |
+| Djibouti (DJ)                       | DJF      | Africa/Djibouti                |
+| Western Sahara (EH)                 | MAD      | Africa/El_Aaiun                |
+| Eritrea (ER)                        | ERN      | Africa/Asmara                  |
+| Gabon (GA)                          | XAF      | Africa/Libreville              |
+| Gambia (GM)                         | GMD      | Africa/Banjul                  |
+| Guinea (GN)                         | GNF      | Africa/Conakry                 |
+| Equatorial Guinea (GQ)              | XAF      | Africa/Malabo                  |
+| Guinea-Bissau (GW)                  | XOF      | Africa/Bissau                  |
+| Comoros (KM)                        | KMF      | Indian/Comoro                  |
+| Liberia (LR)                        | LRD      | Africa/Monrovia                |
+| Lesotho (LS)                        | LSL      | Africa/Maseru                  |
+| Libya (LY)                          | LYD      | Africa/Tripoli                 |
+| Madagascar (MG)                     | MGA      | Indian/Antananarivo            |
+| Mali (ML)                           | XOF      | Africa/Bamako                  |
+| Mauritania (MR)                     | MRU      | Africa/Nouakchott              |
+| Malawi (MW)                         | MWK      | Africa/Blantyre                |
+| Niger (NE)                          | XOF      | Africa/Niamey                  |
+| Réunion (RE)                        | EUR      | Indian/Reunion                 |
+| Seychelles (SC)                     | SCR      | Indian/Mahe                    |
+| Sudan (SD)                          | SDG      | Africa/Khartoum                |
+| St. Helena (SH)                     | SHP      | Atlantic/St_Helena             |
+| Sierra Leone (SL)                   | SLE      | Africa/Freetown                |
+| Somalia (SO)                        | SOS      | Africa/Mogadishu               |
+| South Sudan (SS)                    | SSP      | Africa/Juba                    |
+| São Tomé & Príncipe (ST)            | STN      | Africa/Sao_Tome                |
+| Eswatini (SZ)                       | SZL      | Africa/Mbabane                 |
+| Tristan da Cunha (TA)               | GBP      | Atlantic/St_Helena             |
+| Chad (TD)                           | XAF      | Africa/Ndjamena                |
+| Togo (TG)                           | XOF      | Africa/Lome                    |
+| Mayotte (YT)                        | EUR      | Indian/Mayotte                 |
+| Zimbabwe (ZW)                       | USD      | Africa/Harare                  |
+| Kazakhstan (KZ)                     | KZT      | Asia/Almaty                    |
+| Uzbekistan (UZ)                     | UZS      | Asia/Tashkent                  |
+| Mongolia (MN)                       | MNT      | Asia/Ulaanbaatar               |
+| Myanmar (Burma) (MM)                | MMK      | Asia/Yangon                    |
+| Cambodia (KH)                       | KHR      | Asia/Phnom_Penh                |
+| Laos (LA)                           | LAK      | Asia/Vientiane                 |
+| Brunei (BN)                         | BND      | Asia/Brunei                    |
+| Macao SAR China (MO)                | MOP      | Asia/Macau                     |
+| Maldives (MV)                       | MVR      | Indian/Maldives                |
+| Bhutan (BT)                         | BTN      | Asia/Thimphu                   |
+| Afghanistan (AF)                    | AFN      | Asia/Kabul                     |
+| Cocos (Keeling) Islands (CC)        | AUD      | Indian/Cocos                   |
+| Christmas Island (CX)               | AUD      | Indian/Christmas               |
+| British Indian Ocean Territory (IO) | USD      | Indian/Chagos                  |
+| Kyrgyzstan (KG)                     | KGS      | Asia/Bishkek                   |
+| North Korea (KP)                    | KPW      | Asia/Pyongyang                 |
+| Tajikistan (TJ)                     | TJS      | Asia/Dushanbe                  |
+| Timor-Leste (TL)                    | USD      | Asia/Dili                      |
+| Turkmenistan (TM)                   | TMT      | Asia/Ashgabat                  |
+| Guatemala (GT)                      | GTQ      | America/Guatemala              |
+| Costa Rica (CR)                     | CRC      | America/Costa_Rica             |
+| Panama (PA)                         | PAB      | America/Panama                 |
+| Dominican Republic (DO)             | DOP      | America/Santo_Domingo          |
+| Honduras (HN)                       | HNL      | America/Tegucigalpa            |
+| El Salvador (SV)                    | USD      | America/El_Salvador            |
+| Nicaragua (NI)                      | NIO      | America/Managua                |
+| Belize (BZ)                         | BZD      | America/Belize                 |
+| Jamaica (JM)                        | JMD      | America/Jamaica                |
+| Trinidad & Tobago (TT)              | TTD      | America/Port_of_Spain          |
+| Bahamas (BS)                        | BSD      | America/Nassau                 |
+| Barbados (BB)                       | BBD      | America/Barbados               |
+| Haiti (HT)                          | HTG      | America/Port-au-Prince         |
+| Bolivia (BO)                        | BOB      | America/La_Paz                 |
+| Ecuador (EC)                        | USD      | America/Guayaquil              |
+| Colombia (CO)                       | COP      | America/Bogota                 |
+| Peru (PE)                           | PEN      | America/Lima                   |
+| Venezuela (VE)                      | VES      | America/Caracas                |
+| Antigua & Barbuda (AG)              | XCD      | America/Antigua                |
+| Anguilla (AI)                       | XCD      | America/Anguilla               |
+| Aruba (AW)                          | AWG      | America/Aruba                  |
+| St. Barthélemy (BL)                 | EUR      | America/St_Barthelemy          |
+| Bermuda (BM)                        | BMD      | Atlantic/Bermuda               |
+| Caribbean Netherlands (BQ)          | USD      | America/Kralendijk             |
+| Cuba (CU)                           | CUP      | America/Havana                 |
+| Curaçao (CW)                        | XCG      | America/Curacao                |
+| Dominica (DM)                       | XCD      | America/Dominica               |
+| Falkland Islands (FK)               | FKP      | Atlantic/Stanley               |
+| Grenada (GD)                        | XCD      | America/Grenada                |
+| French Guiana (GF)                  | EUR      | America/Cayenne                |
+| Greenland (GL)                      | DKK      | America/Nuuk                   |
+| Guadeloupe (GP)                     | EUR      | America/Guadeloupe             |
+| Guyana (GY)                         | GYD      | America/Guyana                 |
+| St. Kitts & Nevis (KN)              | XCD      | America/St_Kitts               |
+| Cayman Islands (KY)                 | KYD      | America/Cayman                 |
+| St. Lucia (LC)                      | XCD      | America/St_Lucia               |
+| St. Martin (MF)                     | EUR      | America/Marigot                |
+| Martinique (MQ)                     | EUR      | America/Martinique             |
+| Montserrat (MS)                     | XCD      | America/Montserrat             |
+| St. Pierre & Miquelon (PM)          | EUR      | America/Miquelon               |
+| Puerto Rico (PR)                    | USD      | America/Puerto_Rico            |
+| Suriname (SR)                       | SRD      | America/Paramaribo             |
+| Sint Maarten (SX)                   | XCG      | America/Lower_Princes          |
+| Turks & Caicos Islands (TC)         | USD      | America/Grand_Turk             |
+| St. Vincent & Grenadines (VC)       | XCD      | America/St_Vincent             |
+| British Virgin Islands (VG)         | USD      | America/Tortola                |
+| U.S. Virgin Islands (VI)            | USD      | America/St_Thomas              |
+| Fiji (FJ)                           | FJD      | Pacific/Fiji                   |
+| Papua New Guinea (PG)               | PGK      | Pacific/Port_Moresby           |
+| American Samoa (AS)                 | USD      | Pacific/Pago_Pago              |
+| Cook Islands (CK)                   | NZD      | Pacific/Rarotonga              |
+| Micronesia (FM)                     | USD      | Pacific/Pohnpei                |
+| Guam (GU)                           | USD      | Pacific/Guam                   |
+| Kiribati (KI)                       | AUD      | Pacific/Tarawa                 |
+| Marshall Islands (MH)               | USD      | Pacific/Majuro                 |
+| Northern Mariana Islands (MP)       | USD      | Pacific/Saipan                 |
+| New Caledonia (NC)                  | XPF      | Pacific/Noumea                 |
+| Norfolk Island (NF)                 | AUD      | Pacific/Norfolk                |
+| Nauru (NR)                          | AUD      | Pacific/Nauru                  |
+| Niue (NU)                           | NZD      | Pacific/Niue                   |
+| French Polynesia (PF)               | XPF      | Pacific/Tahiti                 |
+| Palau (PW)                          | USD      | Pacific/Palau                  |
+| Solomon Islands (SB)                | SBD      | Pacific/Guadalcanal            |
+| Tokelau (TK)                        | NZD      | Pacific/Fakaofo                |
+| Tonga (TO)                          | TOP      | Pacific/Tongatapu              |
+| Tuvalu (TV)                         | AUD      | Pacific/Funafuti               |
+| Vanuatu (VU)                        | VUV      | Pacific/Efate                  |
+| Wallis & Futuna (WF)                | XPF      | Pacific/Wallis                 |
+| Samoa (WS)                          | WST      | Pacific/Apia                   |
 
 </details>
 
@@ -232,7 +477,7 @@ FactorPOS includes a generic calculation engine and supports signed, versioned c
 
 > **Notice:** FactorPOS is software, not legal or tax advice. Tax packs and configuration tools do not by themselves certify compliance with local regulations. Operators remain responsible for verifying the requirements that apply to their business.
 
-For pack authoring, validation, and schema details, see the [Tax packs developer guide](docs/tax-packs.md).
+For pack authoring, validation, and schema details, see the [Tax packs developer guide](docs/reference/tax-packs.md).
 
 ## Development
 
@@ -246,6 +491,10 @@ npm run dev
 ```
 
 `npm run dev` builds the frontend and backend, then launches Electron.
+
+Contributors and coding agents can optionally use the repository's
+[local indexed code-search workflow](docs/guides/code-search.md) to retrieve focused passages from
+unfamiliar subsystems without loading large files into an agent context.
 
 ### Architecture
 
@@ -276,7 +525,7 @@ If FactorPOS is useful to you, consider starring the repository.
 - **Documentation index:** [docs/README.md](docs/README.md)
 - **Printer guide & troubleshooting:** [docs/printers.md](docs/printers.md)
 - **Linux setup & support:** [docs/linux.md](docs/linux.md)
-- **Internationalization & translations:** [docs/i18n.md](docs/i18n.md)
+- **Internationalization & translations:** [docs/architecture/internationalization.md](docs/architecture/internationalization.md)
 - **Google Drive backup setup:** [docs/google-drive-setup.md](docs/google-drive-setup.md)
 - **Bug reports & feature proposals:** [GitHub Issues](https://github.com/nihalmuhammad/factorpos/issues)
 - **General questions & ideas:** [GitHub Discussions](https://github.com/nihalmuhammad/factorpos/discussions)

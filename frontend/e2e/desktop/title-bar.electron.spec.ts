@@ -61,7 +61,9 @@ test('real preload, renderer, and main boundaries reach an authenticated dashboa
   expect(runtime.titleBarMode).toBe('native-overlay');
   expect(runtime.titleBarEpoch).toBeGreaterThan(0);
   expect(runtime.titleBarDocumentNonce).toMatch(/^[0-9a-f-]{36}$/i);
-  expect(runtime.focusedAttribute).toBe('true');
+  if (!harness.hiddenWindow) {
+    expect(runtime.focusedAttribute).toBe('true');
+  }
   expect(runtime.desktopAttribute).toBe('true');
   expect(runtime.appInfo).toMatchObject({ name: 'factorpos', platform: process.platform });
   expect(runtime.updateStatus.status).toBeTruthy();
@@ -70,22 +72,41 @@ test('real preload, renderer, and main boundaries reach an authenticated dashboa
 });
 
 test('POS topbar fullscreen toggle stays synchronized with native window state', async () => {
-  test.skip(process.platform === 'linux', 'Linux CI uses Xvfb without a window manager, so native maximize state is not observable');
+  test.skip(
+    process.platform === 'linux',
+    'Linux CI uses Xvfb without a window manager, so native maximize state is not observable',
+  );
+  // Maximizing a hidden window surfaces it, so this native-state test only
+  // runs in the opt-in visible-window mode.
+  test.skip(harness.hiddenWindow, 'Run with FLO_E2E_SHOW_WINDOW=1 for native maximize coverage');
   await harness.authenticateDashboard();
 
-  const readNativeWindowState = async () => harness.app.evaluate(({ BrowserWindow }) => {
-    const window = BrowserWindow.getAllWindows().find((candidate: { webContents: { getURL: () => string } }) => {
-      try { return new URL(candidate.webContents.getURL()).pathname.replace(/\/+$/, '') === '/pos'; } catch { return false; }
+  const readNativeWindowState = async () =>
+    harness.app.evaluate(({ BrowserWindow }) => {
+      const window = BrowserWindow.getAllWindows().find(
+        (candidate: { webContents: { getURL: () => string } }) => {
+          try {
+            return new URL(candidate.webContents.getURL()).pathname.replace(/\/+$/, '') === '/pos';
+          } catch {
+            return false;
+          }
+        },
+      );
+      if (!window) return null;
+      return { isMaximized: window.isMaximized(), isFullScreen: window.isFullScreen() };
     });
-    if (!window) return null;
-    return { isMaximized: window.isMaximized(), isFullScreen: window.isFullScreen() };
-  });
   const topbarToggle = harness.page.getByRole('button', { name: /full-screen POS/i });
 
   await harness.app.evaluate(({ BrowserWindow }) => {
-    const window = BrowserWindow.getAllWindows().find((candidate: { webContents: { getURL: () => string } }) => {
-      try { return new URL(candidate.webContents.getURL()).pathname.replace(/\/+$/, '') === '/pos'; } catch { return false; }
-    });
+    const window = BrowserWindow.getAllWindows().find(
+      (candidate: { webContents: { getURL: () => string } }) => {
+        try {
+          return new URL(candidate.webContents.getURL()).pathname.replace(/\/+$/, '') === '/pos';
+        } catch {
+          return false;
+        }
+      },
+    );
     if (!window) throw new Error('POS BrowserWindow not found');
     if (window.isFullScreen()) window.setFullScreen(false);
     if (window.isMaximized()) window.unmaximize();
@@ -100,7 +121,9 @@ test('POS topbar fullscreen toggle stays synchronized with native window state',
   }
 
   await topbarToggle.click();
-  await expect.poll(readNativeWindowState).toMatchObject({ isMaximized: true, isFullScreen: false });
+  await expect
+    .poll(readNativeWindowState)
+    .toMatchObject({ isMaximized: true, isFullScreen: false });
   await expect(topbarToggle).toHaveAttribute('aria-label', 'Exit full-screen POS');
   if (process.env.FLO_E2E_EVIDENCE_DIR) {
     await harness.page.screenshot({
@@ -109,23 +132,39 @@ test('POS topbar fullscreen toggle stays synchronized with native window state',
   }
 
   await harness.app.evaluate(({ BrowserWindow }) => {
-    const window = BrowserWindow.getAllWindows().find((candidate: { webContents: { getURL: () => string } }) => {
-      try { return new URL(candidate.webContents.getURL()).pathname.replace(/\/+$/, '') === '/pos'; } catch { return false; }
-    });
+    const window = BrowserWindow.getAllWindows().find(
+      (candidate: { webContents: { getURL: () => string } }) => {
+        try {
+          return new URL(candidate.webContents.getURL()).pathname.replace(/\/+$/, '') === '/pos';
+        } catch {
+          return false;
+        }
+      },
+    );
     if (!window) throw new Error('POS BrowserWindow not found');
     window.unmaximize();
   });
-  await expect.poll(readNativeWindowState).toMatchObject({ isMaximized: false, isFullScreen: false });
+  await expect
+    .poll(readNativeWindowState)
+    .toMatchObject({ isMaximized: false, isFullScreen: false });
   await expect(topbarToggle).toHaveAttribute('aria-label', 'Enter full-screen POS');
 
   await harness.app.evaluate(({ BrowserWindow }) => {
-    const window = BrowserWindow.getAllWindows().find((candidate: { webContents: { getURL: () => string } }) => {
-      try { return new URL(candidate.webContents.getURL()).pathname.replace(/\/+$/, '') === '/pos'; } catch { return false; }
-    });
+    const window = BrowserWindow.getAllWindows().find(
+      (candidate: { webContents: { getURL: () => string } }) => {
+        try {
+          return new URL(candidate.webContents.getURL()).pathname.replace(/\/+$/, '') === '/pos';
+        } catch {
+          return false;
+        }
+      },
+    );
     if (!window) throw new Error('POS BrowserWindow not found');
     window.setFullScreen(true);
   });
-  await expect.poll(readNativeWindowState).toMatchObject({ isMaximized: false, isFullScreen: true });
+  await expect
+    .poll(readNativeWindowState)
+    .toMatchObject({ isMaximized: false, isFullScreen: true });
   await expect(topbarToggle).toHaveAttribute('aria-label', 'Exit full-screen POS');
   if (process.env.FLO_E2E_EVIDENCE_DIR) {
     await harness.page.screenshot({
@@ -139,8 +178,18 @@ test('POS topbar fullscreen toggle stays synchronized with native window state',
 });
 
 test('native window lifecycle is observable through the Electron boundary', async () => {
-  test.skip(!['darwin', 'win32', 'linux'].includes(process.platform), 'FloCafe native window lifecycle is unsupported on this platform');
-  test.skip(process.platform === 'linux', 'Linux CI uses Xvfb without a window manager, so native minimize/restore is not observable');
+  test.skip(
+    !['darwin', 'win32', 'linux'].includes(process.platform),
+    'FloCafe native window lifecycle is unsupported on this platform',
+  );
+  test.skip(
+    process.platform === 'linux',
+    'Linux CI uses Xvfb without a window manager, so native minimize/restore is not observable',
+  );
+  test.skip(
+    harness.hiddenWindow,
+    'Run with FLO_E2E_SHOW_WINDOW=1 for native minimize/restore coverage',
+  );
   await harness.app.evaluate(({ app, BrowserWindow }) => {
     app.focus({ steal: true });
     const window = BrowserWindow.getAllWindows()[0];
@@ -154,6 +203,72 @@ test('native window lifecycle is observable through the Electron boundary', asyn
   await expect.poll(() => nativeWindow.evaluate((window) => !window.isMinimized())).toBe(true);
 });
 
+test('real main-process application menu is intact and the title-bar row mirrors it', async () => {
+  await harness.authenticateDashboard();
+
+  const menu = await harness.app.evaluate(({ app, Menu }) => {
+    const application = Menu.getApplicationMenu();
+    if (!application) return null;
+    return {
+      appName: app.getName(),
+      topLevel: application.items.map((item) => ({
+        label: item.label,
+        type: item.type,
+        hasSubmenu: Boolean(item.submenu),
+        submenuItems: item.submenu ? item.submenu.items.map((entry) => entry.label) : [],
+      })),
+    };
+  });
+
+  // The menu main builds is unchanged by the title-bar row: every top-level
+  // entry still carries the submenu the renderer pops, so roles, accelerators,
+  // and click handlers stay the native ones.
+  expect(menu).not.toBeNull();
+  const entries = menu!.topLevel;
+  const labels = entries.map((entry) => entry.label);
+  expect(entries.every((entry) => entry.hasSubmenu)).toBe(true);
+  expect(entries.find((entry) => entry.label === 'File')?.submenuItems).toContain('New Order');
+
+  // macOS prepends the app-name menu and a dev build appends Developer; the
+  // shared top-level surface must be identical on every platform.
+  expect(labels.filter((label) => label !== menu!.appName && label !== 'Developer')).toEqual([
+    'File',
+    'Edit',
+    'View',
+    'Orders',
+    'Reports',
+    'Settings',
+    'Window',
+    'Help',
+  ]);
+
+  const row = harness.page.getByTestId('desktop-application-menu');
+  if (process.platform === 'darwin') {
+    // macOS keeps its authoritative native top-level menu.
+    expect(labels[0]).toBe(menu!.appName);
+    await expect(row).toHaveCount(0);
+  } else {
+    await expect(row).toBeVisible();
+    const layoutMode = await row.getAttribute('data-layout-mode');
+    if (layoutMode === 'compact') {
+      await expect(row.getByTestId('desktop-application-menu-hamburger')).toBeVisible();
+    } else {
+      const visibleLabels = await row
+        .locator('button:not([data-testid="desktop-application-menu-overflow"])')
+        .allTextContents();
+      expect(visibleLabels).toEqual(labels.slice(0, visibleLabels.length));
+      if (layoutMode === 'overflow') {
+        await expect(row.getByTestId('desktop-application-menu-overflow')).toBeVisible();
+      } else {
+        expect(visibleLabels).toEqual(labels);
+      }
+    }
+  }
+});
+
 test('native shell geometry remains an explicit platform boundary', async () => {
-  test.skip(true, 'Traffic-light and caption-button geometry is OS-managed and is not observable through Playwright in this harness; platform unit/runtime probes own that evidence');
+  test.skip(
+    true,
+    'Traffic-light and caption-button geometry is OS-managed and is not observable through Playwright in this harness; platform unit/runtime probes own that evidence',
+  );
 });

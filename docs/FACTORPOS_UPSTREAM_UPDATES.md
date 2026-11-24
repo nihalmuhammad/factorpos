@@ -73,13 +73,16 @@ How to resolve the usual conflicts:
 |---|---|
 | `package.json` | FloCafe's dependencies and scripts; FactorPOS `name`, `productName`, `build.appId`, `build.publish`, artifact names and the `test:factorpos-customizations` step at the start of `test`. Version: see below. |
 | `package-lock.json` | Don't edit by hand: take FloCafe's, then run `npm install` to regenerate it. |
-| `frontend/src/lib/i18n/messages/*.json` | FloCafe's new keys; FactorPOS's branded strings (FactorPOS, not FloCafe/FloPOS). |
+| `frontend/src/lib/i18n/messages/*.json` | FloCafe's new keys; FactorPOS's branded strings (FactorPOS, not FloCafe/Flo Cafe/FloPOS, in every locale; FloAdmin, RevFlo and the Flo cloud keep their names). |
 | `frontend/src/lib/i18n/languages.ts` | FloCafe's new language entries, with `selectable: false`. |
 | `main/index.ts`, `main/updater-shutdown.ts` | FloCafe's changes plus the FactorPOS app name, data folder and `backupBeforeInstall`. |
-| `main/printers/document-compact.ts`, `shared/print/document.ts` | The FactorPOS order-note layout and token; take FloCafe's fixes around them. |
+| `main/printers/document-compact.ts`, `shared/print/document.ts`, `frontend/src/lib/printer/web-print.ts`, `frontend/src/lib/printer/receipt-encoder.ts` | The FactorPOS order-note layout and token; take FloCafe's fixes around them. |
 | `main/routes/settings.ts`, `main/routes/auth.ts`, `main/countries.ts` | Saudi defaults and Western digits. |
+| `main/services/google-drive.ts` | `DRIVE_BACKUP_FOLDER_NAME = 'FactorPOS Backups'`: shop backups already live in that Drive folder. |
+| `main/routes/orders.ts` | The `token_number` column and `generateTokenNumber()` in order creation. |
+| `main/db.ts` `MIGRATIONS` | FloCafe's numbered list exactly as upstream has it. FactorPOS schema changes live only in `FACTORPOS_MIGRATIONS` (tracked by id); never add or renumber a numbered migration for FactorPOS. |
 | `AGENTS.md`, `CLAUDE.md`, `frontend/AGENTS.md` | Keep them deleted (local files, not tracked in FactorPOS): `git rm` them. |
-| `.github/workflows/nightly-release.yml` | The FactorPOS manual-only trigger. |
+| `.github/workflows/full-cross-platform-matrix.yml` | The FactorPOS manual-only trigger. |
 
 Then:
 
@@ -102,3 +105,13 @@ FloCafe, set `package.json` to the higher of FloCafe's version and the last
 FactorPOS release, then bump it when you tag the next release (for example
 FloCafe 3.13.23 merged → release `v3.13.24-beta.1`, then `v3.13.24`). If
 FloCafe later publishes the same number, use the next one.
+
+## CI formatting check on FloCafe merges
+
+CI checks the formatting of every JS/TS file a pull request changes. FloCafe has
+older files that are not formatted, and a FloCafe merge touches them, so FactorPOS
+changed `scripts/ci/check-changed-format.cjs` to skip a file that is byte-for-byte
+FloCafe's version at a FloCafe merge in the pull request. FactorPOS's own edits are
+still checked. Keep "merge FloCafe" in the merge commit subject (the sync workflow and
+`Merge FloCafe X.Y.Z into FactorPOS` both do); otherwise the merge is not recognised.
+Do not reformat FloCafe's files: every later FloCafe change to them would conflict.

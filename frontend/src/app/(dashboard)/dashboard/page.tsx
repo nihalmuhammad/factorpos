@@ -1,26 +1,65 @@
 'use client';
 
-import { useState, useEffect, useRef } from 'react';
-import { useRouter } from 'next/navigation';
+import { useState, useEffect } from 'react';
+import type { ReactNode } from 'react';
+import { useRouter, useSearchParams } from 'next/navigation';
 import Link from 'next/link';
 import { useAuthStore } from '@/store/auth';
 import api from '@/lib/api';
-import { Banknote, ChefHat, Clock, LayoutGrid, TrendingUp, ClipboardList, ArrowRight, Timer, Trophy, Tags, BarChart3, Wallet, RotateCcw, ReceiptText, Hourglass, CalendarDays, Lock } from 'lucide-react';
+import {
+  ArrowDownRight,
+  ArrowRight,
+  ArrowUpRight,
+  Banknote,
+  BarChart3,
+  ChefHat,
+  ChevronDown,
+  ClipboardList,
+  Clock,
+  Download,
+  FileSpreadsheet,
+  FileText,
+  Hourglass,
+  LayoutGrid,
+  Lock,
+  MessageCircle,
+  Minus,
+  ReceiptText,
+  RotateCcw,
+  Tags,
+  Timer,
+  TrendingUp,
+  Trophy,
+  Wallet,
+  type LucideIcon,
+} from 'lucide-react';
 import { useTranslations, useLocale, type AppConfig } from 'use-intl';
 import { Ltr } from '@/components/layout/Ltr';
 import { CashCloseModal } from '@/components/dashboard/CashCloseModal';
-import { CashDrawerMovementModal } from '@/components/dashboard/CashDrawerMovementModal';
 import { useCashClose } from '@/hooks/useCashClose';
-import { useCashDrawerMovements } from '@/hooks/useCashDrawerMovements';
 import toast from 'react-hot-toast';
 import { useFormatCurrency } from '@/hooks/useFormatCurrency';
 import { useFormatDate } from '@/hooks/useFormatDate';
+import { PriceExceptionsCard } from '@/components/dashboard/PriceExceptionsCard';
 import { Button } from '@/components/ui/button';
+import { DatePickerInput } from '@/components/ui/date-picker-input';
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu';
 import { PAYMENT_METHODS } from '@/lib/payment-methods';
 import { ORDER_STATUS_LABEL_KEYS } from '@/lib/i18n-enums';
 import { splitHoursMinutes } from '@/lib/table-timing';
-import { ROLE_ACCESS, hasRole } from '@shared/role-permissions';
-
+import { tenantCan } from '@/lib/permissions';
+import { businessDateForInstant } from '@shared/business-date';
+import { downloadBlob } from '@/lib/download';
+import { exportReportAsPdf, MenuPopupBlockedError } from '@/lib/export-pdf';
+import { SendWhatsAppReportModal } from '@/components/dashboard/SendWhatsAppReportModal';
+import { shareDailySalesViaWhatsApp } from '@/lib/whatsapp-share';
 
 interface PaymentMethodBreakdown {
   method: string | null;
@@ -57,6 +96,18 @@ interface RefundActivity {
   approved_by_name: string;
 }
 
+interface PeriodProfitability {
+  total_quantity: number;
+  net_revenue: number;
+  known_cost_revenue: number;
+  known_cost_quantity: number;
+  unknown_cost_quantity: number;
+  cost_status: 'known' | 'partial' | 'unknown';
+  ingredient_cost: number | null;
+  profit: number | null;
+  margin_percent: number | null;
+}
+
 interface FinancialSummary {
   startDate: string;
   endDate: string;
@@ -68,14 +119,23 @@ interface FinancialSummary {
   averageOrderValue: number;
   paymentMethods: PaymentMethodBreakdown[];
   refunds: RefundActivity[];
+  profitability?: PeriodProfitability;
 }
 
 interface TopProduct {
-  product_id: number;
+  product_id: number | string;
   product_name: string;
   total_quantity: number;
   total_revenue: number;
   order_count: number;
+  net_revenue?: number;
+  known_cost_revenue?: number;
+  known_cost_quantity?: number;
+  unknown_cost_quantity?: number;
+  cost_status?: 'known' | 'partial' | 'unknown';
+  ingredient_cost?: number | null;
+  profit?: number | null;
+  margin_percent?: number | null;
 }
 
 interface RecentOrder {
@@ -114,7 +174,6 @@ interface DayBucket {
   orderCount: number;
 }
 
-
 interface Insights {
   windowDays: number;
   aov: number;
@@ -127,17 +186,40 @@ interface Insights {
   idlestDayOfWeek: DayBucket | null;
 }
 
-/** Today's date as YYYY-MM-DD in a given IANA timezone (not UTC — avoids an
- *  off-by-one-day default near midnight relative to the tenant's locale). */
-function getLocalDateString(date: Date, timeZone: string): string {
-  // en-CA formats as YYYY-MM-DD by convention — a convenient built-in shortcut.
-  return new Intl.DateTimeFormat('en-CA', { timeZone, year: 'numeric', month: '2-digit', day: '2-digit' }).format(date);
+interface WeeklyComparison {
+  sales: number;
+  averageOrderValue: number;
+}
+
+interface DashboardTile {
+  label: string;
+  value: string | number;
+  icon: LucideIcon;
+  color: string;
+  iconBg: string;
+  href: string;
+  comparison?: ReactNode;
+  meta?: string;
+}
+
+interface DashboardMetric {
+  label: string;
+  value: string;
+  icon: LucideIcon;
+  iconBg: string;
+  comparison?: ReactNode;
 }
 
 function getMonthRange(month: string): { startDate: string; endDate: string } {
   const [year, monthNumber] = month.split('-').map(Number);
   const lastDay = new Date(Date.UTC(year, monthNumber, 0)).getUTCDate();
   return { startDate: `${month}-01`, endDate: `${month}-${String(lastDay).padStart(2, '0')}` };
+}
+
+function shiftDate(date: string, days: number): string {
+  const value = new Date(`${date}T00:00:00Z`);
+  value.setUTCDate(value.getUTCDate() + days);
+  return value.toISOString().slice(0, 10);
 }
 
 /** Formats a 0-23 local hour index as a locale-appropriate time label (e.g. "2 PM"). */
@@ -172,11 +254,16 @@ const BUILT_IN_PAYMENT_KEYS = {
 } as const satisfies Record<'cash' | 'card', PosKey>;
 
 export default function DashboardPage() {
+  const searchParams = useSearchParams();
   const { currentTenant } = useAuthStore();
   const t = useTranslations('dashboard');
   const tCommon = useTranslations('common');
   const tPos = useTranslations('pos');
   const tOrders = useTranslations('orders');
+  const tProducts = useTranslations('products');
+  const tSettings = useTranslations('settings');
+  const tWhatsAppConnection = useTranslations('whatsapp.connection');
+  const tWhatsAppSend = useTranslations('whatsapp.send');
   const router = useRouter();
   const [stats, setStats] = useState<DailyStats | null>(null);
   const [daySummary, setDaySummary] = useState<DaySummary | null>(null);
@@ -184,33 +271,70 @@ export default function DashboardPage() {
   const [topProducts, setTopProducts] = useState<TopProduct[]>([]);
   const [recentOrders, setRecentOrders] = useState<RecentOrder[]>([]);
   const [insights, setInsights] = useState<Insights | null>(null);
+  const [weeklyComparison, setWeeklyComparison] = useState<WeeklyComparison | null>(null);
   const [loading, setLoading] = useState(true);
+  const [isExporting, setIsExporting] = useState(false);
+  const [dailySalesWhatsAppOpen, setDailySalesWhatsAppOpen] = useState(false);
 
-  const isOwner = hasRole(currentTenant?.role, ROLE_ACCESS.owner);
+  const isOwner = tenantCan(currentTenant, 'dashboard.view');
+  const canViewFinancials = tenantCan(currentTenant, 'reports.financial.view');
+  const canSendDailySalesWhatsApp =
+    tenantCan(currentTenant, 'reports.view') &&
+    tenantCan(currentTenant, 'reports.daily-sales.export') &&
+    tenantCan(currentTenant, 'whatsapp.use');
+  const canViewSettings = tenantCan(currentTenant, 'settings.view');
   const fmt = useFormatCurrency();
+  // Financial figures require `reports.financial.view`, independently of `dashboard.view`;
+  // mask them instead of showing a misleading zero when that permission isn't granted.
+  const fmtFinancial = (value: number): string => (canViewFinancials ? fmt(value) : '—');
+  const numFinancial = (value: number): string | number => (canViewFinancials ? value : '—');
   const { formatDateTime } = useFormatDate();
   const locale = useLocale();
   const timeZone = currentTenant?.timezone || Intl.DateTimeFormat().resolvedOptions().timeZone;
-  const todayLocal = getLocalDateString(new Date(), timeZone);
+  // The store's business day starts at its configured time, not at midnight, so
+  // the day picker and its upper bound follow the same rule the cash-close modal
+  // and the drawer movements use instead of the plain tenant-local date.
+  const todayLocal = businessDateForInstant({
+    instant: new Date(),
+    timezone: timeZone,
+    startTime: currentTenant?.business_day_start_time || '00:00',
+  });
   const [selectedDate, setSelectedDate] = useState(todayLocal);
   const [selectedMonth, setSelectedMonth] = useState(todayLocal.slice(0, 7));
-  const [periodMode, setPeriodMode] = useState<'day' | 'month'>('day');
-  const dayInputRef = useRef<HTMLInputElement>(null);
-  const monthInputRef = useRef<HTMLInputElement>(null);
+  const [rangeStartDate, setRangeStartDate] = useState(() => shiftDate(todayLocal, -6));
+  const [rangeEndDate, setRangeEndDate] = useState(todayLocal);
+  const [periodMode, setPeriodMode] = useState<'day' | 'month' | 'range'>('day');
   const isToday = periodMode === 'day' && selectedDate === todayLocal;
-  const range = periodMode === 'month'
-    ? getMonthRange(selectedMonth)
-    : { startDate: selectedDate, endDate: selectedDate };
+  const range =
+    periodMode === 'month'
+      ? getMonthRange(selectedMonth)
+      : periodMode === 'range'
+        ? { startDate: rangeStartDate, endDate: rangeEndDate }
+        : { startDate: selectedDate, endDate: selectedDate };
 
-  /** Opens Chromium's native calendar UI while preserving keyboard fallback. */
-  const openPicker = (input: HTMLInputElement | null) => {
-    if (!input) return;
-    try {
-      input.showPicker();
-    } catch {
-      // Older embedded Chromium builds may not expose showPicker. Focusing the
-      // native input still leaves keyboard date entry available.
-      input.focus();
+  const handleRangeStartChange = (nextFrom: string) => {
+    if (!nextFrom) return;
+    setRangeStartDate(nextFrom);
+    if (nextFrom > rangeEndDate) {
+      setRangeEndDate(nextFrom);
+    } else {
+      const maxEnd = shiftDate(nextFrom, 92);
+      if (rangeEndDate > maxEnd) {
+        setRangeEndDate(maxEnd > todayLocal ? todayLocal : maxEnd);
+      }
+    }
+  };
+
+  const handleRangeEndChange = (nextTo: string) => {
+    if (!nextTo) return;
+    setRangeEndDate(nextTo);
+    if (nextTo < rangeStartDate) {
+      setRangeStartDate(nextTo);
+    } else {
+      const minStart = shiftDate(nextTo, -92);
+      if (rangeStartDate < minStart) {
+        setRangeStartDate(minStart);
+      }
     }
   };
 
@@ -231,318 +355,817 @@ export default function DashboardPage() {
   useEffect(() => {
     if (!isOwner) return;
     const controller = new AbortController();
-    const scopedSummary = periodMode === 'month'
-      ? Promise.resolve(null)
-      : isToday
-        ? api.get('/reports/daily-stats', { signal: controller.signal })
-        : api.get('/reports/summary', { params: { date: selectedDate }, signal: controller.signal });
+    const dailyStatsRequest = isToday
+      ? api.get('/reports/daily-stats', { signal: controller.signal })
+      : Promise.resolve(null);
+    const scopedSummary =
+      periodMode !== 'day'
+        ? Promise.resolve(null)
+        : api.get('/reports/summary', {
+            params: { date: selectedDate },
+            signal: controller.signal,
+          });
+    const previousWeekDate = shiftDate(selectedDate, -7);
+    const comparisonRequest =
+      periodMode === 'day' && canViewFinancials
+        ? api
+            .get('/reports/financial-summary', {
+              params: { start_date: previousWeekDate, end_date: previousWeekDate },
+              signal: controller.signal,
+            })
+            .then((res) => ({
+              sales: Number(res.data.financialSummary?.netCollected ?? 0),
+              averageOrderValue: Number(res.data.financialSummary?.averageOrderValue ?? 0),
+            }))
+            .catch((err: unknown) => {
+              if (
+                err instanceof Error &&
+                (err.name === 'CanceledError' || err.name === 'AbortError')
+              )
+                throw err;
+              return null;
+            })
+        : Promise.resolve(null);
+    // `dashboard.view` and `reports.financial.view` are independently configurable, so an
+    // owner may grant one without the other. Skip the financial-summary call entirely in
+    // that case rather than letting its 403 reject the whole Promise.all and blank the tiles
+    // (running orders, tables, top products, ...) that only need `dashboard.view`.
+    const financialSummaryRequest = canViewFinancials
+      ? api.get('/reports/financial-summary', {
+          params: { start_date: range.startDate, end_date: range.endDate },
+          signal: controller.signal,
+        })
+      : Promise.resolve(null);
     Promise.all([
+      dailyStatsRequest,
       scopedSummary,
-      api.get('/reports/financial-summary', { params: { start_date: range.startDate, end_date: range.endDate }, signal: controller.signal }),
-      api.get('/reports/topProducts', { params: { start_date: range.startDate, end_date: range.endDate, limit: 5 }, signal: controller.signal }),
-      api.get('/reports/recentOrders', {
-        params: periodMode === 'month'
-          ? { start_date: range.startDate, end_date: range.endDate, limit: 6 }
-          : { date: selectedDate, limit: 6 },
+      financialSummaryRequest,
+      api.get('/reports/topProducts', {
+        params: { start_date: range.startDate, end_date: range.endDate, limit: 5 },
         signal: controller.signal,
       }),
-      api.get('/reports/insights', { params: { days: 30 }, signal: controller.signal }),
+      api.get('/reports/recentOrders', {
+        params:
+          periodMode !== 'day'
+            ? { start_date: range.startDate, end_date: range.endDate, limit: 6 }
+            : { date: selectedDate, limit: 6 },
+        signal: controller.signal,
+      }),
+      api.get('/reports/insights', {
+        params:
+          periodMode !== 'day'
+            ? { start_date: range.startDate, end_date: range.endDate }
+            : { days: 30 },
+        signal: controller.signal,
+      }),
+      comparisonRequest,
     ])
-      .then(([statsRes, financialRes, topRes, recentRes, insightsRes]) => {
-        setStats(isToday && statsRes ? statsRes.data : null);
-        setDaySummary(!isToday && statsRes ? statsRes.data.summary : null);
-        setFinancialSummary(financialRes.data.financialSummary);
-        setTopProducts(topRes.data.topProducts || []);
-        setRecentOrders(recentRes.data.recentOrders || []);
-        setInsights(insightsRes.data);
-      })
+      .then(
+        ([statsRes, summaryRes, financialRes, topRes, recentRes, insightsRes, comparisonRes]) => {
+          setStats(statsRes?.data ?? null);
+          setDaySummary(summaryRes?.data?.summary ?? null);
+          setFinancialSummary(financialRes?.data.financialSummary ?? null);
+          setTopProducts(topRes.data.topProducts || []);
+          setRecentOrders(recentRes.data.recentOrders || []);
+          setInsights(insightsRes.data);
+          setWeeklyComparison(comparisonRes);
+        },
+      )
       .catch((err: unknown) => {
-        if (err instanceof Error && (err.name === 'CanceledError' || err.name === 'AbortError')) return;
+        if (err instanceof Error && (err.name === 'CanceledError' || err.name === 'AbortError'))
+          return;
         toast.error(tCommon('somethingWrong'));
       })
       .finally(() => {
         if (!controller.signal.aborted) setLoading(false);
       });
     return () => controller.abort();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isOwner, periodMode, selectedDate, selectedMonth]);
+    // oxlint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    isOwner,
+    canViewFinancials,
+    periodMode,
+    selectedDate,
+    selectedMonth,
+    rangeStartDate,
+    rangeEndDate,
+  ]);
 
   // Day-close wizard lives in useCashClose + CashCloseModal; the page
   // only opens it and mounts it.
   const cashClose = useCashClose();
-  const cashDrawer = useCashDrawerMovements();
+  const { openCloseModal } = cashClose;
+  const cashCloseAction = searchParams.get('action');
+  const requestedCashCloseView = searchParams.get('view');
+  const cashCloseView =
+    requestedCashCloseView === 'x-report' || requestedCashCloseView === 'z-report'
+      ? requestedCashCloseView
+      : null;
+  useEffect(() => {
+    if (cashCloseAction !== 'cash-close') return;
+    openCloseModal(cashCloseView);
+    router.replace('/dashboard', { scroll: false });
+  }, [cashCloseAction, cashCloseView, openCloseModal, router]);
+
+  const exportDailySales = async (format: 'xlsx' | 'csv' | 'pdf') => {
+    if (isExporting) return;
+    setIsExporting(true);
+    try {
+      const dateParams =
+        periodMode === 'day'
+          ? { date: selectedDate }
+          : { from: range.startDate, to: range.endDate };
+      const span =
+        periodMode === 'day' || range.startDate === range.endDate
+          ? range.startDate
+          : `${range.startDate}_to_${range.endDate}`;
+
+      if (format === 'pdf') {
+        await exportReportAsPdf({
+          endpoint: '/reports/daily-sales/export',
+          params: dateParams,
+          filename: `daily-sales-${span}.pdf`,
+        });
+        return;
+      }
+
+      if (format === 'xlsx') {
+        const res = await api.get('/reports/daily-sales/export', {
+          params: { ...dateParams, format: 'xlsx' },
+          responseType: 'blob',
+        });
+        downloadBlob(res.data as Blob, `daily-sales-${span}.xlsx`);
+        return;
+      }
+      toast(t('exportCsvStarted'));
+      for (const part of ['summary', 'daily', 'taxes', 'items', 'payments'] as const) {
+        const res = await api.get('/reports/daily-sales/export', {
+          params: { ...dateParams, format: 'csv', part },
+          responseType: 'blob',
+        });
+        downloadBlob(res.data as Blob, `daily-sales-${span}-${part}.csv`);
+      }
+    } catch (error) {
+      toast.error(
+        error instanceof MenuPopupBlockedError
+          ? tProducts('menuPopupBlocked')
+          : tCommon('downloadFailed'),
+      );
+    } finally {
+      setIsExporting(false);
+    }
+  };
+
+  const exportDailyInvoices = async () => {
+    if (isExporting) return;
+    setIsExporting(true);
+    try {
+      const dateParams =
+        periodMode === 'day'
+          ? { date: selectedDate }
+          : { from: range.startDate, to: range.endDate };
+      const span =
+        periodMode === 'day' || range.startDate === range.endDate
+          ? range.startDate
+          : `${range.startDate}_to_${range.endDate}`;
+
+      await exportReportAsPdf({
+        endpoint: '/reports/daily-invoices/export',
+        params: dateParams,
+        filename: `invoices-${span}.pdf`,
+        pageSize: 'A4',
+      });
+    } catch (error) {
+      toast.error(
+        error instanceof MenuPopupBlockedError
+          ? tProducts('menuPopupBlocked')
+          : tCommon('downloadFailed'),
+      );
+    } finally {
+      setIsExporting(false);
+    }
+  };
+
+  const exportCustomerSales = async (format: 'xlsx' | 'csv') => {
+    if (isExporting) return;
+    setIsExporting(true);
+    try {
+      const res = await api.get('/reports/customer-sales/export', {
+        params: { start_date: range.startDate, end_date: range.endDate, format },
+        responseType: 'blob',
+      });
+      const span =
+        range.startDate === range.endDate
+          ? range.startDate
+          : `${range.startDate}_to_${range.endDate}`;
+      downloadBlob(res.data as Blob, `customer-sales-${span}.${format}`);
+    } catch {
+      toast.error(tCommon('downloadFailed'));
+    } finally {
+      setIsExporting(false);
+    }
+  };
+
+  // FactorPOS: monthly VAT invoice workbook for the month of the selected period's start.
+  const exportMonthlyVat = async () => {
+    if (isExporting) return;
+    setIsExporting(true);
+    const month = range.startDate.slice(0, 7);
+    try {
+      const res = await api.get('/reports/monthly-vat/export', {
+        params: { month },
+        responseType: 'blob',
+      });
+      downloadBlob(res.data as Blob, `vat-invoices-${month}.xlsx`);
+    } catch {
+      toast.error(tCommon('downloadFailed'));
+    } finally {
+      setIsExporting(false);
+    }
+  };
+
+  const handleSendDailySalesWhatsApp = async (phoneE164: string): Promise<boolean> => {
+    try {
+      const dateParams =
+        periodMode === 'day'
+          ? { date: selectedDate }
+          : { from: range.startDate, to: range.endDate };
+      const result = await shareDailySalesViaWhatsApp(dateParams, phoneE164);
+      if (result === false) {
+        toast.error(tCommon('somethingWrong'));
+        return false;
+      }
+      toast.success(
+        t(
+          result === 'sent'
+            ? 'reportSentSuccess'
+            : result === 'submitted'
+              ? 'reportSubmittedPending'
+              : 'reportOpeningWhatsAppWeb',
+        ),
+      );
+      return true;
+    } catch (err: unknown) {
+      const reason = (err as { response?: { data?: { reason?: string } } })?.response?.data?.reason;
+      if (reason === 'offline_mode') {
+        toast.error(tSettings('offlineModeTitle'));
+      } else if (reason === 'feature_off') {
+        toast.error(tWhatsAppConnection('notEnabled'));
+      } else if (reason === 'blocked') {
+        toast.error(tWhatsAppSend('error.blocked'));
+      } else if (reason === 'not_on_whatsapp') {
+        toast.error(tWhatsAppSend('error.notOnWhatsapp'));
+      } else if (reason === 'rate_limited' || reason === 'cooldown') {
+        toast.error(tWhatsAppSend('error.rateLimited'));
+      } else {
+        toast.error(tCommon('somethingWrong'));
+      }
+      return false;
+    }
+  };
 
   if (!isOwner) return null;
 
   const paymentMethods = financialSummary?.paymentMethods ?? [];
   const paymentMethodsTotal = paymentMethods.reduce((sum, pm) => sum + Number(pm.total), 0);
 
-  // Live counters (running orders, occupied tables) only apply to today; past dates use daily totals.
-  const dateScopedTiles = periodMode === 'month'
-    ? [
-        {
-          label: t('billsCollected'),
-          value: financialSummary?.billCount ?? 0,
-          icon: ReceiptText,
-          color: 'bg-blue-50 border-blue-200 dark:bg-blue-950/40 dark:border-blue-800/40',
-          iconColor: 'text-blue-600 dark:text-blue-400',
-          href: '/orders',
-        },
-        {
-          label: t('refundCount'),
-          value: financialSummary?.refundCount ?? 0,
-          icon: RotateCcw,
-          color: 'bg-red-50 border-red-200 dark:bg-red-950/40 dark:border-red-800/40',
-          iconColor: 'text-red-600 dark:text-red-400',
-          href: '/orders',
-        },
-      ]
-    : isToday
-    ? [
-        {
-          label: t('runningOrders'),
-          value: stats?.runningOrders ?? 0,
-          icon: ChefHat,
-          color: 'bg-blue-50 border-blue-200 dark:bg-blue-950/40 dark:border-blue-800/40',
-          iconColor: 'text-blue-600 dark:text-blue-400',
-          href: '/orders',
-        },
-        {
-          label: t('pendingOrders'),
-          value: stats?.pendingOrders ?? 0,
-          icon: Clock,
-          color: 'bg-yellow-50 border-yellow-200 dark:bg-yellow-950/40 dark:border-yellow-800/40',
-          iconColor: 'text-yellow-600 dark:text-yellow-400',
-          href: '/orders',
-        },
-        {
-          label: t('tablesOccupied'),
-          value: stats?.tablesOccupied ?? 0,
-          icon: LayoutGrid,
-          color: 'bg-purple-50 border-purple-200 dark:bg-purple-950/40 dark:border-purple-800/40',
-          iconColor: 'text-purple-600 dark:text-purple-400',
-          href: '/tables',
-        },
-        {
-          label: t('avgTableTurn'),
-          value: (() => {
-            if (stats?.avgTableTurnMinutes == null) return '—';
-            const { h, m } = splitHoursMinutes(stats.avgTableTurnMinutes);
-            return h > 0 ? tCommon('timeHoursMinutes', { h, m }) : tCommon('timeMinutes', { m });
-          })(),
-          icon: Hourglass,
-          color: 'bg-cyan-50 border-cyan-200 dark:bg-cyan-950/40 dark:border-cyan-800/40',
-          iconColor: 'text-cyan-600 dark:text-cyan-400',
-          href: '/tables',
-        },
-      ]
-    : [
-        {
-          label: t('orders'),
-          value: daySummary?.orders.count ?? 0,
-          icon: ChefHat,
-          color: 'bg-blue-50 border-blue-200 dark:bg-blue-950/40 dark:border-blue-800/40',
-          iconColor: 'text-blue-600 dark:text-blue-400',
-          href: '/orders',
-        },
-        {
-          label: t('newCustomers'),
-          value: daySummary?.customers.new ?? 0,
-          icon: Clock,
-          color: 'bg-yellow-50 border-yellow-200 dark:bg-yellow-950/40 dark:border-yellow-800/40',
-          iconColor: 'text-yellow-600 dark:text-yellow-400',
-          href: '/customers',
-        },
-      ];
+  const getComparisonBadge = (current: number, previous: number) => {
+    const difference = current - previous;
+    const direction = difference === 0 ? 'flat' : difference > 0 ? 'up' : 'down';
+    const percent =
+      previous === 0 ? null : Math.round((Math.abs(difference) / Math.abs(previous)) * 100);
+    const Icon = direction === 'up' ? ArrowUpRight : direction === 'down' ? ArrowDownRight : Minus;
+    const label =
+      difference === 0
+        ? t('kpiNoChangeVsSameDayLastWeek')
+        : previous === 0
+          ? t('kpiNewVsSameDayLastWeek')
+          : t('kpiChangeVsSameDayLastWeek', {
+              percent: `${direction === 'down' ? '-' : direction === 'up' ? '+' : ''}${percent}`,
+            });
+    const tone =
+      direction === 'up'
+        ? 'bg-emerald-100/80 text-emerald-700 dark:bg-emerald-950/50 dark:text-emerald-300'
+        : direction === 'down'
+          ? 'bg-red-100/80 text-red-700 dark:bg-red-950/50 dark:text-red-300'
+          : 'bg-muted text-muted-foreground';
+    return (
+      <span
+        className={`inline-flex items-center gap-1 rounded-full px-2 py-1 text-[11px] font-semibold ${tone}`}
+      >
+        <Icon size={13} />
+        {label}
+      </span>
+    );
+  };
 
-  const financialTiles = periodMode === 'month'
-    ? [
-        {
-          label: t('grossCollections'),
-          value: fmt(financialSummary?.grossCollected ?? 0),
-          icon: Banknote,
-          color: 'bg-emerald-50 border-emerald-200 dark:bg-emerald-950/40 dark:border-emerald-800/40',
-          iconColor: 'text-emerald-700 dark:text-emerald-400',
-          href: '/orders',
-        },
-        {
-          label: t('refunds'),
-          value: fmt(financialSummary?.refunded ?? 0),
-          icon: RotateCcw,
-          color: 'bg-red-50 border-red-200 dark:bg-red-950/40 dark:border-red-800/40',
-          iconColor: 'text-red-600 dark:text-red-400',
-          href: '/orders',
-        },
-      ]
-    : [];
+  const salesComparison = weeklyComparison
+    ? getComparisonBadge(financialSummary?.netCollected ?? 0, weeklyComparison.sales)
+    : null;
+  const aovComparison = weeklyComparison
+    ? getComparisonBadge(
+        financialSummary?.averageOrderValue ?? 0,
+        weeklyComparison.averageOrderValue,
+      )
+    : null;
+  const primaryTiles: DashboardTile[] =
+    periodMode !== 'day'
+      ? [
+          {
+            label: t('netCollections'),
+            value: fmtFinancial(financialSummary?.netCollected ?? 0),
+            icon: Banknote,
+            color:
+              'border-emerald-200 bg-emerald-50/80 dark:border-emerald-800/50 dark:bg-emerald-950/30',
+            iconBg: 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/50 dark:text-emerald-300',
+            href: '/orders',
+          },
+          {
+            label: t('grossCollections'),
+            value: fmtFinancial(financialSummary?.grossCollected ?? 0),
+            icon: TrendingUp,
+            color: 'border-blue-200 bg-blue-50/80 dark:border-blue-800/50 dark:bg-blue-950/30',
+            iconBg: 'bg-blue-100 text-blue-700 dark:bg-blue-900/50 dark:text-blue-300',
+            href: '/orders',
+          },
+          {
+            label: t('billsCollected'),
+            value: numFinancial(financialSummary?.billCount ?? 0),
+            icon: ReceiptText,
+            color:
+              'border-violet-200 bg-violet-50/80 dark:border-violet-800/50 dark:bg-violet-950/30',
+            iconBg: 'bg-violet-100 text-violet-700 dark:bg-violet-900/50 dark:text-violet-300',
+            href: '/orders',
+          },
+          {
+            label: t('refunds'),
+            value: fmtFinancial(financialSummary?.refunded ?? 0),
+            icon: RotateCcw,
+            color: 'border-red-200 bg-red-50/80 dark:border-red-800/50 dark:bg-red-950/30',
+            iconBg: 'bg-red-100 text-red-700 dark:bg-red-900/50 dark:text-red-300',
+            href: '/orders',
+          },
+        ]
+      : isToday
+        ? [
+            {
+              label: t('todaySales'),
+              value: fmtFinancial(financialSummary?.netCollected ?? 0),
+              comparison: salesComparison,
+              icon: Banknote,
+              color:
+                'border-emerald-200 bg-emerald-50/80 dark:border-emerald-800/50 dark:bg-emerald-950/30',
+              iconBg:
+                'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/50 dark:text-emerald-300',
+              href: '/orders',
+            },
+            {
+              label: t('runningOrders'),
+              value: stats?.runningOrders ?? 0,
+              meta: t('liveNow'),
+              icon: ChefHat,
+              color: 'border-blue-200 bg-blue-50/80 dark:border-blue-800/50 dark:bg-blue-950/30',
+              iconBg: 'bg-blue-100 text-blue-700 dark:bg-blue-900/50 dark:text-blue-300',
+              href: '/orders',
+            },
+            {
+              label: t('pendingOrders'),
+              value: stats?.pendingOrders ?? 0,
+              meta: t('liveNow'),
+              icon: Clock,
+              color:
+                'border-amber-200 bg-amber-50/80 dark:border-amber-800/50 dark:bg-amber-950/30',
+              iconBg: 'bg-amber-100 text-amber-700 dark:bg-amber-900/50 dark:text-amber-300',
+              href: '/orders',
+            },
+            {
+              label: t('tablesOccupied'),
+              value: stats?.tablesOccupied ?? 0,
+              meta: t('liveNow'),
+              icon: LayoutGrid,
+              color:
+                'border-violet-200 bg-violet-50/80 dark:border-violet-800/50 dark:bg-violet-950/30',
+              iconBg: 'bg-violet-100 text-violet-700 dark:bg-violet-900/50 dark:text-violet-300',
+              href: '/tables',
+            },
+          ]
+        : [
+            {
+              label: t('sales'),
+              value: fmtFinancial(financialSummary?.netCollected ?? 0),
+              comparison: salesComparison,
+              icon: Banknote,
+              color:
+                'border-emerald-200 bg-emerald-50/80 dark:border-emerald-800/50 dark:bg-emerald-950/30',
+              iconBg:
+                'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/50 dark:text-emerald-300',
+              href: '/orders',
+            },
+            {
+              label: t('orders'),
+              value: daySummary?.orders.count ?? 0,
+              icon: ClipboardList,
+              color: 'border-blue-200 bg-blue-50/80 dark:border-blue-800/50 dark:bg-blue-950/30',
+              iconBg: 'bg-blue-100 text-blue-700 dark:bg-blue-900/50 dark:text-blue-300',
+              href: '/orders',
+            },
+            {
+              label: t('newCustomers'),
+              value: daySummary?.customers.new ?? 0,
+              icon: Trophy,
+              color:
+                'border-amber-200 bg-amber-50/80 dark:border-amber-800/50 dark:bg-amber-950/30',
+              iconBg: 'bg-amber-100 text-amber-700 dark:bg-amber-900/50 dark:text-amber-300',
+              href: '/customers',
+            },
+            {
+              label: t('billsCollected'),
+              value: numFinancial(financialSummary?.billCount ?? 0),
+              icon: ReceiptText,
+              color:
+                'border-violet-200 bg-violet-50/80 dark:border-violet-800/50 dark:bg-violet-950/30',
+              iconBg: 'bg-violet-100 text-violet-700 dark:bg-violet-900/50 dark:text-violet-300',
+              href: '/orders',
+            },
+          ];
 
-  const tiles = [
-    {
-      label: periodMode === 'month' ? t('netCollections') : isToday ? t('todaySales') : t('sales'),
-      value: fmt(financialSummary?.netCollected ?? 0),
-      icon: Banknote,
-      color: 'bg-green-50 border-green-200 dark:bg-green-950/40 dark:border-green-800/40',
-      iconColor: 'text-green-600 dark:text-green-400',
-      href: '/orders',
-    },
-    ...financialTiles,
-    ...dateScopedTiles,
-    {
-      label: t('aov'),
-      value: fmt(financialSummary?.averageOrderValue ?? 0),
-      icon: TrendingUp,
-      color: 'bg-teal-50 border-teal-200 dark:bg-teal-950/40 dark:border-teal-800/40',
-      iconColor: 'text-teal-600 dark:text-teal-400',
-      href: '/orders',
-    },
-    ...(periodMode === 'day' ? [{
-      label: t('avgPrepTime'),
-      value: insights?.avgPrepTimeMinutes != null ? t('minutesValue', { minutes: insights.avgPrepTimeMinutes }) : '—',
-      icon: Timer,
-      color: 'bg-orange-50 border-orange-200 dark:bg-orange-950/40 dark:border-orange-800/40',
-      iconColor: 'text-orange-600 dark:text-orange-400',
-      href: '/orders',
-    }] : []),
-  ];
+  const secondaryMetrics: DashboardMetric[] =
+    periodMode === 'day' && isToday
+      ? [
+          {
+            label: t('avgTableTurn'),
+            value:
+              stats?.avgTableTurnMinutes != null
+                ? (() => {
+                    const { h, m } = splitHoursMinutes(stats.avgTableTurnMinutes);
+                    return h > 0
+                      ? tCommon('timeHoursMinutes', { h, m })
+                      : tCommon('timeMinutes', { m });
+                  })()
+                : '—',
+            icon: Hourglass,
+            iconBg: 'bg-sky-100 text-sky-700 dark:bg-sky-900/50 dark:text-sky-300',
+          },
+          {
+            label: t('aov'),
+            value: fmtFinancial(financialSummary?.averageOrderValue ?? 0),
+            comparison: aovComparison,
+            icon: TrendingUp,
+            iconBg: 'bg-teal-100 text-teal-700 dark:bg-teal-900/50 dark:text-teal-300',
+          },
+          {
+            label: t('avgPrepTime'),
+            value:
+              insights?.avgPrepTimeMinutes != null
+                ? t('minutesValue', { minutes: insights.avgPrepTimeMinutes })
+                : '—',
+            icon: Timer,
+            iconBg: 'bg-orange-100 text-orange-700 dark:bg-orange-900/50 dark:text-orange-300',
+          },
+        ]
+      : [];
 
   return (
-    <div className="p-6">
-      <div className="mb-6 flex items-center justify-between gap-4 flex-wrap">
-        <h1 className="text-2xl font-bold text-foreground">{t('title')}</h1>
-        <div className="flex items-center gap-2">
-          <div className="flex h-9 rounded-lg border border-border bg-card p-1" role="group" aria-label={t('periodView')}>
-            {(['day', 'month'] as const).map((mode) => (
+    <div className="min-h-full bg-background p-4 sm:p-6 lg:p-7">
+      <div className="mb-7 flex flex-col gap-4 xl:flex-row xl:items-end xl:justify-between">
+        <div>
+          <h1 className="text-2xl font-semibold tracking-tight text-foreground sm:text-3xl">
+            {t('title')}
+          </h1>
+          <p className="mt-1 text-sm text-muted-foreground">
+            {periodMode === 'month'
+              ? t('selectMonth')
+              : periodMode === 'range'
+                ? t('periodWindow', { start: rangeStartDate, end: rangeEndDate })
+                : t('selectDate')}
+          </p>
+        </div>
+
+        <div className="flex flex-wrap items-center justify-start gap-2 xl:justify-end">
+          {periodMode === 'day' ? (
+            <DatePickerInput
+              type="date"
+              value={selectedDate}
+              max={todayLocal}
+              onChange={(e) => e.target.value && setSelectedDate(e.target.value)}
+              className="h-10 rounded-xl border border-border bg-card ps-3 text-sm text-foreground shadow-sm focus:outline-none focus:ring-2 focus:ring-brand/30"
+              buttonClassName="rounded-e-xl"
+              aria-label={t('selectDate')}
+              pickerAriaLabel={t('openDatePicker')}
+            />
+          ) : periodMode === 'month' ? (
+            <DatePickerInput
+              type="month"
+              value={selectedMonth}
+              max={todayLocal.slice(0, 7)}
+              onChange={(e) => e.target.value && setSelectedMonth(e.target.value)}
+              className="h-10 rounded-xl border border-border bg-card ps-3 text-sm text-foreground shadow-sm focus:outline-none focus:ring-2 focus:ring-brand/30"
+              buttonClassName="rounded-e-xl"
+              aria-label={t('selectMonth')}
+              pickerAriaLabel={t('openMonthPicker')}
+            />
+          ) : (
+            <div className="flex flex-wrap items-center gap-2">
+              <DatePickerInput
+                type="date"
+                value={rangeStartDate}
+                max={todayLocal}
+                onChange={(e) => handleRangeStartChange(e.target.value)}
+                className="h-10 rounded-xl border border-border bg-card ps-3 text-sm text-foreground shadow-sm focus:outline-none focus:ring-2 focus:ring-brand/30"
+                buttonClassName="rounded-e-xl"
+                aria-label={t('periodStart')}
+                pickerAriaLabel={t('openDatePicker')}
+              />
+              <DatePickerInput
+                type="date"
+                value={rangeEndDate}
+                min={rangeStartDate}
+                max={
+                  shiftDate(rangeStartDate, 92) < todayLocal
+                    ? shiftDate(rangeStartDate, 92)
+                    : todayLocal
+                }
+                onChange={(e) => handleRangeEndChange(e.target.value)}
+                className="h-10 rounded-xl border border-border bg-card ps-3 text-sm text-foreground shadow-sm focus:outline-none focus:ring-2 focus:ring-brand/30"
+                buttonClassName="rounded-e-xl"
+                aria-label={t('periodEnd')}
+                pickerAriaLabel={t('openDatePicker')}
+              />
+            </div>
+          )}
+
+          <div
+            className="flex h-10 rounded-xl border border-border bg-card p-1 shadow-sm"
+            role="group"
+            aria-label={t('periodView')}
+          >
+            {(['day', 'month', 'range'] as const).map((mode) => (
               <button
                 key={mode}
                 type="button"
                 onClick={() => setPeriodMode(mode)}
-                className={`min-w-16 rounded-md px-3 text-sm font-medium transition-colors ${periodMode === mode ? 'bg-foreground text-background' : 'text-muted-foreground hover:bg-muted'}`}
+                className={`min-w-16 rounded-lg px-3 text-sm font-medium transition-colors ${periodMode === mode ? 'bg-foreground text-background shadow-sm' : 'text-muted-foreground hover:bg-muted'}`}
                 aria-pressed={periodMode === mode}
               >
                 {t(mode)}
               </button>
             ))}
           </div>
-          {periodMode === 'day' ? (
-            <div className="relative">
-              <input
-                ref={dayInputRef}
-                type="date"
-                value={selectedDate}
-                max={todayLocal}
-                onChange={(e) => e.target.value && setSelectedDate(e.target.value)}
-                className="h-9 ps-3 pe-10 text-sm border border-border rounded-lg bg-card text-foreground focus:outline-none focus:ring-2 focus:ring-brand/30"
-                aria-label={t('selectDate')}
-              />
-              <button
-                type="button"
-                onClick={() => openPicker(dayInputRef.current)}
-                className="absolute inset-y-0 end-0 z-10 flex w-9 items-center justify-center rounded-e-lg text-muted-foreground hover:bg-muted hover:text-foreground"
-                aria-label={t('openDatePicker')}
-              >
-                <CalendarDays size={16} />
-              </button>
-            </div>
-          ) : (
-            <div className="relative">
-              <input
-                ref={monthInputRef}
-                type="month"
-                value={selectedMonth}
-                max={todayLocal.slice(0, 7)}
-                onChange={(e) => e.target.value && setSelectedMonth(e.target.value)}
-                className="h-9 ps-3 pe-10 text-sm border border-border rounded-lg bg-card text-foreground focus:outline-none focus:ring-2 focus:ring-brand/30"
-                aria-label={t('selectMonth')}
-              />
-              <button
-                type="button"
-                onClick={() => openPicker(monthInputRef.current)}
-                className="absolute inset-y-0 end-0 z-10 flex w-9 items-center justify-center rounded-e-lg text-muted-foreground hover:bg-muted hover:text-foreground"
-                aria-label={t('openMonthPicker')}
-              >
-                <CalendarDays size={16} />
-              </button>
-            </div>
-          )}
+
+          <span className="mx-1 hidden h-7 w-px bg-border xl:block" aria-hidden="true" />
+
           <Button
             type="button"
-            variant="outline"
-            onClick={cashClose.openCloseModal}
-            className="h-9"
+            onClick={() => cashClose.openCloseModal()}
+            className="h-10 rounded-xl bg-brand px-4 text-white shadow-sm hover:bg-brand-hover"
           >
             <Lock size={14} />
             {t('closeShift')}
           </Button>
-          <Button
-            type="button"
-            variant="outline"
-            onClick={cashDrawer.openModal}
-            className="h-9"
-          >
-            <Banknote size={14} />
-            {t('cashMovement')}
-          </Button>
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <Button
+                type="button"
+                variant="outline"
+                disabled={isExporting}
+                className="h-10 rounded-xl bg-card px-4 shadow-sm"
+                title={t('exportSales')}
+              >
+                <Download size={14} />
+                {t('exportSales')}
+                <ChevronDown size={14} />
+              </Button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end" className="w-48">
+              <DropdownMenuItem onSelect={() => exportDailySales('xlsx')}>
+                <FileSpreadsheet size={14} />
+                {t('exportXlsx')}
+              </DropdownMenuItem>
+              <DropdownMenuItem onSelect={() => exportDailySales('csv')}>
+                <FileText size={14} />
+                {t('exportCsv')}
+              </DropdownMenuItem>
+              <DropdownMenuItem onSelect={() => exportDailySales('pdf')}>
+                <FileText size={14} />
+                {t('exportPdf')}
+              </DropdownMenuItem>
+              {canSendDailySalesWhatsApp && (
+                <DropdownMenuItem onSelect={() => setDailySalesWhatsAppOpen(true)}>
+                  <MessageCircle size={14} className="text-emerald-500" />
+                  {t('sendViaWhatsApp')}
+                </DropdownMenuItem>
+              )}
+              <DropdownMenuItem onSelect={() => exportDailyInvoices()}>
+                <FileText size={14} />
+                {t('exportInvoicesPdf')}
+              </DropdownMenuItem>
+              <DropdownMenuSeparator />
+              <DropdownMenuLabel>{t('exportCustomerSales')}</DropdownMenuLabel>
+              <DropdownMenuItem onSelect={() => exportCustomerSales('xlsx')}>
+                <FileSpreadsheet size={14} />
+                {t('exportXlsx')}
+              </DropdownMenuItem>
+              <DropdownMenuItem onSelect={() => exportCustomerSales('csv')}>
+                <FileText size={14} />
+                {t('exportCsv')}
+              </DropdownMenuItem>
+              <DropdownMenuSeparator />
+              <DropdownMenuLabel>{t('exportMonthlyVatLabel')}</DropdownMenuLabel>
+              <DropdownMenuItem onSelect={() => exportMonthlyVat()}>
+                <FileSpreadsheet size={14} />
+                {t('exportMonthlyVat', { month: range.startDate.slice(0, 7) })}
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
         </div>
       </div>
 
-
       <CashCloseModal model={cashClose} />
-      <CashDrawerMovementModal model={cashDrawer} />
+      <SendWhatsAppReportModal
+        open={dailySalesWhatsAppOpen}
+        country={currentTenant?.country ?? ''}
+        canViewSettings={canViewSettings}
+        onOpenChange={setDailySalesWhatsAppOpen}
+        onSend={handleSendDailySalesWhatsApp}
+      />
 
       {loading ? (
-        <div className="flex items-center justify-center py-20">
-          <div className="w-8 h-8 border-3 border-brand border-t-transparent rounded-full animate-spin" />
+        <div
+          className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4"
+          role="status"
+          aria-live="polite"
+        >
+          <span className="sr-only">{tCommon('loading')}</span>
+          {[0, 1, 2, 3].map((item) => (
+            <div
+              key={item}
+              aria-hidden="true"
+              className="h-36 animate-pulse rounded-2xl border border-border bg-card/70"
+            />
+          ))}
         </div>
       ) : (
         <>
-          <div className="grid grid-cols-2 lg:grid-cols-3 gap-4 mb-6">
-            {tiles.map((tile) => (
+          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
+            {primaryTiles.map((tile) => (
               <Link
                 key={tile.label}
                 href={tile.href}
-                className={`rounded-xl border p-5 ${tile.color} transition-transform hover:-translate-y-0.5 hover:shadow-sm`}
+                className={`group rounded-2xl border p-5 shadow-sm transition-all hover:-translate-y-0.5 hover:shadow-md ${tile.color}`}
               >
-                <div className="flex items-center justify-between mb-3">
+                <div className="flex items-start justify-between gap-3">
                   <span className="text-sm font-medium text-muted-foreground">{tile.label}</span>
-                  <tile.icon size={20} className={tile.iconColor} />
+                  <span
+                    className={`flex size-10 shrink-0 items-center justify-center rounded-xl ${tile.iconBg}`}
+                  >
+                    <tile.icon size={19} />
+                  </span>
                 </div>
-                <p className="text-3xl font-bold text-foreground">
+                <p className="mt-5 text-3xl font-bold tracking-tight text-foreground">
                   {tile.value}
                 </p>
+                <div className="mt-3 min-h-6">
+                  {tile.comparison ||
+                    (tile.meta && (
+                      <span className="text-xs font-medium text-muted-foreground">{tile.meta}</span>
+                    ))}
+                </div>
               </Link>
             ))}
           </div>
 
-          <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+          {secondaryMetrics.length > 0 && (
+            <div className="mt-5 grid grid-cols-1 overflow-hidden rounded-2xl border border-border bg-card shadow-sm sm:grid-cols-3">
+              {secondaryMetrics.map((metric, index) => (
+                <div
+                  key={metric.label}
+                  className={`flex items-center gap-3 p-4 sm:p-5 ${index > 0 ? 'border-t border-border sm:border-s-0 sm:border-t-0 sm:border-s' : ''}`}
+                >
+                  <span
+                    className={`flex size-10 shrink-0 items-center justify-center rounded-xl ${metric.iconBg}`}
+                  >
+                    <metric.icon size={18} />
+                  </span>
+                  <div className="min-w-0">
+                    <p className="text-xs font-medium text-muted-foreground">{metric.label}</p>
+                    <div className="mt-1 flex flex-wrap items-center gap-2">
+                      <p className="text-lg font-semibold text-foreground">{metric.value}</p>
+                      {metric.comparison}
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {canViewFinancials && financialSummary?.profitability && (
+            <div className="mt-5 grid grid-cols-1 overflow-hidden rounded-2xl border border-border bg-card shadow-sm sm:grid-cols-3">
+              <div className="flex items-center gap-3 p-4 sm:p-5">
+                <span className="flex size-10 shrink-0 items-center justify-center rounded-xl bg-amber-100 text-amber-700 dark:bg-amber-900/50 dark:text-amber-300">
+                  <ChefHat size={18} />
+                </span>
+                <div className="min-w-0">
+                  <p className="text-xs font-medium text-muted-foreground">{t('ingredientCost')}</p>
+                  <p className="mt-1 text-lg font-semibold text-foreground">
+                    {financialSummary.profitability.ingredient_cost !== null
+                      ? fmt(Number(financialSummary.profitability.ingredient_cost))
+                      : t('costUnknown')}
+                  </p>
+                </div>
+              </div>
+              <div className="flex items-center gap-3 border-t border-border p-4 sm:border-s sm:border-t-0 sm:p-5">
+                <span className="flex size-10 shrink-0 items-center justify-center rounded-xl bg-emerald-100 text-emerald-700 dark:bg-emerald-900/50 dark:text-emerald-300">
+                  <TrendingUp size={18} />
+                </span>
+                <div className="min-w-0">
+                  <p className="text-xs font-medium text-muted-foreground">{t('grossProfit')}</p>
+                  <p className="mt-1 text-lg font-semibold text-foreground">
+                    {financialSummary.profitability.profit !== null
+                      ? fmt(Number(financialSummary.profitability.profit))
+                      : t('costUnknown')}
+                  </p>
+                </div>
+              </div>
+              <div className="flex items-center gap-3 border-t border-border p-4 sm:border-s sm:border-t-0 sm:p-5">
+                <span className="flex size-10 shrink-0 items-center justify-center rounded-xl bg-indigo-100 text-indigo-700 dark:bg-indigo-900/50 dark:text-indigo-300">
+                  <BarChart3 size={18} />
+                </span>
+                <div className="min-w-0">
+                  <p className="text-xs font-medium text-muted-foreground">{t('grossMargin')}</p>
+                  <div className="mt-1 flex flex-wrap items-center gap-2">
+                    <p className="text-lg font-semibold text-foreground">
+                      {financialSummary.profitability.margin_percent !== null
+                        ? `${financialSummary.profitability.margin_percent}%`
+                        : t('costUnknown')}
+                    </p>
+                    {financialSummary.profitability.cost_status === 'partial' && (
+                      <span className="rounded-full bg-amber-100 px-2 py-0.5 text-[11px] font-medium text-amber-800 dark:bg-amber-950/60 dark:text-amber-300">
+                        {t('partialCost')}
+                      </span>
+                    )}
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+
+          <div className="mt-5 grid grid-cols-1 gap-5 lg:grid-cols-2">
             {/* Recent Orders */}
-            <div className="bg-card rounded-xl border border-border dark:border-border overflow-hidden">
-              <div className="flex items-center justify-between px-4 py-3 border-b border-border dark:border-border">
-                <h2 className="flex items-center gap-2 font-semibold text-foreground">
-                  <ClipboardList size={16} className="text-muted-foreground" />
-                  {isToday ? t('recentOrders') : periodMode === 'month' ? t('monthOrders') : t('orders')}
-                </h2>
-                <Link href="/orders" className="flex items-center gap-1 text-xs text-brand hover:text-brand-hover font-medium">
+            <div className="overflow-hidden rounded-2xl border border-border bg-card shadow-sm">
+              <div className="flex items-center justify-between gap-3 border-b border-border px-5 py-4">
+                <div className="flex items-center gap-3">
+                  <span className="flex size-9 items-center justify-center rounded-xl bg-blue-100 text-blue-700 dark:bg-blue-900/50 dark:text-blue-300">
+                    <ClipboardList size={16} />
+                  </span>
+                  <h2 className="font-semibold text-foreground">
+                    {isToday
+                      ? t('recentOrders')
+                      : periodMode === 'month'
+                        ? t('monthOrders')
+                        : t('orders')}
+                  </h2>
+                </div>
+                <Link
+                  href="/orders"
+                  className="flex items-center gap-1 text-xs text-brand hover:text-brand-hover font-medium"
+                >
                   {t('viewAll')} <ArrowRight size={12} className="rtl-flip" />
                 </Link>
               </div>
               {recentOrders.length === 0 ? (
-                <p className="px-4 py-6 text-sm text-muted-foreground text-center">{t('noOrdersYet')}</p>
+                <div className="flex min-h-48 flex-col items-center justify-center px-6 py-10 text-center">
+                  <span className="mb-3 flex size-12 items-center justify-center rounded-2xl bg-muted text-muted-foreground">
+                    <ClipboardList size={23} />
+                  </span>
+                  <p className="text-sm font-medium text-foreground">{t('noOrdersYet')}</p>
+                </div>
               ) : (
                 <div className="divide-y divide-border">
                   {recentOrders.map((order) => (
                     <Link
                       key={order.id}
                       href="/orders"
-                      className="flex items-center justify-between px-4 py-2.5 hover:bg-muted transition-colors"
+                      className="flex items-center justify-between px-5 py-3 transition-colors hover:bg-muted/60"
                     >
                       <div className="min-w-0">
                         <div className="flex items-center gap-2">
-                          <span className="text-sm font-medium text-foreground">#<Ltr>{order.order_number}</Ltr></span>
+                          <span className="text-sm font-medium text-foreground">
+                            #<Ltr>{order.order_number}</Ltr>
+                          </span>
                           {order.token_number != null && (
-                            <span className="text-xs font-semibold text-foreground">TOKEN #<Ltr>{order.token_number}</Ltr></span>
+                            <span className="text-xs font-semibold text-foreground">
+                              TOKEN #<Ltr>{order.token_number}</Ltr>
+                            </span>
                           )}
-                          <span className={`text-xs font-medium ${orderStatusColor[order.status] || 'text-muted-foreground'}`}>
-                            {(() => { const k = (ORDER_STATUS_LABEL_KEYS as Record<string, OrdersKey | undefined>)[order.status]; return k ? tOrders(k) : order.status; })()}
+                          <span
+                            className={`text-xs font-medium ${orderStatusColor[order.status] || 'text-muted-foreground'}`}
+                          >
+                            {(() => {
+                              const k = (
+                                ORDER_STATUS_LABEL_KEYS as Record<string, OrdersKey | undefined>
+                              )[order.status];
+                              return k ? tOrders(k) : order.status;
+                            })()}
                           </span>
                         </div>
                         <p className="text-xs text-muted-foreground truncate">
@@ -559,29 +1182,92 @@ export default function DashboardPage() {
             </div>
 
             {/* Top Products Today */}
-            <div className="bg-card rounded-xl border border-border dark:border-border overflow-hidden">
-              <div className="flex items-center justify-between px-4 py-3 border-b border-border dark:border-border">
-                <h2 className="flex items-center gap-2 font-semibold text-foreground">
-                  <TrendingUp size={16} className="text-muted-foreground" />
-                  {periodMode === 'month' ? t('topProductsMonth') : isToday ? t('topProductsToday') : t('topProducts')}
-                </h2>
-                <Link href="/products" className="flex items-center gap-1 text-xs text-brand hover:text-brand-hover font-medium">
+            <div className="overflow-hidden rounded-2xl border border-border bg-card shadow-sm">
+              <div className="flex items-center justify-between gap-3 border-b border-border px-5 py-4">
+                <div className="flex items-center gap-3">
+                  <span className="flex size-9 items-center justify-center rounded-xl bg-emerald-100 text-emerald-700 dark:bg-emerald-900/50 dark:text-emerald-300">
+                    <TrendingUp size={16} />
+                  </span>
+                  <h2 className="font-semibold text-foreground">
+                    {periodMode === 'month'
+                      ? t('topProductsMonth')
+                      : isToday
+                        ? t('topProductsToday')
+                        : t('topProducts')}
+                  </h2>
+                </div>
+                <Link
+                  href="/products"
+                  className="flex items-center gap-1 text-xs text-brand hover:text-brand-hover font-medium"
+                >
                   {t('viewAll')} <ArrowRight size={12} className="rtl-flip" />
                 </Link>
               </div>
               {topProducts.length === 0 ? (
-                <p className="px-4 py-6 text-sm text-muted-foreground text-center">{t('noSalesYet')}</p>
+                <div className="flex min-h-48 flex-col items-center justify-center px-6 py-10 text-center">
+                  <span className="mb-3 flex size-12 items-center justify-center rounded-2xl bg-muted text-muted-foreground">
+                    <TrendingUp size={23} />
+                  </span>
+                  <p className="text-sm font-medium text-foreground">{t('noSalesYet')}</p>
+                </div>
               ) : (
                 <div className="divide-y divide-border">
                   {topProducts.map((product) => (
-                    <div key={product.product_id} className="flex items-center justify-between px-4 py-2.5">
+                    <div
+                      key={product.product_id}
+                      className="flex items-center justify-between gap-3 px-5 py-3"
+                    >
                       <div className="min-w-0">
-                        <span className="text-sm font-medium text-foreground">{product.product_name}</span>
-                        <p className="text-xs text-muted-foreground">{t('productSoldOrders', { quantity: product.total_quantity, orders: product.order_count })}</p>
+                        <div className="flex flex-wrap items-center gap-2">
+                          <span className="text-sm font-medium text-foreground">
+                            {product.product_name}
+                          </span>
+                          {canViewFinancials && product.cost_status === 'partial' && (
+                            <span className="rounded-full bg-amber-100 px-2 py-0.5 text-[11px] font-medium text-amber-800 dark:bg-amber-950/60 dark:text-amber-300">
+                              {t('partialCost')}
+                            </span>
+                          )}
+                        </div>
+                        <p className="text-xs text-muted-foreground">
+                          {t('productSoldOrders', {
+                            quantity: product.total_quantity,
+                            orders: product.order_count,
+                          })}
+                        </p>
                       </div>
-                      <span className="text-sm font-semibold text-foreground shrink-0">
-                        {fmt(Number(product.total_revenue))}
-                      </span>
+                      <div className="shrink-0 text-end">
+                        <span className="text-sm font-semibold text-foreground">
+                          {fmt(Number(product.total_revenue))}
+                        </span>
+                        {canViewFinancials && product.cost_status && (
+                          <div className="text-xs text-muted-foreground">
+                            {product.cost_status === 'unknown' ||
+                            product.ingredient_cost === null ||
+                            product.ingredient_cost === undefined ? (
+                              <span>{t('costUnknown')}</span>
+                            ) : (
+                              <span>
+                                {t('ingredientCostLabel', {
+                                  amount: fmt(Number(product.ingredient_cost)),
+                                })}
+                                {product.profit !== null && product.profit !== undefined && (
+                                  <>
+                                    {' · '}
+                                    {t('profitMarginLabel', {
+                                      profit: fmt(Number(product.profit)),
+                                      margin:
+                                        product.margin_percent !== null &&
+                                        product.margin_percent !== undefined
+                                          ? `${product.margin_percent}%`
+                                          : '—',
+                                    })}
+                                  </>
+                                )}
+                              </span>
+                            )}
+                          </div>
+                        )}
+                      </div>
                     </div>
                   ))}
                 </div>
@@ -589,27 +1275,46 @@ export default function DashboardPage() {
             </div>
           </div>
 
-          <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 mt-4">
+          <div className="mt-5">
+            <PriceExceptionsCard startDate={range.startDate} endDate={range.endDate} />
+          </div>
+
+          <div className="mt-5 grid grid-cols-1 gap-5 lg:grid-cols-2">
             {/* Top Staff */}
-            <div className="bg-card rounded-xl border border-border dark:border-border overflow-hidden">
-              <div className="flex items-center justify-between px-4 py-3 border-b border-border dark:border-border">
-                <h2 className="flex items-center gap-2 font-semibold text-foreground">
-                  <Trophy size={16} className="text-muted-foreground" />
-                  {t('topStaff')}
-                </h2>
-                <Link href="/staff" className="flex items-center gap-1 text-xs text-brand hover:text-brand-hover font-medium">
+            <div className="overflow-hidden rounded-2xl border border-border bg-card shadow-sm">
+              <div className="flex items-center justify-between gap-3 border-b border-border px-5 py-4">
+                <div className="flex items-center gap-3">
+                  <span className="flex size-9 items-center justify-center rounded-xl bg-amber-100 text-amber-700 dark:bg-amber-900/50 dark:text-amber-300">
+                    <Trophy size={16} />
+                  </span>
+                  <h2 className="font-semibold text-foreground">{t('topStaff')}</h2>
+                </div>
+                <Link
+                  href="/staff"
+                  className="flex items-center gap-1 text-xs text-brand hover:text-brand-hover font-medium"
+                >
                   {t('viewAll')} <ArrowRight size={12} className="rtl-flip" />
                 </Link>
               </div>
               {(insights?.topStaff.length ?? 0) === 0 ? (
-                <p className="px-4 py-6 text-sm text-muted-foreground text-center">{t('noSalesYet')}</p>
+                <div className="flex min-h-48 flex-col items-center justify-center px-6 py-10 text-center">
+                  <span className="mb-3 flex size-12 items-center justify-center rounded-2xl bg-muted text-muted-foreground">
+                    <Trophy size={23} />
+                  </span>
+                  <p className="text-sm font-medium text-foreground">{t('noSalesYet')}</p>
+                </div>
               ) : (
                 <div className="divide-y divide-border">
                   {insights!.topStaff.map((staff) => (
-                    <div key={staff.user_id} className="flex items-center justify-between px-4 py-2.5">
+                    <div
+                      key={staff.user_id}
+                      className="flex items-center justify-between px-5 py-3"
+                    >
                       <div className="min-w-0">
                         <span className="text-sm font-medium text-foreground">{staff.name}</span>
-                        <p className="text-xs text-muted-foreground">{t('staffOrderCount', { orders: staff.orderCount })}</p>
+                        <p className="text-xs text-muted-foreground">
+                          {t('staffOrderCount', { orders: staff.orderCount })}
+                        </p>
                       </div>
                       <span className="text-sm font-semibold text-foreground shrink-0">
                         {fmt(Number(staff.revenue))}
@@ -621,22 +1326,40 @@ export default function DashboardPage() {
             </div>
 
             {/* Top Categories */}
-            <div className="bg-card rounded-xl border border-border dark:border-border overflow-hidden">
-              <div className="flex items-center justify-between px-4 py-3 border-b border-border dark:border-border">
-                <h2 className="flex items-center gap-2 font-semibold text-foreground">
-                  <Tags size={16} className="text-muted-foreground" />
-                  {t('topCategories')}
-                </h2>
+            <div className="overflow-hidden rounded-2xl border border-border bg-card shadow-sm">
+              <div className="flex items-center justify-between gap-3 border-b border-border px-5 py-4">
+                <div className="flex items-center gap-3">
+                  <span className="flex size-9 items-center justify-center rounded-xl bg-violet-100 text-violet-700 dark:bg-violet-900/50 dark:text-violet-300">
+                    <Tags size={16} />
+                  </span>
+                  <h2 className="font-semibold text-foreground">{t('topCategories')}</h2>
+                </div>
+                <Link
+                  href="/products"
+                  className="flex items-center gap-1 text-xs text-brand hover:text-brand-hover font-medium"
+                >
+                  {t('viewAll')} <ArrowRight size={12} className="rtl-flip" />
+                </Link>
               </div>
               {(insights?.topCategories.length ?? 0) === 0 ? (
-                <p className="px-4 py-6 text-sm text-muted-foreground text-center">{t('noSalesYet')}</p>
+                <div className="flex min-h-48 flex-col items-center justify-center px-6 py-10 text-center">
+                  <span className="mb-3 flex size-12 items-center justify-center rounded-2xl bg-muted text-muted-foreground">
+                    <Tags size={23} />
+                  </span>
+                  <p className="text-sm font-medium text-foreground">{t('noSalesYet')}</p>
+                </div>
               ) : (
                 <div className="divide-y divide-border">
                   {insights!.topCategories.map((category) => (
-                    <div key={category.category_id ?? category.name} className="flex items-center justify-between px-4 py-2.5">
+                    <div
+                      key={category.category_id ?? category.name}
+                      className="flex items-center justify-between px-5 py-3"
+                    >
                       <div className="min-w-0">
                         <span className="text-sm font-medium text-foreground">{category.name}</span>
-                        <p className="text-xs text-muted-foreground">{t('categoryQuantitySold', { quantity: category.quantity })}</p>
+                        <p className="text-xs text-muted-foreground">
+                          {t('categoryQuantitySold', { quantity: category.quantity })}
+                        </p>
                       </div>
                       <span className="text-sm font-semibold text-foreground shrink-0">
                         {fmt(Number(category.revenue))}
@@ -648,28 +1371,40 @@ export default function DashboardPage() {
             </div>
           </div>
 
-          {periodMode === 'month' && (
-            <section className="bg-card rounded-lg border border-border mt-4 overflow-hidden">
-              <div className="flex items-center justify-between gap-3 px-4 py-3 border-b border-border">
+          {periodMode === 'month' && canViewFinancials && (
+            <section className="mt-5 overflow-hidden rounded-2xl border border-border bg-card shadow-sm">
+              <div className="flex items-center justify-between gap-3 border-b border-border px-5 py-4">
                 <div>
                   <h2 className="flex items-center gap-2 font-semibold text-foreground">
-                    <RotateCcw size={16} className="text-red-500" />
+                    <span className="flex size-9 items-center justify-center rounded-xl bg-red-100 text-red-700 dark:bg-red-900/50 dark:text-red-300">
+                      <RotateCcw size={16} />
+                    </span>
                     {t('refundActivity')}
                   </h2>
                   <p className="text-xs text-muted-foreground mt-0.5">{t('refundActivityHint')}</p>
                 </div>
-                <span className="text-sm font-semibold text-red-600">{fmt(financialSummary?.refunded ?? 0)}</span>
+                <span className="text-sm font-semibold text-red-600">
+                  {fmt(financialSummary?.refunded ?? 0)}
+                </span>
               </div>
               {(financialSummary?.refunds.length ?? 0) === 0 ? (
-                <p className="px-4 py-8 text-sm text-muted-foreground text-center">{t('noRefunds')}</p>
+                <p className="px-6 py-10 text-center text-sm text-muted-foreground">
+                  {t('noRefunds')}
+                </p>
               ) : (
                 <div className="divide-y divide-border">
                   {financialSummary!.refunds.map((refund) => (
-                    <div key={refund.id} className="grid grid-cols-1 gap-2 px-4 py-3 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center">
+                    <div
+                      key={refund.id}
+                      className="grid grid-cols-1 gap-2 px-5 py-3 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center"
+                    >
                       <div className="min-w-0">
                         <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
                           <span className="text-sm font-semibold text-foreground">
-                            {t('refundReference', { bill: refund.bill_number, order: refund.order_number })}
+                            {t('refundReference', {
+                              bill: refund.bill_number,
+                              order: refund.order_number,
+                            })}
                           </span>
                           <span className="text-xs text-muted-foreground">{refund.method}</span>
                         </div>
@@ -680,9 +1415,15 @@ export default function DashboardPage() {
                           {' · '}
                           {t('collectedAt', { date: formatDateTime(refund.paid_at) })}
                         </p>
-                        {refund.reason && <p className="mt-1 text-xs text-muted-foreground truncate">{refund.reason}</p>}
+                        {refund.reason && (
+                          <p className="mt-1 text-xs text-muted-foreground truncate">
+                            {refund.reason}
+                          </p>
+                        )}
                       </div>
-                      <span className="text-base font-bold text-red-600 sm:text-end">{fmt(-Number(refund.amount))}</span>
+                      <span className="text-base font-bold text-red-600 sm:text-end">
+                        {fmt(-Number(refund.amount))}
+                      </span>
                     </div>
                   ))}
                 </div>
@@ -690,92 +1431,143 @@ export default function DashboardPage() {
             </section>
           )}
 
-          {/* Payment Methods */}
-          <div className="bg-card rounded-xl border border-border dark:border-border p-4 mt-4">
-            <div className="flex items-center gap-2 mb-4">
-              <Wallet size={16} className="text-muted-foreground" />
-              <h2 className="font-semibold text-foreground">{t('paymentMethods')}</h2>
-            </div>
-            {paymentMethods.length === 0 ? (
-              <p className="text-sm text-muted-foreground text-center py-6">{t('noPaymentsYet')}</p>
-            ) : (
-              <div className="space-y-3">
-                {paymentMethods.map((pm) => {
-                  const meta = PAYMENT_METHODS.find((m) => m.key === pm.method);
-                  const Icon = meta?.icon ?? Wallet;
-                  const label = meta ? tPos(BUILT_IN_PAYMENT_KEYS[meta.key]) : pm.method === 'wallet' ? tPos('methodWallet') : String(pm.method || tCommon('unknown'));
-                  const percent = paymentMethodsTotal > 0
-                    ? Math.max(0, Math.min(100, Math.round((Number(pm.total) / paymentMethodsTotal) * 100)))
-                    : 0;
-                  return (
-                    <div key={pm.method ?? 'unknown'}>
-                      <div className="flex items-center justify-between mb-1">
-                        <div className="flex items-center gap-2">
-                          <Icon size={14} className="text-muted-foreground" />
-                          <span className="text-sm font-medium text-foreground">{label}</span>
-                        </div>
-                        <span className="text-sm font-semibold text-foreground">{fmt(Number(pm.total))}</span>
-                      </div>
-                      <div className="flex items-center gap-2">
-                        <div className="flex-1 h-1.5 bg-muted rounded-full overflow-hidden">
-                          <div className="h-full bg-brand rounded-full" style={{ width: `${percent}%` }} />
-                        </div>
-                        <span className="text-xs text-muted-foreground shrink-0">
-                          {t('paymentMethodCount', { count: pm.count, percent })}
-                        </span>
-                      </div>
-                    </div>
-                  );
-                })}
+          <div className="mt-5 grid grid-cols-1 gap-5 lg:grid-cols-2">
+            {/* Payment Methods */}
+            <div className="overflow-hidden rounded-2xl border border-border bg-card shadow-sm">
+              <div className="flex items-center gap-3 border-b border-border px-5 py-4">
+                <span className="flex size-9 items-center justify-center rounded-xl bg-sky-100 text-sky-700 dark:bg-sky-900/50 dark:text-sky-300">
+                  <Wallet size={16} />
+                </span>
+                <h2 className="font-semibold text-foreground">{t('paymentMethods')}</h2>
               </div>
-            )}
-          </div>
+              <div className="p-5">
+                {paymentMethods.length === 0 ? (
+                  <div className="flex min-h-40 flex-col items-center justify-center text-center">
+                    <span className="mb-3 flex size-12 items-center justify-center rounded-2xl bg-muted text-muted-foreground">
+                      <Wallet size={23} />
+                    </span>
+                    <p className="text-sm font-medium text-foreground">{t('noPaymentsYet')}</p>
+                  </div>
+                ) : (
+                  <div className="space-y-4">
+                    {paymentMethods.map((pm) => {
+                      const meta = PAYMENT_METHODS.find((m) => m.key === pm.method);
+                      const Icon = meta?.icon ?? Wallet;
+                      const label = meta
+                        ? tPos(BUILT_IN_PAYMENT_KEYS[meta.key])
+                        : pm.method === 'wallet'
+                          ? tPos('methodWallet')
+                          : String(pm.method || tCommon('unknown'));
+                      const percent =
+                        paymentMethodsTotal > 0
+                          ? Math.max(
+                              0,
+                              Math.min(
+                                100,
+                                Math.round((Number(pm.total) / paymentMethodsTotal) * 100),
+                              ),
+                            )
+                          : 0;
+                      return (
+                        <div key={pm.method ?? 'unknown'}>
+                          <div className="mb-1.5 flex items-center justify-between gap-3">
+                            <div className="flex min-w-0 items-center gap-2">
+                              <Icon size={14} className="text-muted-foreground" />
+                              <span className="truncate text-sm font-medium text-foreground">
+                                {label}
+                              </span>
+                            </div>
+                            <span className="shrink-0 text-sm font-semibold text-foreground">
+                              {fmt(Number(pm.total))}
+                            </span>
+                          </div>
+                          <div className="flex items-center gap-2">
+                            <div className="h-2 flex-1 overflow-hidden rounded-full bg-muted">
+                              <div
+                                className="h-full rounded-full bg-brand transition-all"
+                                style={{ width: `${percent}%` }}
+                              />
+                            </div>
+                            <span className="shrink-0 text-xs text-muted-foreground">
+                              {t('paymentMethodCount', { count: pm.count, percent })}
+                            </span>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            </div>
 
-          {/* Business Patterns */}
-          <div className="bg-card rounded-xl border border-border dark:border-border p-4 mt-4">
-            <div className="flex items-center gap-2 mb-1">
-              <BarChart3 size={16} className="text-muted-foreground" />
-              <h2 className="font-semibold text-foreground">{t('businessPatterns')}</h2>
-            </div>
-            <p className="text-xs text-muted-foreground mb-4">
-              {t('businessPatternsHint', { days: insights?.windowDays ?? 30 })}
-            </p>
-            <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
-              <div>
-                <p className="text-xs text-muted-foreground mb-1">{t('busiestHour')}</p>
-                <p className="text-lg font-bold text-foreground">
-                  {insights?.busiestHour ? formatHourLabel(insights.busiestHour.hour, locale) : t('notEnoughData')}
-                </p>
-                {insights?.busiestHour && (
-                  <p className="text-xs text-muted-foreground">{t('ordersCount', { count: insights.busiestHour.orderCount })}</p>
-                )}
+            {/* Business Patterns */}
+            <div className="overflow-hidden rounded-2xl border border-border bg-card shadow-sm">
+              <div className="border-b border-border px-5 py-4">
+                <div className="flex items-center gap-3">
+                  <span className="flex size-9 items-center justify-center rounded-xl bg-fuchsia-100 text-fuchsia-700 dark:bg-fuchsia-900/50 dark:text-fuchsia-300">
+                    <BarChart3 size={16} />
+                  </span>
+                  <div>
+                    <h2 className="font-semibold text-foreground">{t('businessPatterns')}</h2>
+                    <p className="mt-0.5 text-xs text-muted-foreground">
+                      {t('businessPatternsHint', { days: insights?.windowDays ?? 30 })}
+                    </p>
+                  </div>
+                </div>
               </div>
-              <div>
-                <p className="text-xs text-muted-foreground mb-1">{t('idlestHour')}</p>
-                <p className="text-lg font-bold text-foreground">
-                  {insights?.idlestHour ? formatHourLabel(insights.idlestHour.hour, locale) : t('notEnoughData')}
-                </p>
-                {insights?.idlestHour && (
-                  <p className="text-xs text-muted-foreground">{t('ordersCount', { count: insights.idlestHour.orderCount })}</p>
-                )}
-              </div>
-              <div>
-                <p className="text-xs text-muted-foreground mb-1">{t('busiestDay')}</p>
-                <p className="text-lg font-bold text-foreground">
-                  {insights?.busiestDayOfWeek ? formatWeekdayLabel(insights.busiestDayOfWeek.dayIndex, locale) : t('notEnoughData')}
-                </p>
-                {insights?.busiestDayOfWeek && (
-                  <p className="text-xs text-muted-foreground">{t('ordersCount', { count: insights.busiestDayOfWeek.orderCount })}</p>
-                )}
-              </div>
-              <div>
-                <p className="text-xs text-muted-foreground mb-1">{t('idlestDay')}</p>
-                <p className="text-lg font-bold text-foreground">
-                  {insights?.idlestDayOfWeek ? formatWeekdayLabel(insights.idlestDayOfWeek.dayIndex, locale) : t('notEnoughData')}
-                </p>
-                {insights?.idlestDayOfWeek && (
-                  <p className="text-xs text-muted-foreground">{t('ordersCount', { count: insights.idlestDayOfWeek.orderCount })}</p>
-                )}
+              <div className="grid grid-cols-2 gap-px bg-border lg:grid-cols-4">
+                <div className="bg-card p-4">
+                  <p className="text-xs text-muted-foreground">{t('busiestHour')}</p>
+                  <p className="mt-2 text-lg font-bold text-foreground">
+                    {insights?.busiestHour
+                      ? formatHourLabel(insights.busiestHour.hour, locale)
+                      : t('notEnoughData')}
+                  </p>
+                  {insights?.busiestHour && (
+                    <p className="mt-1 text-xs text-muted-foreground">
+                      {t('ordersCount', { count: insights.busiestHour.orderCount })}
+                    </p>
+                  )}
+                </div>
+                <div className="bg-card p-4">
+                  <p className="text-xs text-muted-foreground">{t('idlestHour')}</p>
+                  <p className="mt-2 text-lg font-bold text-foreground">
+                    {insights?.idlestHour
+                      ? formatHourLabel(insights.idlestHour.hour, locale)
+                      : t('notEnoughData')}
+                  </p>
+                  {insights?.idlestHour && (
+                    <p className="mt-1 text-xs text-muted-foreground">
+                      {t('ordersCount', { count: insights.idlestHour.orderCount })}
+                    </p>
+                  )}
+                </div>
+                <div className="bg-card p-4">
+                  <p className="text-xs text-muted-foreground">{t('busiestDay')}</p>
+                  <p className="mt-2 text-lg font-bold text-foreground">
+                    {insights?.busiestDayOfWeek
+                      ? formatWeekdayLabel(insights.busiestDayOfWeek.dayIndex, locale)
+                      : t('notEnoughData')}
+                  </p>
+                  {insights?.busiestDayOfWeek && (
+                    <p className="mt-1 text-xs text-muted-foreground">
+                      {t('ordersCount', { count: insights.busiestDayOfWeek.orderCount })}
+                    </p>
+                  )}
+                </div>
+                <div className="bg-card p-4">
+                  <p className="text-xs text-muted-foreground">{t('idlestDay')}</p>
+                  <p className="mt-2 text-lg font-bold text-foreground">
+                    {insights?.idlestDayOfWeek
+                      ? formatWeekdayLabel(insights.idlestDayOfWeek.dayIndex, locale)
+                      : t('notEnoughData')}
+                  </p>
+                  {insights?.idlestDayOfWeek && (
+                    <p className="mt-1 text-xs text-muted-foreground">
+                      {t('ordersCount', { count: insights.idlestDayOfWeek.orderCount })}
+                    </p>
+                  )}
+                </div>
               </div>
             </div>
           </div>

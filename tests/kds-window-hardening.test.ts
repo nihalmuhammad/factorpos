@@ -88,7 +88,11 @@ Module._load = function (request: string, parent: unknown, isMain: boolean) {
         showOpenDialog: async () => ({ canceled: false, filePaths: ['/tmp/flo-backup.db'] }),
         showMessageBox: async () => ({ response: 0 }),
       },
-      app: { getPath: () => '/tmp/flo-kds-test', getVersion: () => '3.2.0', getName: () => 'FloCafe' },
+      app: {
+        getPath: () => '/tmp/flo-kds-test',
+        getVersion: () => '3.2.0',
+        getName: () => 'FloCafe',
+      },
       BrowserWindow: FakeBrowserWindow,
       shell: {
         openExternal: async () => {
@@ -100,8 +104,11 @@ Module._load = function (request: string, parent: unknown, isMain: boolean) {
   if (request === './db') {
     const fakeDb = {
       prepare: (sql: string) => ({
-        all: () => (sql.includes('settings') ? [{ key: 'business_name', value: 'Flo Cafe' }] : [{ id: 1, name: 'Thermal Kitchen' }]),
-        get: () => ({ bill_count: 5, revenue: 120.50, covers: 12, count: 2 }),
+        all: () =>
+          sql.includes('settings')
+            ? [{ key: 'business_name', value: 'Flo Cafe' }]
+            : [{ id: 1, name: 'Thermal Kitchen' }],
+        get: () => ({ bill_count: 5, revenue: 120.5, covers: 12, count: 2 }),
         run: () => ({ changes: 1 }),
       }),
     };
@@ -131,7 +138,8 @@ Module._load = function (request: string, parent: unknown, isMain: boolean) {
   }
   if (request === './services/master-pin') {
     return {
-      authorizeMasterPin: (pin?: string) => (pin === '1234' ? { ok: true } : { ok: false, error: 'Invalid master PIN' }),
+      authorizeMasterPin: (pin?: string) =>
+        pin === '1234' ? { ok: true } : { ok: false, error: 'Invalid master PIN' },
       isMasterPinAvailable: () => true,
       isMasterPinSet: () => true,
     };
@@ -145,14 +153,17 @@ Module._load = function (request: string, parent: unknown, isMain: boolean) {
   if (request === './services/whatsapp') {
     return {
       getStatus: () => ({ connected: false, qrCode: null }),
-      sanitizeLogText: (error: unknown) => (error instanceof Error ? error.message : String(error))
-        .replace(/https?:\/\/\S+/gi, '[redacted-url]'),
+      sanitizeLogText: (error: unknown) =>
+        (error instanceof Error ? error.message : String(error)).replace(
+          /https?:\/\/\S+/gi,
+          '[redacted-url]',
+        ),
     };
   }
   return originalLoad.apply(this, arguments as any);
 };
 
-import { registerIpcHandlers } from '../main/ipc';
+const { registerIpcHandlers } = require('../main/ipc') as typeof import('../main/ipc');
 
 async function run(): Promise<void> {
   const evidenceLogs: string[] = [];
@@ -191,7 +202,10 @@ async function run(): Promise<void> {
     senderFrame: { frameToken: 'stale-frame', detached: false },
   };
   documentHandler(staleFrameEvent, '123e4567-e89b-42d3-a456-426614174005');
-  assert.deepEqual(staleFrameEvent.returnValue, { success: false, error: 'Invalid document registration' });
+  assert.deepEqual(staleFrameEvent.returnValue, {
+    success: false,
+    error: 'Invalid document registration',
+  });
 
   mainPosWindow.loadedUrl = 'http://evil.example.com/';
   const remoteDocumentEvent: any = {
@@ -202,32 +216,83 @@ async function run(): Promise<void> {
   assert.deepEqual(remoteDocumentEvent.returnValue, { error: 'Unauthorized sender' });
   mainPosWindow.loadedUrl = 'http://localhost:3001/';
 
-  const trustedLocalhost = { sender: { getURL: () => 'http://localhost:3001/' } };
-  const trusted127 = { sender: { getURL: () => 'http://127.0.0.1:3001/pos' } };
+  const trustedLocalhost = {
+    sender: {
+      ownerWindow: mainPosWindow,
+      mainFrame: mainPosWindow.webContents.mainFrame,
+      getURL: () => 'http://localhost:3001/',
+    },
+    senderFrame: mainPosWindow.webContents.mainFrame,
+  };
+  const trusted127 = {
+    sender: {
+      ownerWindow: mainPosWindow,
+      mainFrame: mainPosWindow.webContents.mainFrame,
+      getURL: () => 'http://127.0.0.1:3001/pos',
+    },
+    senderFrame: mainPosWindow.webContents.mainFrame,
+  };
+  const secondaryLocalhostWindow = {
+    sender: {
+      ownerWindow: otherWindow,
+      mainFrame: otherWindow.webContents.mainFrame,
+      getURL: () => 'http://localhost:3001/',
+    },
+    senderFrame: otherWindow.webContents.mainFrame,
+  };
+  const wrongPortLocalhost = {
+    sender: {
+      ownerWindow: mainPosWindow,
+      mainFrame: mainPosWindow.webContents.mainFrame,
+      getURL: () => 'http://localhost:3002/kds',
+    },
+    senderFrame: mainPosWindow.webContents.mainFrame,
+  };
+  const subframeLocalhost = {
+    sender: {
+      ownerWindow: mainPosWindow,
+      mainFrame: mainPosWindow.webContents.mainFrame,
+      getURL: () => 'http://localhost:3001/',
+    },
+    senderFrame: { frameToken: 'subframe-token', detached: false },
+  };
   const untrustedKds = { sender: { getURL: () => 'http://192.168.1.50:3002/kds' } };
   const untrustedExternal = { sender: { getURL: () => 'http://evil.example.com/' } };
   const untrustedSpoofedPrefix = { sender: { getURL: () => 'http://localhost.evil.com/' } };
-  const untrustedCredentialPrefix = { sender: { getURL: () => 'http://localhost:3001@evil.example/' } };
+  const untrustedCredentialPrefix = {
+    sender: { getURL: () => 'http://localhost:3001@evil.example/' },
+  };
   const untrustedNullSender = { sender: { getURL: () => null } };
 
-  // 1. Verify ALL non-PIN-gated handlers enforce sender identity
+  // 1. Verify ALL handlers that need no credential beyond sender identity enforce it
   const nonPinGatedHandlers = [
     { channel: 'db-health-check', args: [] },
-    { channel: 'db-apply-safe-fixes', args: [['finding-1']] },
+    { channel: 'pick-restore-file', args: [] },
     { channel: 'master-pin-status', args: [] },
     { channel: 'get-settings', args: [] },
-    { channel: 'set-setting', args: ['business_name', 'My Cafe'] },
+    { channel: 'set-setting', args: ['theme_mode', 'dark'] },
     { channel: 'whatsapp-get-status', args: [] },
     { channel: 'whatsapp-open-share', args: ['https://wa.me/15555550100?text=test'] },
     { channel: 'get-kds-info', args: [] },
     { channel: 'open-kds-window', args: [] },
     { channel: 'get-app-info', args: [] },
     { channel: 'get-printers', args: [] },
-    { channel: 'save-printer', args: [{ name: 'Kitchen Printer', type: 'thermal', connection_type: 'network' }] },
-    { channel: 'get-daily-summary', args: [] },
   ];
 
-  log(`\n[Phase 1] Verifying sender identity across ${nonPinGatedHandlers.length} non-PIN-gated IPC channels...`);
+  // These two channels are deleted rather than gated: writing a printer and
+  // reading the day's financial totals are permission-gated HTTP routes, and
+  // an origin-checked IPC channel is the wrong boundary for either one.
+  for (const removedChannel of ['save-printer', 'get-daily-summary']) {
+    assert.equal(
+      registered.has(removedChannel),
+      false,
+      `IPC channel '${removedChannel}' is no longer registered`,
+    );
+  }
+
+  log(
+    `\n[Phase 1] Verifying sender identity across ${nonPinGatedHandlers.length} non-PIN-gated IPC channels...`,
+  );
 
   for (const { channel, args } of nonPinGatedHandlers) {
     const listener = registered.get(channel);
@@ -235,43 +300,107 @@ async function run(): Promise<void> {
 
     // Test rejection of untrusted senders
     const kdsRes = await listener(untrustedKds, ...args);
-    assert.deepEqual(kdsRes, { error: 'Unauthorized sender' }, `${channel} rejected KDS origin sender`);
+    assert.deepEqual(
+      kdsRes,
+      { error: 'Unauthorized sender' },
+      `${channel} rejected KDS origin sender`,
+    );
 
     const extRes = await listener(untrustedExternal, ...args);
-    assert.deepEqual(extRes, { error: 'Unauthorized sender' }, `${channel} rejected external origin sender`);
+    assert.deepEqual(
+      extRes,
+      { error: 'Unauthorized sender' },
+      `${channel} rejected external origin sender`,
+    );
 
     const spoofRes = await listener(untrustedSpoofedPrefix, ...args);
-    assert.deepEqual(spoofRes, { error: 'Unauthorized sender' }, `${channel} rejected spoofed prefix sender`);
+    assert.deepEqual(
+      spoofRes,
+      { error: 'Unauthorized sender' },
+      `${channel} rejected spoofed prefix sender`,
+    );
 
     const credentialPrefixRes = await listener(untrustedCredentialPrefix, ...args);
-    assert.deepEqual(credentialPrefixRes, { error: 'Unauthorized sender' }, `${channel} rejected credential-prefix sender`);
+    assert.deepEqual(
+      credentialPrefixRes,
+      { error: 'Unauthorized sender' },
+      `${channel} rejected credential-prefix sender`,
+    );
 
     const nullRes = await listener(untrustedNullSender, ...args);
     assert.deepEqual(nullRes, { error: 'Unauthorized sender' }, `${channel} rejected null sender`);
 
+    const secondaryWinRes = await listener(secondaryLocalhostWindow, ...args);
+    assert.deepEqual(
+      secondaryWinRes,
+      { error: 'Unauthorized sender' },
+      `${channel} rejected secondary BrowserWindow sender even on localhost:3001`,
+    );
+
+    const wrongPortRes = await listener(wrongPortLocalhost, ...args);
+    assert.deepEqual(
+      wrongPortRes,
+      { error: 'Unauthorized sender' },
+      `${channel} rejected wrong localhost port sender`,
+    );
+
+    const subframeRes = await listener(subframeLocalhost, ...args);
+    assert.deepEqual(
+      subframeRes,
+      { error: 'Unauthorized sender' },
+      `${channel} rejected non-main frame sender`,
+    );
+
     // Test acceptance of trusted localhost and 127.0.0.1 senders
     const localRes = await listener(trustedLocalhost, ...args);
-    assert.notDeepEqual(localRes, { error: 'Unauthorized sender' }, `${channel} accepted localhost sender`);
+    assert.notDeepEqual(
+      localRes,
+      { error: 'Unauthorized sender' },
+      `${channel} accepted localhost sender`,
+    );
 
     const loopbackRes = await listener(trusted127, ...args);
-    assert.notDeepEqual(loopbackRes, { error: 'Unauthorized sender' }, `${channel} accepted 127.0.0.1 sender`);
+    assert.notDeepEqual(
+      loopbackRes,
+      { error: 'Unauthorized sender' },
+      `${channel} accepted 127.0.0.1 sender`,
+    );
 
     log(`  ✓ ${channel}: successfully blocks untrusted senders and admits trusted origins`);
   }
 
   const openShareListener = registered.get('whatsapp-open-share')!;
   const invalidShareRes = await openShareListener(trustedLocalhost, 'https://example.com/');
-  assert.deepEqual(invalidShareRes, { success: false, error: 'Invalid WhatsApp share URL' }, 'WhatsApp opener rejects non-wa.me URLs');
+  assert.deepEqual(
+    invalidShareRes,
+    { success: false, error: 'Invalid WhatsApp share URL' },
+    'WhatsApp opener rejects non-wa.me URLs',
+  );
   failExternalOpen = true;
-  const failedShareRes = await openShareListener(trustedLocalhost, 'https://wa.me/15555550100?text=test');
-  assert.deepEqual(failedShareRes, { success: false, error: 'Failed to open WhatsApp' }, 'WhatsApp opener reports shell failure');
+  const failedShareRes = await openShareListener(
+    trustedLocalhost,
+    'https://wa.me/15555550100?text=test',
+  );
+  assert.deepEqual(
+    failedShareRes,
+    { success: false, error: 'Failed to open WhatsApp' },
+    'WhatsApp opener reports shell failure',
+  );
   failExternalOpen = false;
-  const successfulShareRes = await openShareListener(trustedLocalhost, 'https://wa.me/15555550100?text=test');
+  const successfulShareRes = await openShareListener(
+    trustedLocalhost,
+    'https://wa.me/15555550100?text=test',
+  );
   assert.deepEqual(successfulShareRes, { success: true }, 'WhatsApp opener reports shell success');
 
   // 2. PIN-gated handlers enforce master PIN
   log('\n[Phase 2] Verifying PIN-gated handlers require authorization...');
   const backupListener = registered.get('backup-database')!;
+  assert.deepEqual(
+    await backupListener(untrustedExternal, '1234'),
+    { error: 'Unauthorized sender' },
+    'backup-database rejected an untrusted sender even with a valid master PIN',
+  );
   const invalidPinRes = await backupListener(trustedLocalhost, 'wrong-pin');
   assert.equal(invalidPinRes.success, false, 'backup rejected invalid PIN');
   assert.equal(invalidPinRes.error, 'Invalid master PIN');
@@ -279,20 +408,96 @@ async function run(): Promise<void> {
   assert.equal(validPinRes.success, true, 'backup accepted valid PIN');
   log('  ✓ backup-database: successfully protected by master PIN');
 
+  // db-apply-safe-fixes now needs a master PIN, so it is no longer one of the
+  // handlers that need nothing beyond sender identity. Its sender check is
+  // verified here instead, next to its PIN check.
+  const safeFixesListener = registered.get('db-apply-safe-fixes')!;
+  assert.deepEqual(
+    await safeFixesListener(untrustedExternal),
+    { error: 'Unauthorized sender' },
+    'db-apply-safe-fixes rejected an untrusted sender',
+  );
+  const noPinRes = await safeFixesListener(trustedLocalhost, undefined);
+  assert.equal(noPinRes.success, false, 'db-apply-safe-fixes rejected a missing master PIN');
+  const badPinRes = await safeFixesListener(trustedLocalhost, 'wrong-pin');
+  assert.equal(badPinRes.success, false, 'db-apply-safe-fixes rejected an invalid master PIN');
+  // Assert the real success shape. A bare `notEqual(res.success, false)` is
+  // satisfied by any result that has no `success` key at all, so a handler that
+  // took the PIN and then silently skipped the repairs still read as a pass.
+  const goodPinRes = await safeFixesListener(trustedLocalhost, '1234');
+  assert.deepEqual(
+    goodPinRes,
+    { applied: ['fix1'], skipped: [], errors: [] },
+    'db-apply-safe-fixes ran the repairs for a valid master PIN',
+  );
+  log('  ✓ db-apply-safe-fixes: sender-checked and protected by master PIN');
+
+  // A master PIN does not replace the origin check for restore-backup or
+  // db-initialize, so assert each sender gate separately.
+  const restoreListener = registered.get('restore-backup')!;
+  assert.deepEqual(
+    await restoreListener(untrustedExternal, '1234'),
+    { error: 'Unauthorized sender' },
+    'restore-backup rejected an untrusted sender even with a valid master PIN',
+  );
+  assert.deepEqual(
+    await restoreListener(untrustedSpoofedPrefix, '1234'),
+    { error: 'Unauthorized sender' },
+    'restore-backup rejected a spoofed prefix sender even with a valid master PIN',
+  );
+  const noPinRestore = await restoreListener(trustedLocalhost);
+  assert.equal(noPinRestore.success, false, 'restore-backup rejected a missing master PIN');
+  assert.equal(noPinRestore.error, 'Invalid master PIN');
+  log('  ✓ restore-backup: sender-checked and protected by master PIN');
+
+  const initializeListener = registered.get('db-initialize')!;
+  assert.deepEqual(
+    await initializeListener(untrustedExternal, { pin: '1234', confirmationPhrase: 'INITIALIZE' }),
+    { error: 'Unauthorized sender' },
+    'db-initialize rejected an untrusted sender even with a valid master PIN',
+  );
+  assert.deepEqual(
+    await initializeListener(untrustedCredentialPrefix, {
+      pin: '1234',
+      confirmationPhrase: 'INITIALIZE',
+    }),
+    { error: 'Unauthorized sender' },
+    'db-initialize rejected a credential-prefix sender even with a valid master PIN',
+  );
+  const noPinInitialize = await initializeListener(trustedLocalhost, {
+    pin: undefined,
+    confirmationPhrase: 'INITIALIZE',
+  });
+  assert.equal(noPinInitialize.success, false, 'db-initialize rejected a missing master PIN');
+  assert.equal(noPinInitialize.error, 'Invalid master PIN');
+  log('  ✓ db-initialize: sender-checked and protected by master PIN');
+
   // 3. KDS window webPreferences: privileged preload bridge removed, isolation intact
   log('\n[Phase 3] Verifying KDS window construction and bridge removal...');
   while (windows.length > 0) {
     const w = windows.pop();
-    w.close();
+    if (w !== mainPosWindow) w.close();
   }
   const openKdsListener = registered.get('open-kds-window')!;
   await openKdsListener(trustedLocalhost);
   assert.equal(windows.length, 1, 'a KDS window is created');
   const kdsWindow = windows[0];
 
-  assert.equal(kdsWindow.webPreferences.preload, undefined, 'KDS window webPreferences.preload is undefined (bridge removed)');
-  assert.equal(kdsWindow.webPreferences.contextIsolation, true, 'context isolation remains enabled');
-  assert.equal(kdsWindow.webPreferences.nodeIntegration, false, 'node integration remains disabled');
+  assert.equal(
+    kdsWindow.webPreferences.preload,
+    undefined,
+    'KDS window webPreferences.preload is undefined (bridge removed)',
+  );
+  assert.equal(
+    kdsWindow.webPreferences.contextIsolation,
+    true,
+    'context isolation remains enabled',
+  );
+  assert.equal(
+    kdsWindow.webPreferences.nodeIntegration,
+    false,
+    'node integration remains disabled',
+  );
   // gh-513: open-kds-window appends the current palette via appendThemeQueryParam so
   // the KDS window's pre-paint script learns the theme without preload access.
   // Assert both the origin/path invariance and that the theme param is one of the
@@ -302,31 +507,68 @@ async function run(): Promise<void> {
     /^http:\/\/192\.168\.1\.50:3002\/kds\?theme=(?:light|dark)$/.test(kdsWindow.loadedUrl),
     `KDS window loads a themed URL (got ${kdsWindow.loadedUrl})`,
   );
-  log('  ✓ BrowserWindow webPreferences: preload=undefined, contextIsolation=true, nodeIntegration=false');
+  log(
+    '  ✓ BrowserWindow webPreferences: preload=undefined, contextIsolation=true, nodeIntegration=false',
+  );
 
   // 4. Navigation confinement to KDS origin and window-open denial
   log('\n[Phase 4] Verifying KDS window navigation confinement...');
   const navigateHandlers = kdsWindow.webContents.handlers.get('will-navigate')!;
-  assert.ok(navigateHandlers && navigateHandlers.length === 1, 'will-navigate handler is installed');
+  assert.ok(
+    navigateHandlers && navigateHandlers.length === 1,
+    'will-navigate handler is installed',
+  );
   const navigate = navigateHandlers[0];
 
   let prevented = false;
-  navigate({ preventDefault: () => { prevented = true; } }, 'http://evil.example.com/');
+  navigate(
+    {
+      preventDefault: () => {
+        prevented = true;
+      },
+    },
+    'http://evil.example.com/',
+  );
   assert.equal(prevented, true, 'navigation to external origin is prevented');
 
   prevented = false;
-  navigate({ preventDefault: () => { prevented = true; } }, 'http://192.168.1.50:3002/kds/station/1');
+  navigate(
+    {
+      preventDefault: () => {
+        prevented = true;
+      },
+    },
+    'http://192.168.1.50:3002/kds/station/1',
+  );
   assert.equal(prevented, false, 'navigation within KDS origin is allowed');
 
   prevented = false;
-  navigate({ preventDefault: () => { prevented = true; } }, 'http://localhost:3001/');
+  navigate(
+    {
+      preventDefault: () => {
+        prevented = true;
+      },
+    },
+    'http://localhost:3001/',
+  );
   assert.equal(prevented, true, 'navigation to main POS origin is prevented');
 
   prevented = false;
-  navigate({ preventDefault: () => { prevented = true; } }, 'javascript:alert(1)');
+  navigate(
+    {
+      preventDefault: () => {
+        prevented = true;
+      },
+    },
+    'javascript:alert(1)',
+  );
   assert.equal(prevented, true, 'navigation to javascript pseudo-protocol is prevented');
 
-  assert.deepEqual(kdsWindow.webContents.windowOpenHandler!(), { action: 'deny' }, 'new windows via window.open are denied');
+  assert.deepEqual(
+    kdsWindow.webContents.windowOpenHandler!(),
+    { action: 'deny' },
+    'new windows via window.open are denied',
+  );
   log('  ✓ will-navigate strictly confines navigation to http://192.168.1.50:3002');
   log('  ✓ windowOpenHandler denies all popup/new-window requests');
 

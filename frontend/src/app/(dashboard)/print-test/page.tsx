@@ -3,14 +3,30 @@
 import { useMemo, useState } from 'react';
 import { Printer, FileText, MessageCircle, Download, Usb, Globe } from 'lucide-react';
 import { Button } from '@/components/ui/button';
-import { usePrinterStore } from '@/hooks/usePrinter';
-import { showPrintLanguageLoadErrorsToast, showPrintWarningsToast } from '@/lib/printer/warnings-toast';
+import {
+  PrintCancelledOnTenantChangeError,
+  isPrintCancelledOnTenantChangeError,
+  usePrinterStore,
+} from '@/hooks/usePrinter';
+import { ensureReceiptSettingsLoaded } from '@/hooks/useReceiptSettingsSync';
+import {
+  showPrintLanguageLoadErrorsToast,
+  showPrintWarningsToast,
+} from '@/lib/printer/warnings-toast';
 import { usePosSettingsStore } from '@/store/pos-settings';
 import { useAuthStore } from '@/store/auth';
 import { printerService } from '@/lib/printer/PrinterService';
-import { createTestBill, createTestOrder, createTestTenant, createTestCustomer } from '@/lib/printer/test-data';
+import {
+  createTestBill,
+  createTestOrder,
+  createTestTenant,
+  createTestCustomer,
+} from '@/lib/printer/test-data';
 import { printWebBill, generateBillHtml } from '@/lib/printer/web-print';
-import { ensurePrintLanguagesLoaded, resolveBillPrintLanguages } from '@/lib/printer/print-document';
+import {
+  ensurePrintLanguagesLoaded,
+  resolveReadyBillPrintLanguages,
+} from '@/lib/printer/print-document';
 import { generateKotHtml } from '@/lib/printer/kot-web-print';
 import { shareBillViaWhatsApp, getWhatsAppMessage } from '@/lib/whatsapp-share';
 import toast from 'react-hot-toast';
@@ -23,23 +39,64 @@ export default function PrintTestPage() {
   const [paperWidth, setPaperWidth] = useState<PaperWidth>(58);
   const [testing, setTesting] = useState(false);
 
-  const { printBill, printTaxBill, printKot, printMethod, setPrintMethod, downloadLastReceipt, lastPrintedBytes, status } = usePrinterStore();
+  const {
+    printBill,
+    printTaxBill,
+    printKot,
+    printMethod,
+    setPrintMethod,
+    downloadLastReceipt,
+    lastPrintedBytes,
+    status,
+  } = usePrinterStore();
   const currentTenant = useAuthStore((s) => s.currentTenant);
   const kotPrintingEnabled = usePosSettingsStore((s) => s.kotPrintingEnabled);
   const printerPaperSize = usePosSettingsStore((s) => s.printerPaperSize);
   const t = useTranslations('printTest');
   const tCommon = useTranslations('common');
-  const effectiveTestMode: TestMode = !kotPrintingEnabled && testMode === 'kot' ? 'receipt' : testMode;
+  const effectiveTestMode: TestMode =
+    !kotPrintingEnabled && testMode === 'kot' ? 'receipt' : testMode;
 
   const testBill = useMemo(() => createTestBill(), []);
   const testOrder = useMemo(() => createTestOrder(), []);
+  // Country/currency reflect the signed-in store, not the synthetic
+  // defaults, so a non-Indian merchant's test print isn't shown in rupees.
   const testTenant = useMemo(
-    () => createTestTenant({ timezone: currentTenant?.timezone || 'Asia/Kolkata' }),
-    [currentTenant?.timezone],
+    () =>
+      createTestTenant({
+        timezone: currentTenant?.timezone || '',
+        country: currentTenant?.country || '',
+        currency: currentTenant?.currency || '',
+      }),
+    [currentTenant?.timezone, currentTenant?.country, currentTenant?.currency],
   );
   const testCustomer = useMemo(() => createTestCustomer(), []);
 
+  const assertSameTenant = (
+    tenantIdAtStart: number | null,
+    reservedWindow?: Window | null,
+  ): void => {
+    if ((useAuthStore.getState().currentTenant?.id ?? null) === tenantIdAtStart) return;
+    if (reservedWindow && !reservedWindow.closed) reservedWindow.close();
+    throw new PrintCancelledOnTenantChangeError();
+  };
+
+  const resolveHydratedShowLargeOrderNumber = async (
+    tenantIdAtStart: number | null,
+    reservedWindow?: Window | null,
+  ): Promise<boolean> => {
+    const isSameTenant = () =>
+      (useAuthStore.getState().currentTenant?.id ?? null) === tenantIdAtStart;
+    const ready = await ensureReceiptSettingsLoaded(tenantIdAtStart).catch(() => isSameTenant());
+    if (!ready || !isSameTenant()) {
+      if (reservedWindow && !reservedWindow.closed) reservedWindow.close();
+      throw new PrintCancelledOnTenantChangeError();
+    }
+    return usePosSettingsStore.getState().billShowLargeOrderNumber;
+  };
+
   const handlePrint = async () => {
+    const tenantIdAtStart = useAuthStore.getState().currentTenant?.id ?? null;
     setTesting(true);
     try {
       switch (effectiveTestMode) {
@@ -47,9 +104,28 @@ export default function PrintTestPage() {
           if (printMethod === 'browser') {
             // Browser test surface runs through the real document-driven
             // web-print path (#444).
-            const printWarnings = await printWebBill(testBill, testTenant, {
-              paperSize: paperWidth === 80 ? 'thermal80' : 'thermal58',
-            });
+            const reservedWindow =
+              typeof window !== 'undefined'
+                ? window.open('', '_blank', 'width=800,height=600')
+                : null;
+            const showLargeOrderNumber = await resolveHydratedShowLargeOrderNumber(
+              tenantIdAtStart,
+              reservedWindow,
+            );
+            const languages = await resolveReadyBillPrintLanguages();
+            assertSameTenant(tenantIdAtStart, reservedWindow);
+            await ensurePrintLanguagesLoaded(languages);
+            assertSameTenant(tenantIdAtStart, reservedWindow);
+            const printWarnings = await printWebBill(
+              testBill,
+              testTenant,
+              {
+                paperSize: paperWidth === 80 ? 'thermal80' : 'thermal58',
+                showLargeOrderNumber,
+                languages,
+              },
+              reservedWindow,
+            );
             toast.success(t('browserDialogOpened'));
             showPrintWarningsToast(printWarnings);
           } else {
@@ -60,13 +136,32 @@ export default function PrintTestPage() {
           break;
         case 'tax':
           if (printMethod === 'browser') {
-            const printWarnings = await printWebBill(testBill, testTenant, {
-              paperSize: paperWidth === 80 ? 'thermal80' : 'thermal58',
-              includeTaxId: true,
-              taxRegistrationNumber: 'TAXID-0001',
-              address: '123 Main Street, Mumbai - 400001',
-              phone: '+91 9876543210',
-            });
+            const reservedWindow =
+              typeof window !== 'undefined'
+                ? window.open('', '_blank', 'width=800,height=600')
+                : null;
+            const showLargeOrderNumber = await resolveHydratedShowLargeOrderNumber(
+              tenantIdAtStart,
+              reservedWindow,
+            );
+            const languages = await resolveReadyBillPrintLanguages();
+            assertSameTenant(tenantIdAtStart, reservedWindow);
+            await ensurePrintLanguagesLoaded(languages);
+            assertSameTenant(tenantIdAtStart, reservedWindow);
+            const printWarnings = await printWebBill(
+              testBill,
+              testTenant,
+              {
+                paperSize: paperWidth === 80 ? 'thermal80' : 'thermal58',
+                includeTaxId: true,
+                taxRegistrationNumber: 'TAXID-0001',
+                address: '123 Main Street, Mumbai - 400001',
+                phone: '+91 9876543210',
+                showLargeOrderNumber,
+                languages,
+              },
+              reservedWindow,
+            );
             toast.success(t('browserDialogOpened'));
             showPrintWarningsToast(printWarnings);
           } else {
@@ -88,42 +183,90 @@ export default function PrintTestPage() {
           }
           if (printMethod === 'browser') {
             // Render semantic KOT HTML and preload ticket locale if different from UI language.
-            const { resolveKotTicketLanguage } = await import('@/lib/printer/kot-web-print');
-            const kotLanguage = resolveKotTicketLanguage();
-            const failedLanguages = await ensurePrintLanguagesLoaded([kotLanguage]);
-            const html = generateKotHtml(testOrder, { paperWidth, language: kotLanguage, stationName: t('kitchenStation'), timezone: testTenant.timezone });
-            await printerService.printViaBrowser(html, paperWidth);
-            toast.success(t('browserDialogOpened'));
-            showPrintWarningsToast(failedLanguages.map((language) => ({
-              field: 'kot language',
-              text: language,
-              message: t('kotLanguageLoadError', { language }),
-              kind: 'locale' as const,
-            })));
+            const reservedWindow = printerService.reserveBrowserPrintWindow();
+            try {
+              const showLargeOrderNumber = await resolveHydratedShowLargeOrderNumber(
+                tenantIdAtStart,
+                reservedWindow,
+              );
+              const { resolveReadyKotTicketLanguage } = await import('@/lib/printer/kot-web-print');
+              const kotLanguage = await resolveReadyKotTicketLanguage();
+              assertSameTenant(tenantIdAtStart, reservedWindow);
+              const failedLanguages = await ensurePrintLanguagesLoaded([kotLanguage]);
+              assertSameTenant(tenantIdAtStart, reservedWindow);
+              const html = generateKotHtml(testOrder, {
+                paperWidth,
+                language: kotLanguage,
+                stationName: t('kitchenStation'),
+                timezone: testTenant.timezone,
+                showLargeOrderNumber,
+              });
+              await printerService.printViaBrowser(html, paperWidth, reservedWindow);
+              toast.success(t('browserDialogOpened'));
+              showPrintWarningsToast(
+                failedLanguages.map((language) => ({
+                  field: 'kot language',
+                  text: language,
+                  message: t('kotLanguageLoadError', { language }),
+                  kind: 'locale' as const,
+                })),
+              );
+            } catch (err) {
+              if (reservedWindow && !reservedWindow.closed) reservedWindow.close();
+              throw err;
+            }
           } else {
-            const printWarnings = await printKot(testOrder, { paperWidth, stationName: t('kitchenStation') });
+            const printWarnings = await printKot(testOrder, {
+              paperWidth,
+              stationName: t('kitchenStation'),
+            });
             toast.success(t('kotPrinted'));
             showPrintWarningsToast(printWarnings);
           }
           break;
         case 'web-print': {
-          const printWarnings = await printWebBill(testBill, testTenant, { paperSize: printerPaperSize, includeTaxId: true });
+          const reservedWindow =
+            typeof window !== 'undefined'
+              ? window.open('', '_blank', 'width=800,height=600')
+              : null;
+          const showLargeOrderNumber = await resolveHydratedShowLargeOrderNumber(
+            tenantIdAtStart,
+            reservedWindow,
+          );
+          const languages = await resolveReadyBillPrintLanguages();
+          assertSameTenant(tenantIdAtStart, reservedWindow);
+          await ensurePrintLanguagesLoaded(languages);
+          assertSameTenant(tenantIdAtStart, reservedWindow);
+          const printWarnings = await printWebBill(
+            testBill,
+            testTenant,
+            {
+              paperSize: printerPaperSize,
+              includeTaxId: true,
+              showLargeOrderNumber,
+              languages,
+            },
+            reservedWindow,
+          );
           toast.success(t('webPrintDialogOpened'));
           showPrintWarningsToast(printWarnings);
           break;
         }
         case 'whatsapp':
-          if (!await shareBillViaWhatsApp(testBill, testCustomer, testTenant, {
-            pointsEarned: 50,
-            walletBalance: 200,
-          })) {
+          if (
+            !(await shareBillViaWhatsApp(testBill, testCustomer, testTenant, {
+              pointsEarned: 50,
+              walletBalance: 200,
+            }))
+          ) {
             toast.error(tCommon('somethingWrong'));
           } else {
             toast.success(t('whatsappOpened'));
           }
           break;
       }
-    } catch {
+    } catch (err) {
+      if (isPrintCancelledOnTenantChangeError(err)) return;
       toast.error(t('failedWithReason', { message: tCommon('somethingWrong') }));
     } finally {
       setTesting(false);
@@ -131,8 +274,21 @@ export default function PrintTestPage() {
   };
 
   const handleDownloadHtml = async () => {
-    const languages = resolveBillPrintLanguages();
-    const failedLanguages = await ensurePrintLanguagesLoaded(languages);
+    const tenantIdAtStart = useAuthStore.getState().currentTenant?.id ?? null;
+    let showLargeOrderNumber: boolean;
+    let languages: Awaited<ReturnType<typeof resolveReadyBillPrintLanguages>>;
+    let failedLanguages: Awaited<ReturnType<typeof ensurePrintLanguagesLoaded>>;
+    try {
+      showLargeOrderNumber = await resolveHydratedShowLargeOrderNumber(tenantIdAtStart);
+      languages = await resolveReadyBillPrintLanguages();
+      assertSameTenant(tenantIdAtStart);
+      failedLanguages = await ensurePrintLanguagesLoaded(languages);
+      assertSameTenant(tenantIdAtStart);
+    } catch (err) {
+      if (isPrintCancelledOnTenantChangeError(err)) return;
+      toast.error(t('failedWithReason', { message: tCommon('somethingWrong') }));
+      return;
+    }
     if (failedLanguages.length > 0) {
       showPrintLanguageLoadErrorsToast(failedLanguages);
       return;
@@ -143,6 +299,7 @@ export default function PrintTestPage() {
       taxRegistrationNumber: 'TAXID-0001',
       address: '123 Main Street, Mumbai - 400001',
       phone: '+91 9876543210',
+      showLargeOrderNumber,
       languages,
     });
 
@@ -170,7 +327,9 @@ export default function PrintTestPage() {
     { value: 'tax', label: t('optionTaxBill'), icon: Printer },
     // Hidden entirely when KOT printing is disabled — this is a manual
     // "Print KOT" action, which must never be reachable in that state (#133).
-    ...(kotPrintingEnabled ? [{ value: 'kot' as TestMode, label: t('optionKot'), icon: Printer }] : []),
+    ...(kotPrintingEnabled
+      ? [{ value: 'kot' as TestMode, label: t('optionKot'), icon: Printer }]
+      : []),
     { value: 'web-print', label: t('optionWebPrint'), icon: FileText },
     { value: 'whatsapp', label: t('optionWhatsapp'), icon: MessageCircle },
   ];
@@ -208,7 +367,7 @@ export default function PrintTestPage() {
 
         <div className="bg-card rounded-xl border border-border p-6 mb-6">
           <h2 className="font-semibold text-foreground mb-4">{t('printerSettings')}</h2>
-          
+
           <div className="space-y-4">
             <div>
               <label className="block text-sm font-medium text-foreground mb-2">
@@ -267,9 +426,7 @@ export default function PrintTestPage() {
                 </button>
               </div>
               <p className="text-xs text-muted-foreground mt-2">
-                {printMethod === 'escpos' 
-                  ? t('escposHint', { status })
-                  : t('browserHint')}
+                {printMethod === 'escpos' ? t('escposHint', { status }) : t('browserHint')}
               </p>
             </div>
 
@@ -290,32 +447,19 @@ export default function PrintTestPage() {
         </div>
 
         <div className="flex gap-3">
-          <Button
-            onClick={handlePrint}
-            disabled={testing}
-            className="flex-1"
-            size="lg"
-          >
+          <Button onClick={handlePrint} disabled={testing} className="flex-1" size="lg">
             {testing ? t('printing') : t('runTest')}
           </Button>
 
           {effectiveTestMode === 'web-print' && (
-            <Button
-              onClick={handleDownloadHtml}
-              variant="outline"
-              size="lg"
-            >
+            <Button onClick={handleDownloadHtml} variant="outline" size="lg">
               <Download size={18} className="me-2" />
               {t('downloadHtml')}
             </Button>
           )}
 
           {effectiveTestMode === 'whatsapp' && (
-            <Button
-              onClick={handleCopyWhatsappText}
-              variant="outline"
-              size="lg"
-            >
+            <Button onClick={handleCopyWhatsappText} variant="outline" size="lg">
               {t('copyText')}
             </Button>
           )}
@@ -324,12 +468,16 @@ export default function PrintTestPage() {
         <div className="mt-6 p-4 bg-muted rounded-lg">
           <h3 className="font-medium text-foreground mb-2">{t('dataPreview')}</h3>
           <pre className="text-xs text-muted-foreground overflow-x-auto">
-            {JSON.stringify({
-              bill: testBill.bill_number,
-              total: testBill.total,
-              items: testOrder.items?.length,
-              customer: testCustomer.name,
-            }, null, 2)}
+            {JSON.stringify(
+              {
+                bill: testBill.bill_number,
+                total: testBill.total,
+                items: testOrder.items?.length,
+                customer: testCustomer.name,
+              },
+              null,
+              2,
+            )}
           </pre>
         </div>
       </div>

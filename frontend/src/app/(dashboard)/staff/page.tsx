@@ -1,17 +1,20 @@
 'use client';
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import axios from 'axios';
 import api from '@/lib/api';
 import { Button } from '@/components/ui/button';
 import toast from 'react-hot-toast';
-import { Plus, X, Edit, RotateCcw, Eye, EyeOff } from 'lucide-react';
+import { Plus, X, Edit, RotateCcw, Eye, EyeOff, KeyRound } from 'lucide-react';
 import type { Staff } from '@/lib/types';
 import { useTranslations, type AppConfig } from 'use-intl';
 import { useAuthStore } from '@/store/auth';
 import { PermissionMatrix } from '@/components/settings/PermissionMatrix';
+import { PermissionAuditLog } from '@/components/settings/PermissionAuditLog';
+import { validatePassword } from '@shared/password-policy';
 import { ROLE_ACCESS, ROLE_KEYS, hasRole } from '@shared/role-permissions';
 import { ROLE_LABEL_KEYS } from '@/lib/i18n-enums';
+import { tenantCan } from '@/lib/permissions';
 
 const VALID_ROLES = ROLE_KEYS;
 
@@ -43,14 +46,21 @@ export default function StaffPage() {
   const tCommon = useTranslations('common');
   const tAuth = useTranslations('auth');
   const tSetup = useTranslations('setup');
-  const { currentTenant } = useAuthStore();
-  const canViewPermissionMatrix = hasRole(currentTenant?.role, ROLE_ACCESS.ownerManager);
+  const { currentTenant, replaceSessionToken } = useAuthStore();
+  const canManagePermissions = tenantCan(currentTenant, 'authorization.manage');
+  const canManageStaff = tenantCan(currentTenant, 'staff.operational.manage');
+  const canManagePrivilegedStaff = tenantCan(currentTenant, 'staff.privileged.manage');
+  const canResetCredentials = tenantCan(currentTenant, 'staff.credentials.reset');
   const [staff, setStaff] = useState<Staff[]>([]);
+  const [kitchenStations, setKitchenStations] = useState<{ id: string; name: string }[]>([]);
+  const [kdsEnabled, setKdsEnabled] = useState(true);
   const [, setLoading] = useState(true);
   const [showForm, setShowForm] = useState(false);
   const [editingStaff, setEditingStaff] = useState<Staff | null>(null);
   const [showResetPw, setShowResetPw] = useState(false);
   const [resetPwStaff, setResetPwStaff] = useState<Staff | null>(null);
+  const [showResetPin, setShowResetPin] = useState(false);
+  const [resetPinStaff, setResetPinStaff] = useState<Staff | null>(null);
   const [form, setForm] = useState({
     name: '',
     email: '',
@@ -58,17 +68,28 @@ export default function StaffPage() {
     confirmPassword: '',
     role: 'server',
     pin: '',
+    station_ids: [] as string[],
   });
   const [newPassword, setNewPassword] = useState('');
   const [confirmNewPassword, setConfirmNewPassword] = useState('');
+  const [newResetPin, setNewResetPin] = useState('');
+  const [confirmNewResetPin, setConfirmNewResetPin] = useState('');
   const [showPassword, setShowPassword] = useState(false);
   const [showPin, setShowPin] = useState(false);
   const [showResetPassword, setShowResetPassword] = useState(false);
+  const [showResetPinValue, setShowResetPinValue] = useState(false);
+  const addTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const editTriggerRefs = useRef<Record<string, HTMLButtonElement | null>>({});
+  const resetPwTriggerRefs = useRef<Record<string, HTMLButtonElement | null>>({});
+  const resetPinTriggerRefs = useRef<Record<string, HTMLButtonElement | null>>({});
+  const formTriggerRef = useRef<HTMLElement | null>(null);
+  const resetPwTriggerRef = useRef<HTMLElement | null>(null);
+  const resetPinTriggerRef = useRef<HTMLElement | null>(null);
 
   const fetchStaff = async () => {
     try {
-      const { data } = await api.get('/staff');
-      setStaff(data.staff || []);
+      const { data } = await api.get(canManagePermissions ? '/authorization/users' : '/staff');
+      setStaff(data.staff || data.users || []);
     } catch {
       toast.error(t('failedToLoad'));
     } finally {
@@ -77,30 +98,58 @@ export default function StaffPage() {
   };
 
   useEffect(() => {
-    api.get('/staff')
-      .then(({ data }) => setStaff(data.staff || []))
+    api
+      .get(canManagePermissions ? '/authorization/users' : '/staff')
+      .then(({ data }) => setStaff(data.staff || data.users || []))
       .catch(() => toast.error(t('failedToLoad')))
       .finally(() => setLoading(false));
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+    api
+      .get('/kitchen-stations')
+      .then(({ data }) => setKitchenStations(data.kitchenStations || []))
+      .catch(() => setKitchenStations([]));
+    api
+      .get('/settings/kds_enabled')
+      .then(({ data }) => setKdsEnabled(data.setting?.value !== 'false'))
+      .catch(() => setKdsEnabled(true));
+    // oxlint-disable-next-line react-hooks/exhaustive-deps
+  }, [canManagePermissions]);
 
-  const openAdd = () => {
+  const openAdd = (e?: React.MouseEvent<HTMLButtonElement>) => {
+    formTriggerRef.current = e?.currentTarget ?? addTriggerRef.current;
     setEditingStaff(null);
-    setForm({ name: '', email: '', password: '', confirmPassword: '', role: 'server', pin: '' });
+    setForm({
+      name: '',
+      email: '',
+      password: '',
+      confirmPassword: '',
+      role: 'server',
+      pin: '',
+      station_ids: [],
+    });
     setShowPassword(false);
     setShowPin(false);
     setShowForm(true);
   };
 
-  const openEdit = (s: Staff) => {
+  const openEdit = (s: Staff, e?: React.MouseEvent<HTMLButtonElement>) => {
+    formTriggerRef.current = e?.currentTarget ?? editTriggerRefs.current[s.id] ?? null;
     setEditingStaff(s);
-    setForm({ name: s.name, email: s.email || '', password: '', confirmPassword: '', role: s.role, pin: '' });
+    setForm({
+      name: s.name,
+      email: s.email || '',
+      password: '',
+      confirmPassword: '',
+      role: s.role,
+      pin: '',
+      station_ids: [],
+    });
     setShowPassword(false);
     setShowPin(false);
     setShowForm(true);
   };
 
-  const openResetPw = (s: Staff) => {
+  const openResetPw = (s: Staff, e?: React.MouseEvent<HTMLButtonElement>) => {
+    resetPwTriggerRef.current = e?.currentTarget ?? resetPwTriggerRefs.current[s.id] ?? null;
     setResetPwStaff(s);
     setNewPassword('');
     setConfirmNewPassword('');
@@ -108,21 +157,41 @@ export default function StaffPage() {
     setShowResetPw(true);
   };
 
+  const openResetPin = (s: Staff, e?: React.MouseEvent<HTMLButtonElement>) => {
+    resetPinTriggerRef.current = e?.currentTarget ?? resetPinTriggerRefs.current[s.id] ?? null;
+    setResetPinStaff(s);
+    setNewResetPin('');
+    setConfirmNewResetPin('');
+    setShowResetPinValue(false);
+    setShowResetPin(true);
+  };
+
   const handleSave = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (form.password && form.password !== form.confirmPassword) {
+    const allowCredentialsInForm = !editingStaff || canResetCredentials;
+    if (allowCredentialsInForm && form.password && form.password !== form.confirmPassword) {
       toast.error(tSetup('passwordsMismatch'));
+      return;
+    }
+    if (allowCredentialsInForm && form.password && !validatePassword(form.password)) {
+      toast.error(tSetup('errorPasswordRequirementsNotMet'));
       return;
     }
     try {
       if (editingStaff) {
-        await api.put(`/staff/${editingStaff.id}`, {
+        const { data } = await api.put(`/staff/${editingStaff.id}`, {
           name: form.name,
           email: form.email,
           role: form.role,
-          ...(form.password ? { password: form.password } : {}),
-          ...(form.pin ? { pin: form.pin } : {}),
+          ...(canResetCredentials && form.password ? { password: form.password } : {}),
+          ...(canResetCredentials && form.pin ? { pin: form.pin } : {}),
         });
+        if (typeof data?.token === 'string' && data.token) {
+          replaceSessionToken?.(
+            data.token,
+            canResetCredentials && form.pin ? { has_pin: true } : undefined,
+          );
+        }
         toast.success(t('updatedToast'));
       } else {
         await api.post('/staff', {
@@ -131,6 +200,7 @@ export default function StaffPage() {
           password: form.password,
           role: form.role,
           ...(form.pin ? { pin: form.pin } : {}),
+          ...(form.role === 'chef' ? { station_ids: form.station_ids } : {}),
         });
         toast.success(t('addedToast'));
       }
@@ -147,8 +217,15 @@ export default function StaffPage() {
       toast.error(tSetup('passwordsMismatch'));
       return;
     }
+    if (!validatePassword(newPassword)) {
+      toast.error(tSetup('errorPasswordRequirementsNotMet'));
+      return;
+    }
     try {
-      await api.put(`/staff/${resetPwStaff.id}`, { password: newPassword });
+      const { data } = await api.put(`/staff/${resetPwStaff.id}`, { password: newPassword });
+      if (typeof data?.token === 'string' && data.token) {
+        replaceSessionToken?.(data.token);
+      }
       toast.success(t('resetPasswordToast'));
       closeResetPassword();
     } catch (error: unknown) {
@@ -156,16 +233,74 @@ export default function StaffPage() {
     }
   };
 
+  const handleResetPin = async () => {
+    if (!resetPinStaff || !newResetPin) return;
+    if (!/^\d{4,6}$/.test(newResetPin)) {
+      toast.error(tAuth('pinRequirementsHint'));
+      return;
+    }
+    if (newResetPin !== confirmNewResetPin) {
+      toast.error(tAuth('pinMismatch'));
+      return;
+    }
+    try {
+      const { data } = await api.put(`/staff/${resetPinStaff.id}`, { pin: newResetPin });
+      if (typeof data?.token === 'string' && data.token) {
+        replaceSessionToken?.(data.token, { has_pin: true });
+      }
+      toast.success(t('resetPinToast'));
+      closeResetPin();
+      fetchStaff();
+    } catch (error: unknown) {
+      toast.error(extractErrorMessage(error, t('failedToResetPin')));
+    }
+  };
+
+  const handleClearPin = async () => {
+    if (!resetPinStaff) return;
+    try {
+      const { data } = await api.put(`/staff/${resetPinStaff.id}`, { pin: null });
+      if (typeof data?.token === 'string' && data.token) {
+        replaceSessionToken?.(data.token, { has_pin: false });
+      }
+      toast.success(t('pinClearedToast'));
+      closeResetPin();
+      fetchStaff();
+    } catch (error: unknown) {
+      toast.error(extractErrorMessage(error, t('failedToResetPin')));
+    }
+  };
+
   const closeForm = () => {
     setShowForm(false);
     setShowPassword(false);
     setShowPin(false);
+    formTriggerRef.current?.focus();
   };
 
   const closeResetPassword = () => {
     setShowResetPw(false);
     setShowResetPassword(false);
+    resetPwTriggerRef.current?.focus();
   };
+
+  const closeResetPin = () => {
+    setShowResetPin(false);
+    setShowResetPinValue(false);
+    resetPinTriggerRef.current?.focus();
+  };
+
+  useEffect(() => {
+    if (!showForm && !showResetPw && !showResetPin) return;
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape') return;
+      if (showForm) closeForm();
+      if (showResetPw) closeResetPassword();
+      if (showResetPin) closeResetPin();
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [showForm, showResetPw, showResetPin]);
 
   const toggleActive = async (s: Staff) => {
     try {
@@ -176,127 +311,265 @@ export default function StaffPage() {
     }
   };
 
-  const editingLastActiveOwner = Boolean(editingStaff?.is_active)
-    && editingStaff?.role === 'owner'
-    && staff.filter((s) => s.role === 'owner' && Boolean(s.is_active)).length === 1;
+  const editingLastActiveOwner =
+    Boolean(editingStaff?.is_active) &&
+    editingStaff?.role === 'owner' &&
+    staff.filter((s) => s.role === 'owner' && Boolean(s.is_active)).length === 1;
 
   return (
     <div>
       <div className="flex justify-between items-center mb-6">
         <h1 className="text-2xl font-bold text-foreground">{t('title')}</h1>
-        <Button onClick={openAdd}><Plus size={16} className="me-1" /> {t('addButton')}</Button>
+        {canManageStaff && (
+          <Button ref={addTriggerRef} onClick={openAdd}>
+            <Plus size={16} className="me-1" /> {t('addButton')}
+          </Button>
+        )}
       </div>
 
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
         {staff.map((s) => (
-          <div key={s.id} className={`bg-card rounded-xl p-5 border ${s.is_active ? 'border-border' : 'border-border opacity-60'}`}>
+          <div
+            key={s.id}
+            className={`bg-card rounded-xl p-5 border ${s.is_active ? 'border-border' : 'border-border opacity-60'}`}
+          >
             <div className="flex justify-between items-start mb-3">
               <div>
                 <p className="font-bold text-foreground">{s.name}</p>
                 <p className="text-xs text-muted-foreground">{s.email || '—'}</p>
-                {Boolean(s.has_pin) && (
-                  <p className="text-xs text-green-600 mt-1">{t('pinSet')}</p>
-                )}
+                {Boolean(s.has_pin) && <p className="text-xs text-green-600 mt-1">{t('pinSet')}</p>}
               </div>
-              <span className={`inline-block px-2.5 py-0.5 rounded-full text-xs font-medium capitalize ${roleColors[s.role] || 'bg-muted text-foreground'}`}>
+              <span
+                className={`inline-block px-2.5 py-0.5 rounded-full text-xs font-medium capitalize ${roleColors[s.role] || 'bg-muted text-foreground'}`}
+              >
                 {roleLabel(s.role, t)}
               </span>
             </div>
-            <div className="flex flex-wrap gap-2 mt-3">
-              <Button variant="outline" size="sm" onClick={() => openEdit(s)}>
-                <Edit size={14} className="me-1" /> {tCommon('edit')}
-              </Button>
-              <Button variant="outline" size="sm" onClick={() => openResetPw(s)}>
-                <RotateCcw size={14} className="me-1" /> {t('resetPwButton')}
-              </Button>
-              <Button
-                variant="ghost"
-                size="sm"
-                onClick={() => toggleActive(s)}
-                className={s.is_active ? 'text-red-500 hover:text-red-700 hover:bg-red-50' : 'text-green-500 hover:text-green-700 hover:bg-green-50'}
-              >
-                {s.is_active ? t('deactivate') : t('reactivate')}
-              </Button>
-            </div>
+            {canManageStaff &&
+              (canManagePrivilegedStaff || !hasRole(s.role, ROLE_ACCESS.ownerManager)) && (
+                <div className="flex flex-wrap gap-2 mt-3">
+                  <Button
+                    ref={(el) => {
+                      editTriggerRefs.current[s.id] = el;
+                    }}
+                    variant="outline"
+                    size="sm"
+                    onClick={(e) => openEdit(s, e)}
+                  >
+                    <Edit size={14} className="me-1" /> {tCommon('edit')}
+                  </Button>
+                  {canResetCredentials && (
+                    <Button
+                      ref={(el) => {
+                        resetPwTriggerRefs.current[s.id] = el;
+                      }}
+                      variant="outline"
+                      size="sm"
+                      onClick={(e) => openResetPw(s, e)}
+                    >
+                      <RotateCcw size={14} className="me-1" /> {t('resetPwButton')}
+                    </Button>
+                  )}
+                  {canResetCredentials && (
+                    <Button
+                      ref={(el) => {
+                        resetPinTriggerRefs.current[s.id] = el;
+                      }}
+                      variant="outline"
+                      size="sm"
+                      onClick={(e) => openResetPin(s, e)}
+                    >
+                      <KeyRound size={14} className="me-1" /> {t('resetPinButton')}
+                    </Button>
+                  )}
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => toggleActive(s)}
+                    className={
+                      s.is_active
+                        ? 'text-red-500 hover:text-red-700 hover:bg-red-50'
+                        : 'text-green-500 hover:text-green-700 hover:bg-green-50'
+                    }
+                  >
+                    {s.is_active ? t('deactivate') : t('reactivate')}
+                  </Button>
+                </div>
+              )}
           </div>
         ))}
       </div>
 
-      {staff.length === 0 && <p className="text-center text-muted-foreground py-12">{t('empty')}</p>}
+      {staff.length === 0 && (
+        <p className="text-center text-muted-foreground py-12">{t('empty')}</p>
+      )}
 
-      {canViewPermissionMatrix && <PermissionMatrix />}
+      {canManagePermissions && <PermissionMatrix staff={staff} />}
+      {canManagePermissions && <PermissionAuditLog staff={staff} />}
 
       {showForm && (
         <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
-          <div className="bg-card rounded-2xl p-6 w-full max-w-sm">
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="staff-modal-title"
+            className="bg-card rounded-2xl p-6 w-full max-w-sm max-h-[90vh] overflow-y-auto"
+          >
             <div className="flex justify-between items-center mb-4">
-              <h2 className="text-lg font-bold">{editingStaff ? t('modalTitleEdit') : t('modalTitleAdd')}</h2>
-              <button type="button" onClick={closeForm}><X size={20} className="text-gray-400" /></button>
+              <h2 id="staff-modal-title" className="text-lg font-bold">
+                {editingStaff ? t('modalTitleEdit') : t('modalTitleAdd')}
+              </h2>
+              <button type="button" onClick={closeForm} aria-label={tCommon('close')}>
+                <X size={20} className="text-gray-400" />
+              </button>
             </div>
             <form onSubmit={handleSave} className="space-y-4">
               <input
-                type="text" placeholder={t('namePlaceholder')} value={form.name}
+                type="text"
+                placeholder={t('namePlaceholder')}
+                value={form.name}
                 onChange={(e) => setForm({ ...form, name: e.target.value })}
-                className="w-full px-3 py-2 border rounded-lg outline-none focus:ring-2 focus:ring-brand" required
+                className="w-full px-3 py-2 border rounded-lg outline-none focus:ring-2 focus:ring-brand"
+                required
               />
               <input
-                type="email" placeholder={tAuth('email')} value={form.email}
+                type="email"
+                placeholder={tAuth('email')}
+                value={form.email}
                 onChange={(e) => setForm({ ...form, email: e.target.value })}
                 className="w-full px-3 py-2 border rounded-lg outline-none focus:ring-2 focus:ring-brand"
                 autoComplete="email"
                 dir="ltr"
                 required
               />
-              <div className="relative">
-                <input
-                  type={showPassword ? 'text' : 'password'} placeholder={editingStaff ? t('newPasswordPlaceholder') : t('passwordPlaceholder')}
-                  value={form.password}
-                  onChange={(e) => setForm({ ...form, password: e.target.value })}
-                  className="w-full px-3 py-2 pe-10 border rounded-lg outline-none focus:ring-2 focus:ring-brand"
-                  required={!editingStaff}
-                />
-                <button type="button" aria-label="Toggle password visibility" title="Toggle password visibility" onClick={() => setShowPassword(!showPassword)} className="absolute end-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground">
-                  {showPassword ? <EyeOff size={16} /> : <Eye size={16} />}
-                </button>
-              </div>
-              <input
-                type={showPassword ? 'text' : 'password'} placeholder={tAuth('confirmPassword')}
-                value={form.confirmPassword}
-                onChange={(e) => setForm({ ...form, confirmPassword: e.target.value })}
-                className="w-full px-3 py-2 border rounded-lg outline-none focus:ring-2 focus:ring-brand"
-                required={!editingStaff || Boolean(form.password)}
-              />
+              {(!editingStaff || canResetCredentials) && (
+                <>
+                  <div className="relative">
+                    <input
+                      type={showPassword ? 'text' : 'password'}
+                      placeholder={
+                        editingStaff ? t('newPasswordPlaceholder') : t('passwordPlaceholder')
+                      }
+                      value={form.password}
+                      onChange={(e) => setForm({ ...form, password: e.target.value })}
+                      className="w-full px-3 py-2 pe-10 border rounded-lg outline-none focus:ring-2 focus:ring-brand"
+                      dir="ltr"
+                      required={!editingStaff}
+                    />
+                    <button
+                      type="button"
+                      aria-label="Toggle password visibility"
+                      title="Toggle password visibility"
+                      onClick={() => setShowPassword(!showPassword)}
+                      className="absolute end-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+                    >
+                      {showPassword ? <EyeOff size={16} /> : <Eye size={16} />}
+                    </button>
+                  </div>
+                  <input
+                    type={showPassword ? 'text' : 'password'}
+                    placeholder={tAuth('confirmPassword')}
+                    value={form.confirmPassword}
+                    onChange={(e) => setForm({ ...form, confirmPassword: e.target.value })}
+                    className="w-full px-3 py-2 border rounded-lg outline-none focus:ring-2 focus:ring-brand"
+                    dir="ltr"
+                    required={!editingStaff || Boolean(form.password)}
+                  />
+                </>
+              )}
               <select
-                value={form.role} onChange={(e) => {
+                value={form.role}
+                onChange={(e) => {
                   const role = e.target.value;
-                  setForm({ ...form, role, pin: hasRole(role, ROLE_ACCESS.ownerManager) ? form.pin : '' });
+                  setForm({
+                    ...form,
+                    role,
+                    station_ids: role === 'chef' ? form.station_ids : [],
+                  });
                 }}
                 className="w-full px-3 py-2 border rounded-lg outline-none focus:ring-2 focus:ring-brand"
               >
-                {VALID_ROLES.map((r) => (
-                  <option key={r} value={r} disabled={editingLastActiveOwner && r !== 'owner'}>{roleLabel(r, t)}</option>
+                {VALID_ROLES.filter(
+                  (role) => canManagePrivilegedStaff || !hasRole(role, ROLE_ACCESS.ownerManager),
+                ).map((r) => (
+                  <option key={r} value={r} disabled={editingLastActiveOwner && r !== 'owner'}>
+                    {roleLabel(r, t)}
+                  </option>
                 ))}
               </select>
-              {hasRole(form.role, ROLE_ACCESS.ownerManager) && (
+              {!editingStaff && form.role === 'chef' && (
+                <div>
+                  <p className="text-sm font-medium text-foreground mb-1">
+                    {t('kitchenStationsOptional')}
+                  </p>
+                  <div
+                    className={`space-y-1 rounded-lg border border-border p-2 ${!kdsEnabled ? 'opacity-60' : ''}`}
+                  >
+                    {kitchenStations.map((station) => (
+                      <label
+                        key={station.id}
+                        className="flex items-center gap-2 rounded px-2 py-1.5 text-sm hover:bg-muted"
+                      >
+                        <input
+                          type="checkbox"
+                          checked={form.station_ids.includes(station.id)}
+                          onChange={() =>
+                            setForm((current) => ({
+                              ...current,
+                              station_ids: current.station_ids.includes(station.id)
+                                ? current.station_ids.filter((id) => id !== station.id)
+                                : [...current.station_ids, station.id],
+                            }))
+                          }
+                          disabled={!kdsEnabled}
+                          className="rounded border-gray-300 dark:border-border text-brand focus:ring-brand"
+                        />
+                        {station.name}
+                      </label>
+                    ))}
+                    {kitchenStations.length === 0 && (
+                      <p className="px-2 py-1 text-xs text-muted-foreground">
+                        {t('noKitchenStations')}
+                      </p>
+                    )}
+                  </div>
+                  <p className="text-xs text-muted-foreground mt-1">
+                    {kdsEnabled ? t('kitchenStationsOptionalHint') : t('kitchenStationsRequireKds')}
+                  </p>
+                </div>
+              )}
+              {(!editingStaff || canResetCredentials) && (
                 <div>
                   <div className="relative">
                     <input
-                      type={showPin ? 'text' : 'password'} placeholder={editingStaff ? t('pinPlaceholderEdit') : t('pinPlaceholderAdd')}
+                      type={showPin ? 'text' : 'password'}
+                      placeholder={editingStaff ? t('pinPlaceholderEdit') : t('pinPlaceholderAdd')}
                       value={form.pin}
-                      onChange={(e) => setForm({ ...form, pin: e.target.value.replace(/\D/g, '').slice(0, 6) })}
+                      onChange={(e) =>
+                        setForm({ ...form, pin: e.target.value.replace(/\D/g, '').slice(0, 6) })
+                      }
                       className="w-full px-3 py-2 pe-10 border rounded-lg outline-none focus:ring-2 focus:ring-brand"
                       maxLength={6}
                       pattern="[0-9]*"
                       inputMode="numeric"
+                      dir="ltr"
                     />
-                    <button type="button" aria-label="Toggle PIN visibility" title="Toggle PIN visibility" onClick={() => setShowPin(!showPin)} className="absolute end-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground">
+                    <button
+                      type="button"
+                      aria-label="Toggle PIN visibility"
+                      title="Toggle PIN visibility"
+                      onClick={() => setShowPin(!showPin)}
+                      className="absolute end-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+                    >
                       {showPin ? <EyeOff size={16} /> : <Eye size={16} />}
                     </button>
                   </div>
                   <p className="text-xs text-muted-foreground mt-1">{t('pinHint')}</p>
                 </div>
               )}
-              <Button type="submit" className="w-full">{editingStaff ? t('updateButton') : t('addButton')}</Button>
+              <Button type="submit" className="w-full">
+                {editingStaff ? t('updateButton') : t('addButton')}
+              </Button>
             </form>
           </div>
         </div>
@@ -304,29 +577,124 @@ export default function StaffPage() {
 
       {showResetPw && resetPwStaff && (
         <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
-          <div className="bg-card rounded-2xl p-6 w-full max-w-sm">
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="reset-password-modal-title"
+            className="bg-card rounded-2xl p-6 w-full max-w-sm"
+          >
             <div className="flex justify-between items-center mb-4">
-              <h2 className="text-lg font-bold">{t('resetPasswordTitle')}</h2>
-              <button type="button" onClick={closeResetPassword}><X size={20} className="text-gray-400" /></button>
+              <h2 id="reset-password-modal-title" className="text-lg font-bold">
+                {t('resetPasswordTitle')}
+              </h2>
+              <button type="button" onClick={closeResetPassword} aria-label={tCommon('close')}>
+                <X size={20} className="text-gray-400" />
+              </button>
             </div>
-            <p className="text-sm text-muted-foreground mb-4">{t('resetPasswordBody', { name: resetPwStaff.name })}</p>
+            <p className="text-sm text-muted-foreground mb-4">
+              {t('resetPasswordBody', { name: resetPwStaff.name })}
+            </p>
             <div className="space-y-4">
               <div className="relative">
                 <input
-                  type={showResetPassword ? 'text' : 'password'} placeholder={t('newPasswordPlaceholder')} value={newPassword}
+                  type={showResetPassword ? 'text' : 'password'}
+                  placeholder={t('newPasswordPlaceholder')}
+                  value={newPassword}
                   onChange={(e) => setNewPassword(e.target.value)}
                   className="w-full px-3 py-2 pe-10 border rounded-lg outline-none focus:ring-2 focus:ring-brand"
                 />
-                <button type="button" aria-label="Toggle password visibility" title="Toggle password visibility" onClick={() => setShowResetPassword(!showResetPassword)} className="absolute end-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground">
+                <button
+                  type="button"
+                  aria-label="Toggle password visibility"
+                  title="Toggle password visibility"
+                  onClick={() => setShowResetPassword(!showResetPassword)}
+                  className="absolute end-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+                >
                   {showResetPassword ? <EyeOff size={16} /> : <Eye size={16} />}
                 </button>
               </div>
               <input
-                type={showResetPassword ? 'text' : 'password'} placeholder={tAuth('confirmPassword')} value={confirmNewPassword}
+                type={showResetPassword ? 'text' : 'password'}
+                placeholder={tAuth('confirmPassword')}
+                value={confirmNewPassword}
                 onChange={(e) => setConfirmNewPassword(e.target.value)}
                 className="w-full px-3 py-2 border rounded-lg outline-none focus:ring-2 focus:ring-brand"
               />
-              <Button onClick={handleResetPassword} className="w-full">{t('resetPasswordTitle')}</Button>
+              <Button onClick={handleResetPassword} className="w-full">
+                {t('resetPasswordTitle')}
+              </Button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {showResetPin && resetPinStaff && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="reset-pin-modal-title"
+            className="bg-card rounded-2xl p-6 w-full max-w-sm"
+          >
+            <div className="flex justify-between items-center mb-4">
+              <h2 id="reset-pin-modal-title" className="text-lg font-bold">
+                {t('resetPinTitle')}
+              </h2>
+              <button type="button" onClick={closeResetPin} aria-label={tCommon('close')}>
+                <X size={20} className="text-gray-400" />
+              </button>
+            </div>
+            <p className="text-sm text-muted-foreground mb-4">
+              {t('resetPinBody', { name: resetPinStaff.name })}
+            </p>
+            <div className="space-y-4">
+              <div className="relative">
+                <input
+                  type={showResetPinValue ? 'text' : 'password'}
+                  placeholder={t('pinPlaceholderAdd')}
+                  value={newResetPin}
+                  onChange={(e) => setNewResetPin(e.target.value.replace(/\D/g, '').slice(0, 6))}
+                  className="w-full px-3 py-2 pe-10 border rounded-lg outline-none focus:ring-2 focus:ring-brand font-mono tracking-widest"
+                  maxLength={6}
+                  pattern="[0-9]*"
+                  inputMode="numeric"
+                  dir="ltr"
+                />
+                <button
+                  type="button"
+                  aria-label="Toggle PIN visibility"
+                  title="Toggle PIN visibility"
+                  onClick={() => setShowResetPinValue(!showResetPinValue)}
+                  className="absolute end-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+                >
+                  {showResetPinValue ? <EyeOff size={16} /> : <Eye size={16} />}
+                </button>
+              </div>
+              <input
+                type={showResetPinValue ? 'text' : 'password'}
+                placeholder={tAuth('confirmNewPinLabel')}
+                value={confirmNewResetPin}
+                onChange={(e) =>
+                  setConfirmNewResetPin(e.target.value.replace(/\D/g, '').slice(0, 6))
+                }
+                className="w-full px-3 py-2 border rounded-lg outline-none focus:ring-2 focus:ring-brand font-mono tracking-widest"
+                maxLength={6}
+                pattern="[0-9]*"
+                inputMode="numeric"
+                dir="ltr"
+              />
+              <Button
+                onClick={handleResetPin}
+                disabled={newResetPin.length < 4 || confirmNewResetPin.length < 4}
+                className="w-full"
+              >
+                {t('resetPinTitle')}
+              </Button>
+              {Boolean(resetPinStaff.has_pin) && (
+                <Button variant="outline" onClick={handleClearPin} className="w-full">
+                  {t('clearPinButton')}
+                </Button>
+              )}
             </div>
           </div>
         </div>

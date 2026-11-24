@@ -23,15 +23,24 @@ const os = require('os');
 const path = require('path');
 const testDir = fs.mkdtempSync(path.join(os.tmpdir(), 'flo-floors-'));
 Module._load = function (request: string, parent: unknown, isMain: boolean) {
-  if (request === 'electron') return { app: { isPackaged: true, getPath: () => testDir, getVersion: () => 'test' } };
+  if (request === 'electron')
+    return { app: { isPackaged: true, getPath: () => testDir, getVersion: () => 'test' } };
   return originalLoad.apply(this, arguments as any);
 };
 
 const {
-  initTestDb, createApp, startServer,
-  seedOwnerUser, seedManagerUser,
-  api, assert, assertEqual, assertGreaterThan,
-  closeDatabase, getDatabase, now,
+  initTestDb,
+  createApp,
+  startServer,
+  seedOwnerUser,
+  seedManagerUser,
+  api,
+  assertOrThrow,
+  assertEqualOrThrow,
+  assertGreaterThanOrThrow,
+  closeDatabase,
+  getDatabase,
+  now,
 } = require('./helpers/test-setup');
 
 const bcrypt = require('bcryptjs');
@@ -54,7 +63,17 @@ async function main() {
   db.prepare(
     `INSERT INTO users (id, name, email, password, role, pin_hash, is_active, created_at, updated_at)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).run(cashierId, 'Test Cashier', 'cashier@test.local', cashierHash, 'cashier', null, 1, now(), now());
+  ).run(
+    cashierId,
+    'Test Cashier',
+    'cashier@test.local',
+    cashierHash,
+    'cashier',
+    null,
+    1,
+    now(),
+    now(),
+  );
   const cashierToken = jwt.sign(
     { userId: cashierId, email: 'cashier@test.local', role: 'cashier' },
     getJWTSecret(),
@@ -101,20 +120,22 @@ async function main() {
       body: JSON.stringify({ newName: 'Main' }),
     });
 
-    assertEqual(renameRes.status, 200, 'PATCH /floors/Ground returns 200');
-    assertEqual(renameRes.data.floor, 'Main', 'Response echoes new floor name');
-    assertEqual(renameRes.data.previousFloor, 'Ground', 'Response echoes previous name');
-    assertEqual(renameRes.data.affected, 3, 'affected count equals tables on Ground');
+    assertEqualOrThrow(renameRes.status, 200, 'PATCH /floors/Ground returns 200');
+    assertEqualOrThrow(renameRes.data.floor, 'Main', 'Response echoes new floor name');
+    assertEqualOrThrow(renameRes.data.previousFloor, 'Ground', 'Response echoes previous name');
+    assertEqualOrThrow(renameRes.data.affected, 3, 'affected count equals tables on Ground');
 
-    const afterRename = db.prepare(
-      `SELECT id, floor FROM tables WHERE id IN ('tbl-g-1', 'tbl-g-2', 'tbl-g-3', 'tbl-f-1', 'tbl-f-2', 'tbl-u-1') ORDER BY id`,
-    ).all() as Array<{ id: string; floor: string | null }>;
+    const afterRename = db
+      .prepare(
+        `SELECT id, floor FROM tables WHERE id IN ('tbl-g-1', 'tbl-g-2', 'tbl-g-3', 'tbl-f-1', 'tbl-f-2', 'tbl-u-1') ORDER BY id`,
+      )
+      .all() as Array<{ id: string; floor: string | null }>;
     const groundFloor = afterRename.filter((r) => r.floor === 'Ground');
     const mainFloor = afterRename.filter((r) => r.floor === 'Main');
     const firstFloor = afterRename.filter((r) => r.floor === 'First');
-    assertEqual(groundFloor.length, 0, 'No tables left on "Ground" after rename');
-    assertEqual(mainFloor.length, 3, 'All three Ground tables now on "Main"');
-    assertEqual(firstFloor.length, 2, '"First" tables untouched');
+    assertEqualOrThrow(groundFloor.length, 0, 'No tables left on "Ground" after rename');
+    assertEqualOrThrow(mainFloor.length, 3, 'All three Ground tables now on "Main"');
+    assertEqualOrThrow(firstFloor.length, 2, '"First" tables untouched');
     console.log(`   ✓ Ground (0) → Main (3); First (2), Unassigned (1) unchanged`);
 
     // ═══════════════════════════════════════════════════════════════════
@@ -128,18 +149,18 @@ async function main() {
       body: JSON.stringify({ newName: 'First' }),
     });
 
-    assertEqual(mergeRes.status, 200, 'Merge rename returns 200');
-    assertEqual(mergeRes.data.affected, 3, 'affected count is 3 (Main tables moved)');
+    assertEqualOrThrow(mergeRes.status, 200, 'Merge rename returns 200');
+    assertEqualOrThrow(mergeRes.data.affected, 3, 'affected count is 3 (Main tables moved)');
 
-    const afterMerge = db.prepare(
-      `SELECT COUNT(*) AS n FROM tables WHERE floor = 'First'`,
-    ).get() as { n: number };
-    assertEqual(afterMerge.n, 5, 'First now holds all 5 tables (2 original + 3 merged)');
+    const afterMerge = db
+      .prepare(`SELECT COUNT(*) AS n FROM tables WHERE floor = 'First'`)
+      .get() as { n: number };
+    assertEqualOrThrow(afterMerge.n, 5, 'First now holds all 5 tables (2 original + 3 merged)');
 
-    const mainLeft = db.prepare(
-      `SELECT COUNT(*) AS n FROM tables WHERE floor = 'Main'`,
-    ).get() as { n: number };
-    assertEqual(mainLeft.n, 0, 'No tables left on "Main" after merge');
+    const mainLeft = db.prepare(`SELECT COUNT(*) AS n FROM tables WHERE floor = 'Main'`).get() as {
+      n: number;
+    };
+    assertEqualOrThrow(mainLeft.n, 0, 'No tables left on "Main" after merge');
     console.log(`   ✓ Main (3 tables) merged into First (now 5)`);
 
     // ═══════════════════════════════════════════════════════════════════
@@ -147,25 +168,38 @@ async function main() {
     // ═══════════════════════════════════════════════════════════════════
     console.log('\n─── Scenario C: DELETE /api/tables/floors/First unassigns every table ───');
 
+    db.prepare(`UPDATE tables SET position_x = 25, position_y = 40 WHERE floor = 'First'`).run();
+
     const deleteRes = await api(baseUrl, '/api/tables/floors/First', {
       method: 'DELETE',
       headers: ownerAuth,
     });
 
-    assertEqual(deleteRes.status, 200, 'DELETE /floors/First returns 200');
-    assertEqual(deleteRes.data.removedFloor, 'First', 'Response echoes removed floor');
-    assertEqual(deleteRes.data.affected, 5, 'affected count is 5');
-    assertEqual(deleteRes.data.floor, null, 'Response confirms new floor is null');
+    assertEqualOrThrow(deleteRes.status, 200, 'DELETE /floors/First returns 200');
+    assertEqualOrThrow(deleteRes.data.removedFloor, 'First', 'Response echoes removed floor');
+    assertEqualOrThrow(deleteRes.data.affected, 5, 'affected count is 5');
+    assertEqualOrThrow(deleteRes.data.floor, null, 'Response confirms new floor is null');
 
-    const afterDelete = db.prepare(
-      `SELECT COUNT(*) AS n FROM tables WHERE floor IS NULL`,
-    ).get() as { n: number };
-    assertEqual(afterDelete.n, 6, 'All 6 tables now unassigned (5 + the original unassigned)');
+    const afterDelete = db
+      .prepare(`SELECT COUNT(*) AS n FROM tables WHERE floor IS NULL`)
+      .get() as { n: number };
+    assertEqualOrThrow(
+      afterDelete.n,
+      6,
+      'All 6 tables now unassigned (5 + the original unassigned)',
+    );
 
-    const stillFirst = db.prepare(
-      `SELECT COUNT(*) AS n FROM tables WHERE floor = 'First'`,
-    ).get() as { n: number };
-    assertEqual(stillFirst.n, 0, 'No tables left on "First"');
+    const staleCoords = db
+      .prepare(
+        `SELECT COUNT(*) AS n FROM tables WHERE position_x IS NOT NULL OR position_y IS NOT NULL`,
+      )
+      .get() as { n: number };
+    assertEqualOrThrow(staleCoords.n, 0, 'Deleting a floor clears stale position_x and position_y');
+
+    const stillFirst = db
+      .prepare(`SELECT COUNT(*) AS n FROM tables WHERE floor = 'First'`)
+      .get() as { n: number };
+    assertEqualOrThrow(stillFirst.n, 0, 'No tables left on "First"');
     console.log(`   ✓ All 5 tables on First moved to Unassigned; tables preserved`);
 
     // ═══════════════════════════════════════════════════════════════════
@@ -178,15 +212,19 @@ async function main() {
       headers: ownerAuth,
       body: JSON.stringify({}),
     });
-    assertEqual(missingName.status, 400, 'Missing newName returns 400');
-    assertEqual(missingName.data.code, 'FLOOR_NAME_REQUIRED', 'Error code is FLOOR_NAME_REQUIRED');
+    assertEqualOrThrow(missingName.status, 400, 'Missing newName returns 400');
+    assertEqualOrThrow(
+      missingName.data.code,
+      'FLOOR_NAME_REQUIRED',
+      'Error code is FLOOR_NAME_REQUIRED',
+    );
 
     const blankName = await api(baseUrl, '/api/tables/floors/Ground', {
       method: 'PATCH',
       headers: ownerAuth,
       body: JSON.stringify({ newName: '   ' }),
     });
-    assertEqual(blankName.status, 400, 'Whitespace newName returns 400');
+    assertEqualOrThrow(blankName.status, 400, 'Whitespace newName returns 400');
     console.log(`   ✓ Validation rejects empty / whitespace newName`);
 
     // ═══════════════════════════════════════════════════════════════════
@@ -199,13 +237,13 @@ async function main() {
       headers: cashierAuth,
       body: JSON.stringify({ newName: 'X' }),
     });
-    assertEqual(cashierPatch.status, 403, 'Cashier PATCH is denied');
+    assertEqualOrThrow(cashierPatch.status, 403, 'Cashier PATCH is denied');
 
     const cashierDelete = await api(baseUrl, '/api/tables/floors/Ground', {
       method: 'DELETE',
       headers: cashierAuth,
     });
-    assertEqual(cashierDelete.status, 403, 'Cashier DELETE is denied');
+    assertEqualOrThrow(cashierDelete.status, 403, 'Cashier DELETE is denied');
 
     // 'Ground' has zero rows by this point (Scenario A renamed them all), so a
     // rename here would return 200 with affected: 0 and prove nothing. Seed a
@@ -220,12 +258,12 @@ async function main() {
       headers: managerAuth,
       body: JSON.stringify({ newName: 'Patio' }),
     });
-    assertEqual(managerRename.status, 200, 'Manager PATCH is allowed');
-    assertEqual(managerRename.data.affected, 1, 'Manager rename moved the seeded table');
-    const mgrPersisted = db.prepare(
-      `SELECT floor FROM tables WHERE id = 'tbl-mgr-1'`,
-    ).get() as { floor: string };
-    assertEqual(mgrPersisted.floor, 'Patio', 'Persisted row landed on "Patio"');
+    assertEqualOrThrow(managerRename.status, 200, 'Manager PATCH is allowed');
+    assertEqualOrThrow(managerRename.data.affected, 1, 'Manager rename moved the seeded table');
+    const mgrPersisted = db.prepare(`SELECT floor FROM tables WHERE id = 'tbl-mgr-1'`).get() as {
+      floor: string;
+    };
+    assertEqualOrThrow(mgrPersisted.floor, 'Patio', 'Persisted row landed on "Patio"');
     console.log(`   ✓ Cashier denied (403), Manager allowed (200, affected 1, persisted)`);
 
     // ═══════════════════════════════════════════════════════════════════
@@ -239,7 +277,10 @@ async function main() {
     // Express path-decoder that feeds `req.params.name`.
     const encodedFloor = 'Mezzanine Level';
     const encodedFloorEscaped = encodeURIComponent(encodedFloor);
-    assert(encodedFloorEscaped.includes('%20'), `Encoded form contains %20: ${encodedFloorEscaped}`);
+    assertOrThrow(
+      encodedFloorEscaped.includes('%20'),
+      `Encoded form contains %20: ${encodedFloorEscaped}`,
+    );
 
     db.prepare(
       `INSERT INTO tables (id, number, capacity, floor, created_at, updated_at)
@@ -255,14 +296,18 @@ async function main() {
       headers: ownerAuth,
       body: JSON.stringify({ newName: 'Mezz' }),
     });
-    assertEqual(encodedRename.status, 200, 'URL-encoded rename works');
-    assertEqual(encodedRename.data.previousFloor, encodedFloor, 'Server saw the decoded floor name');
-    assertEqual(encodedRename.data.affected, 2, 'Both Mezzanine tables renamed');
+    assertEqualOrThrow(encodedRename.status, 200, 'URL-encoded rename works');
+    assertEqualOrThrow(
+      encodedRename.data.previousFloor,
+      encodedFloor,
+      'Server saw the decoded floor name',
+    );
+    assertEqualOrThrow(encodedRename.data.affected, 2, 'Both Mezzanine tables renamed');
 
-    const stillThere = db.prepare(
-      `SELECT COUNT(*) AS n FROM tables WHERE floor = 'Mezz'`,
-    ).get() as { n: number };
-    assertEqual(stillThere.n, 2, 'Tables land on "Mezz"');
+    const stillThere = db
+      .prepare(`SELECT COUNT(*) AS n FROM tables WHERE floor = 'Mezz'`)
+      .get() as { n: number };
+    assertEqualOrThrow(stillThere.n, 2, 'Tables land on "Mezz"');
     console.log(`   ✓ "Mezzanine Level" → "Mezz" via ${encodedFloorEscaped}`);
 
     console.log('\n✅ All floor management scenarios passed');
