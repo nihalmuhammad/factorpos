@@ -49,6 +49,10 @@ channel.
 
 ## Making a release
 
+Two repository secrets must exist first, or the workflow stops before building:
+`FACTORPOS_SUPPORT_TICKET_URL` and `FACTORPOS_SUPPORT_TICKET_SECRET`, the
+Submit Ticket endpoint (setup in `scripts/support-ticket-apps-script/README.md`).
+
 Run the tests locally first (`npm run lint`, `npm test`). Then, on an
 up-to-date `main`:
 

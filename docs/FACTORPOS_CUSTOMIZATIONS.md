@@ -57,6 +57,35 @@ database is backed up and moved back to v84, and the token migration is
 recorded by id, so FloCafe's own 85 and later run after an upstream merge.
 Covered by `npm run test:factorpos-migrations`.
 
+## Long-history performance
+
+Shops that bill for months slowed down because some queries read the whole
+sales history on every dashboard load and at launch:
+
+- `paymentMethodBreakdown` (dashboard daily stats, day summary, financial
+  summary, Z report) splits its bill filter into "paid since the window start"
+  and "still unpaid", so both halves are `paid_at` index lookups. Results are
+  unchanged; the test compares them with the previous query.
+- `idx_orders_type_status_completed` (FactorPOS migration
+  `2026-11-24-orders-table-turn-index`) serves the dashboard's average table
+  turn.
+- Launch runs `PRAGMA quick_check`; the full `integrity_check` runs when the
+  last clean one (setting `factorpos_last_full_integrity_check_at`) is more
+  than seven days old.
+- `PRAGMA optimize` runs at open (`0x10002`, `analysis_limit = 400`) and every
+  six hours, so SQLite plans with real row statistics.
+- Cash shifts (`main/routes/cash-closures.ts`): the X/Z drawer cash query uses
+  the same exact paid_at split. Shift expected cash, shift totals and shift
+  staff sales (the status bar polls the current shift every 15 seconds) read
+  only bills that are unpaid or paid no earlier than seven days before the
+  shift opened, instead of every bill ever made. A shift's lines are written
+  while it is open or by a same-business-day tender correction, so older bills
+  cannot hold them; only a PC clock that jumped back more than a week during a
+  shift could break that.
+
+The Orders page's Unpaid tab still scans history when few orders are unpaid.
+Covered by `npm run test:factorpos-dashboard-performance`.
+
 ## Releases and updates
 
 - Shop PCs update from this repository's GitHub Releases, built by
@@ -144,6 +173,15 @@ Covered by `npm run test:factorpos-migrations`.
 - Email Error Log (Support): opens a local `.eml` draft with the recent log,
   sanitized by FloCafe's `sanitizeLogTail` before it is attached.
 - Support-ticket subjects say FactorPOS (`frontend/src/lib/operation-failure.ts`).
+- Submit Ticket goes to the owner's Google Apps Script web app, which emails the
+  address in its `NOTIFY_EMAIL` script property (never in this repository) and logs
+  the ticket in a Sheet and Drive
+  (`main/services/factorpos-ticket-relay.ts`, receiver and setup in
+  `scripts/support-ticket-apps-script/`). Tickets stay in FloCafe's
+  `support_ticket_outbox`, so the queue, retries and Support-screen status are
+  FloCafe's; FloCafe's cloud flush stands down while the relay is configured.
+  The release workflow stamps the URL and secret from repository secrets and
+  refuses to build without them. Covered by `npm run test:factorpos-ticket-relay`.
 
 ## Still pending
 

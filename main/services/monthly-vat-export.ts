@@ -38,6 +38,11 @@ export type MonthlyVatInvoiceRow = {
   charges: number;
   amount_before_vat: number;
   vat_amount: number;
+  /**
+   * VAT rate of the bill: the rate its tax breakdown applied (e.g. 15) when every line
+   * used one rate; otherwise VAT ÷ amount before VAT, to two decimals. Never the rounded
+   * ratio for a single-rate bill, which per-line rounding can show as 14.99.
+   */
   effective_vat_percent: number | null;
   total_with_vat: number;
   round_off: number;
@@ -176,6 +181,36 @@ function minorUnits(currency: string): MinorUnits {
 }
 
 /** Splits a VAT-inclusive refund into VAT using the share VAT had in its source (item or invoice). */
+/** The single VAT rate a bill's tax snapshot applied, or null when there is none or several. */
+function snapshotVatRate(taxSnapshot: unknown): number | null {
+  let parsed: unknown = taxSnapshot;
+  if (typeof parsed === 'string') {
+    try {
+      parsed = JSON.parse(parsed);
+    } catch {
+      return null;
+    }
+  }
+  // FloCafe stores one snapshot per item (an array), or one for the whole bill.
+  const snapshots = Array.isArray(parsed) ? parsed : parsed ? [parsed] : [];
+  const rates = new Set<number>();
+  for (const snapshot of snapshots) {
+    const lines = (snapshot as { lines?: unknown })?.lines;
+    if (!Array.isArray(lines)) continue;
+    for (const line of lines) {
+      if (!(Number((line as { taxAmount?: unknown })?.taxAmount) > 0)) continue;
+      const components = (line as { components?: unknown })?.components;
+      if (!Array.isArray(components)) continue;
+      const total = components.reduce(
+        (sum, c) => sum + (Number((c as { rate?: unknown })?.rate) || 0),
+        0,
+      );
+      if (total > 0) rates.add(Math.round(total * 10000) / 10000);
+    }
+  }
+  return rates.size === 1 ? [...rates][0] : null;
+}
+
 function vatShare(grossMinor: number, sourceVatMinor: number, sourceGrossMinor: number): number {
   if (sourceGrossMinor <= 0 || sourceVatMinor <= 0) return 0;
   return Math.round((grossMinor * sourceVatMinor) / sourceGrossMinor);
@@ -214,7 +249,7 @@ export function buildMonthlyVatDataset(
     SELECT
       b.id, b.bill_number, b.paid_at, b.subtotal, b.discount_amount, b.tax_amount,
       b.service_charge, b.packaging_charge, b.delivery_charge, b.round_off, b.total,
-      b.payment_status, b.payment_details,
+      b.payment_status, b.payment_details, b.tax_snapshot,
       o.order_number, o.token_number, o.type AS order_type,
       (SELECT COALESCE(SUM(r.amount_cents), 0) FROM refunds r WHERE r.bill_id = b.id) AS refunded_cents
     FROM bills b
@@ -275,7 +310,10 @@ export function buildMonthlyVatDataset(
       ),
       amount_before_vat: fromMinor(before),
       vat_amount: fromMinor(vat),
-      effective_vat_percent: before > 0 ? Math.round((vat / before) * 10000) / 100 : null,
+      effective_vat_percent:
+        before > 0
+          ? (snapshotVatRate(bill.tax_snapshot) ?? Math.round((vat / before) * 10000) / 100)
+          : null,
       total_with_vat: fromMinor(withVat),
       round_off: fromMinor(roundOff),
       amount_payable: fromMinor(payable),

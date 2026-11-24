@@ -41,6 +41,10 @@ fs.writeFileSync(
     official_release: process.env.FLO_OFFICIAL_RELEASE === '1',
     posthog_project_token: process.env.POSTHOG_PROJECT_TOKEN?.trim() || null,
     posthog_host: process.env.POSTHOG_HOST?.trim() || null,
+    // FactorPOS: Submit Ticket goes to the owner's Apps Script web app (see
+    // scripts/support-ticket-apps-script). Set only by the FactorPOS release workflow.
+    support_ticket_url: process.env.FACTORPOS_SUPPORT_TICKET_URL?.trim() || null,
+    support_ticket_secret: process.env.FACTORPOS_SUPPORT_TICKET_SECRET?.trim() || null,
   }),
   'utf8',
 );

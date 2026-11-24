@@ -326,6 +326,43 @@ async function main() {
 
     const empty = await fetch(url('month=2026-01'), { headers: authHeader });
     assertEqualOrThrow(empty.status, 200, 'empty month still downloads');
+
+    console.log('\n─── VAT % is the applied rate, not the rounded ratio ───');
+    {
+      // 80.00 incl. VAT → 69.57 + 10.43: the ratio is 14.99%, the rate applied is 15%.
+      const snap = JSON.stringify([
+        {
+          lines: [
+            {
+              lineId: 'line-0001:prod-vat',
+              taxableBase: 69.57,
+              taxAmount: 10.43,
+              components: [{ rate: 15 }],
+            },
+          ],
+        },
+      ]);
+      const withSnapshot = seedBill({
+        billNumber: 'INV-R1',
+        paidAtLocal: '2026-08-10T12:00',
+        total: 80,
+        tax: 10.43,
+      });
+      db.prepare('UPDATE bills SET tax_snapshot = ? WHERE id = ?').run(snap, withSnapshot.billId);
+      seedBill({ billNumber: 'INV-R2', paidAtLocal: '2026-08-10T13:00', total: 80, tax: 10.43 });
+      const august = buildMonthlyVatDataset({ month: '2026-08' }, db);
+      const byNumber = (n: string) => august.invoices.find((row: any) => row.invoice_number === n);
+      assertEqualOrThrow(
+        byNumber('INV-R1')?.effective_vat_percent,
+        15,
+        'a 15% bill shows 15, not 14.99',
+      );
+      assertEqualOrThrow(
+        byNumber('INV-R2')?.effective_vat_percent,
+        14.99,
+        'without a tax breakdown it falls back to VAT ÷ amount before VAT',
+      );
+    }
   } finally {
     server.close();
     closeDatabase();

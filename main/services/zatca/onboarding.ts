@@ -22,7 +22,12 @@ import {
   type KeyProtection,
 } from './credentials';
 import { localIssueDateTime, zatcaSeller } from './document';
-import type { ComplianceCheckResult, FatooraAuth, FatooraClient } from './fatoora';
+import {
+  errorMessage,
+  type ComplianceCheckResult,
+  type FatooraAuth,
+  type FatooraClient,
+} from './fatoora';
 import { FIRST_PREVIOUS_INVOICE_HASH, signZatcaDocument } from './signing';
 import type { ZatcaDocumentInput } from './xml';
 
@@ -242,11 +247,8 @@ export async function runOnboarding(
       let protection: KeyProtection;
       try {
         protection = keyProtectionFor(environment);
-      } catch (error: any) {
-        throw new OnboardingError(
-          String(error?.message || error),
-          'zatca_secure_storage_unavailable',
-        );
+      } catch (error: unknown) {
+        throw new OnboardingError(errorMessage(error), 'zatca_secure_storage_unavailable');
       }
       const privateKey = generatePrivateKey();
       const portal: ZatcaPortal = environment === 'production' ? 'production' : 'simulation';
@@ -274,8 +276,8 @@ export async function runOnboarding(
     const step = async (work: () => Promise<void>) => {
       try {
         await work();
-      } catch (error: any) {
-        update(db, row!.id, { last_error: String(error?.message || error) });
+      } catch (error: unknown) {
+        update(db, row!.id, { last_error: errorMessage(error) });
         throw error;
       }
     };

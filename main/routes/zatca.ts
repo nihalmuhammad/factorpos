@@ -22,6 +22,7 @@ import { credentialSummary, loadSigningCredential } from '../services/zatca/cred
 import { zatcaSeller, ZatcaDocumentError } from '../services/zatca/document';
 import {
   createFatooraClient,
+  errorMessage,
   FATOORA_BASE_URL,
   FatooraError,
   type FatooraClient,
@@ -71,8 +72,8 @@ function sellerCheck(db: ReturnType<typeof getDatabase>): {
   try {
     zatcaSeller(sellerSnapshot(db));
     return { complete: true, problem: null };
-  } catch (error: any) {
-    return { complete: false, problem: String(error?.message || error) };
+  } catch (error: unknown) {
+    return { complete: false, problem: errorMessage(error) };
   }
 }
 
@@ -117,7 +118,7 @@ function overview(db: ReturnType<typeof getDatabase>) {
   };
 }
 
-function sendError(res: Response, error: any) {
+function sendError(res: Response, error: unknown) {
   if (error instanceof OnboardingError) {
     return res.status(error.statusCode).json({ error: error.message, code: error.code });
   }
@@ -131,7 +132,7 @@ function sendError(res: Response, error: any) {
   }
   res.locals.postHogError = error;
   console.error('[API] ZATCA error:', error);
-  return res.status(500).json({ error: String(error?.message || 'Internal server error') });
+  return res.status(500).json({ error: errorMessage(error) || 'Internal server error' });
 }
 
 router.get('/', requirePermission('settings.view'), (_req: Request, res: Response) => {

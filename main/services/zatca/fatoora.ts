@@ -72,15 +72,37 @@ function basicAuth(auth: FatooraAuth): string {
   return `Basic ${Buffer.from(`${token}:${auth.secret}`, 'utf8').toString('base64')}`;
 }
 
+export function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/** The parts of a FATOORA JSON response FactorPOS reads. */
+interface FatooraBody {
+  errors?: unknown;
+  message?: string;
+  dispositionMessage?: string;
+  binarySecurityToken?: string;
+  secret?: string;
+  requestID?: string | number;
+  requestId?: string | number;
+  reportingStatus?: string | null;
+  validationResults?: {
+    status?: string;
+    errorMessages?: unknown;
+    warningMessages?: unknown;
+  };
+}
+
 function messages(list: unknown): string[] {
   if (!Array.isArray(list)) return [];
-  return list.map(
-    (item: any) => [item?.code, item?.message].filter(Boolean).join(': ') || String(item),
-  );
+  return list.map((item: unknown) => {
+    const entry = (item ?? {}) as { code?: unknown; message?: unknown };
+    return [entry.code, entry.message].filter(Boolean).join(': ') || String(item);
+  });
 }
 
 /** The most useful error text FATOORA returned. */
-function errorText(body: any, status: number): string {
+function errorText(body: FatooraBody | null, status: number): string {
   const parts = [
     ...messages(body?.errors),
     ...messages(body?.validationResults?.errorMessages),
@@ -92,7 +114,7 @@ function errorText(body: any, status: number): string {
   return `ZATCA returned HTTP ${status}`;
 }
 
-function issued(body: any): IssuedCsid {
+function issued(body: FatooraBody | null): IssuedCsid {
   const token = String(body?.binarySecurityToken ?? '');
   const secret = String(body?.secret ?? '');
   const requestId = String(body?.requestID ?? body?.requestId ?? '');
@@ -125,13 +147,13 @@ export function createFatooraClient(baseUrl: string, fetchImpl: FetchLike = fetc
         body: JSON.stringify(init.body),
         signal: AbortSignal.timeout(TIMEOUT_MS),
       });
-    } catch (error: any) {
-      throw new FatooraError(`Could not reach ZATCA: ${error?.message || error}`, 503);
+    } catch (error: unknown) {
+      throw new FatooraError(`Could not reach ZATCA: ${errorMessage(error)}`, 503);
     }
     const text = await response.text();
-    let body: any = null;
+    let body: FatooraBody | null = null;
     try {
-      body = text ? JSON.parse(text) : null;
+      body = text ? (JSON.parse(text) as FatooraBody) : null;
     } catch {
       body = { message: text.slice(0, 300) };
     }

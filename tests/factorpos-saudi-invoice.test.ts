@@ -210,6 +210,32 @@ test('58 mm bills drop the unit price column but keep totals', () => {
   assert.ok(!text.includes('Price'));
 });
 
+test('browser bill: Arabic total labels get their own full-width line (no wrap on 58 mm)', () => {
+  const html: string = generateSaudiBillHtml(
+    {
+      ...bill(),
+      payment_details: [{ method: 'cash', amount: 400, timestamp: '' }],
+      order: order(),
+    },
+    {
+      paperSize: 'thermal58',
+      businessName: 'nihal cafe',
+      vatNumber: '300000000000003',
+      qrDataUrl: null,
+    },
+  );
+  for (const label of ['الإجمالي غير شامل الضريبة', 'الإجمالي شامل الضريبة']) {
+    assert.ok(
+      html.includes(`<td colspan="2"><div class="ar" dir="rtl">${label}</div></td>`),
+      `${label} spans the bill width`,
+    );
+  }
+  assert.ok(
+    html.includes('<tr class="grand"><td>Total incl. VAT</td>'),
+    'English label beside the amount',
+  );
+});
+
 test('browser bill shows both titles, VAT split and the QR image', () => {
   const html: string = generateSaudiBillHtml(
     {
