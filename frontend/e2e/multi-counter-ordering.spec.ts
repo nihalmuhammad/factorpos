@@ -509,7 +509,9 @@ test('Multi-counter ordering flow: Owner config, create & pay, queue, table occu
 
       await page.getByRole('button', { name: 'Place Order' }).click();
       await expect(
-        page.getByText('FloCafe could not confirm whether the order or payment was saved.').last(),
+        page
+          .getByText('FactorPOS could not confirm whether the order or payment was saved.')
+          .last(),
       ).toBeVisible();
       expect(orderPosts, 'changing checkout mode does not submit a second order').toHaveLength(1);
 

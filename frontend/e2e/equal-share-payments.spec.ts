@@ -976,7 +976,7 @@ test.describe('equal share payments', () => {
     await expect(
       page
         .getByRole('alert')
-        .filter({ hasText: 'FloCafe could not confirm whether the order or payment was saved.' }),
+        .filter({ hasText: 'FactorPOS could not confirm whether the order or payment was saved.' }),
     ).toBeVisible();
 
     // Nothing advanced: same amount, same count, same application.
@@ -1039,7 +1039,7 @@ test.describe('equal share payments', () => {
     await expect(
       page
         .getByRole('alert')
-        .filter({ hasText: 'FloCafe could not confirm whether the order or payment was saved.' }),
+        .filter({ hasText: 'FactorPOS could not confirm whether the order or payment was saved.' }),
     ).toBeVisible();
     await expect(page.getByRole('button', { name: 'Close' })).toBeDisabled();
 

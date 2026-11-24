@@ -1469,13 +1469,15 @@ test('Network pairing cards explain local and VPN/mesh QR choices across setting
     'VPN / Mesh-Netzwerk',
   );
 
-  await selectLanguage('Geschäftsdaten', 'ar');
+  // FactorPOS: Arabic is not in the FactorPOS language picker yet, so the
+  // right-to-left check uses Persian, which is.
+  await selectLanguage('Geschäftsdaten', 'fa');
   await expect(page.locator('html')).toHaveAttribute('dir', 'rtl');
-  await page.getByRole('button', { name: 'الطلب من جانب الطاولة', exact: true }).click();
+  await page.getByRole('button', { name: 'سفارش‌گیری پشت میز', exact: true }).click();
   await expectPairingHints(
-    'استخدم هذا الخيار عندما تتمكن جميع الأجهزة من الوصول إلى هذا العنوان عبر Wi-Fi أو Ethernet أو شبكة VPN/mesh',
-    'استخدم هذا الخيار عندما تتصل الأجهزة عبر VPN أو شبكة متداخلة بين شبكات فرعية أو مواقع مختلفة',
-    'شبكة VPN / شبكة متشابكة',
+    'وقتی همه دستگاه‌ها بتوانند از طریق Wi-Fi، Ethernet یا شبکه VPN/mesh به این نشانی دسترسی داشته باشند، از این گزینه استفاده کنید',
+    'وقتی دستگاه‌ها از طریق VPN یا شبکه مش بین زیرشبکه‌ها یا مکان‌های مختلف متصل می‌شوند، از این گزینه استفاده کنید',
+    'VPN / شبکه مش',
   );
 });
 

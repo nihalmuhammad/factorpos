@@ -352,7 +352,7 @@ test('a lost prepaid payment response replays the same saved request after bill 
     const checkout = page.getByTestId('prepaid-checkout-modal');
     await expect(checkout).toBeVisible();
     await expect(
-      checkout.getByText('FloCafe could not confirm whether the order or payment was saved.', {
+      checkout.getByText('FactorPOS could not confirm whether the order or payment was saved.', {
         exact: true,
       }),
     ).toBeVisible();
@@ -597,7 +597,7 @@ test('an unrelated payment does not resolve another cashier’s pending payment 
   await expect(
     page
       .getByRole('main')
-      .getByText('FloCafe could not confirm whether the order or payment was saved.', {
+      .getByText('FactorPOS could not confirm whether the order or payment was saved.', {
         exact: false,
       }),
   ).toBeVisible();

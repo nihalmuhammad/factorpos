@@ -1063,7 +1063,8 @@ test('POS scheduled orders: unresolved order attempts preserve payload and idemp
     await route.continue();
   });
 
-  const unconfirmedToastText = 'FloCafe could not confirm whether the order or payment was saved.';
+  const unconfirmedToastText =
+    'FactorPOS could not confirm whether the order or payment was saved.';
   const submitExpectedAbortedOrder = async (
     expectedCount: number,
     expectedScheduledFor: string,
