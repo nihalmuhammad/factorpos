@@ -287,6 +287,21 @@ test('editions: KOT by default; the ZATCA installer has its own identity and fee
   const workflow = read('.github/workflows/factorpos-release.yml');
   assert.match(workflow, /edition: zatca/, 'the release builds the ZATCA installer');
   assert.match(workflow, /gh release upload zatca-updates/, 'and refreshes its feed');
+  // Submit Ticket secrets are stamped in the per-edition build job, so both installers get them.
+  const buildJob = workflow.slice(
+    workflow.indexOf('  build-windows:'),
+    workflow.indexOf('  publish:'),
+  );
+  assert.match(buildJob, /edition: zatca/, 'the per-edition build job builds ZATCA');
+  assert.match(
+    buildJob,
+    /name: Compile backend[\s\S]*?FACTORPOS_SUPPORT_TICKET_URL: \$\{\{ secrets\.FACTORPOS_SUPPORT_TICKET_URL \}\}/,
+    'both editions stamp the Submit Ticket endpoint',
+  );
+  assert.ok(
+    require('../scripts/release/electron-builder-zatca.cjs').files.includes('dist/**/*'),
+    'the ZATCA installer ships the stamped build identity',
+  );
 });
 
 test('orders carry the day token and setup preselects Saudi Arabia', () => {
