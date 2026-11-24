@@ -105,3 +105,14 @@ FloCafe, set `package.json` to the higher of FloCafe's version and the last
 FactorPOS release, then bump it when you tag the next release (for example
 FloCafe 3.13.23 merged → release `v3.13.24-beta.1`, then `v3.13.24`). If
 FloCafe later publishes the same number, use the next one.
+
+## CI formatting check on FloCafe merges
+
+CI checks the formatting of every JS/TS file a pull request changes. FloCafe has
+older files that are not formatted, and a FloCafe merge touches them, so FactorPOS
+changed `scripts/ci/check-changed-format.cjs` to skip a file that is byte-for-byte
+FloCafe's version at a FloCafe merge in the pull request. FactorPOS's own edits are
+still checked. Keep "merge FloCafe" in the merge commit subject (the sync workflow and
+`Merge FloCafe X.Y.Z into FactorPOS` both do); otherwise the merge is not recognised.
+Do not reformat FloCafe's files: every later FloCafe change to them would conflict.
+

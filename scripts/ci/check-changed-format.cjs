@@ -146,10 +146,43 @@ function mergeBaseCommit(base, head) {
   );
 }
 
+// FactorPOS: a FloCafe update merge brings in upstream files exactly as FloCafe ships
+// them, including FloCafe's own unformatted backlog. Reformatting those would make every
+// later FloCafe change to them conflict, so a file that is byte-for-byte FloCafe's version
+// at a FloCafe merge in this range is left out. FactorPOS's own edits are still checked.
+const FLOCAFE_MERGE_SUBJECT = /\bmerge FloCafe\b/i;
+
+function flocafeMergeSides(from, head) {
+  const merges = git(['rev-list', '--merges', '--format=%P%x09%s', `${from}..${head}`], {
+    allowFailure: true,
+  });
+  if (merges.status !== 0) return [];
+  return merges.stdout
+    .split('\n')
+    .filter((line) => line && !line.startsWith('commit '))
+    .map((line) => line.split('\t'))
+    .filter(([, subject]) => FLOCAFE_MERGE_SUBJECT.test(subject ?? ''))
+    .map(([parents]) => parents.split(' ')[1])
+    .filter(Boolean);
+}
+
+function identicalToFlocafe(file, head, sides) {
+  return sides.some(
+    (side) => git(['diff', '--quiet', side, head, '--', file], { allowFailure: true }).status === 0,
+  );
+}
+
 function changedFiles(base, head, strategy) {
   const from = strategy === 'merge-base' ? mergeBaseCommit(base, head) : base;
   const diff = git(['diff', '--name-only', '--diff-filter=ACMRT', '-z', `${from}..${head}`]);
-  return diff.stdout.split('\0').filter(Boolean);
+  const files = diff.stdout.split('\0').filter(Boolean);
+  const sides = flocafeMergeSides(from, head);
+  if (sides.length === 0) return files;
+  const own = files.filter((file) => !identicalToFlocafe(file, head, sides));
+  console.log(
+    `FactorPOS: ${files.length - own.length} changed file(s) are FloCafe's own version from a FloCafe merge; not format-checked.`,
+  );
+  return own;
 }
 
 function runCheck(pkg, files) {
