@@ -350,7 +350,9 @@ function main() {
         }
       ).value,
     ),
-    { source: 'core', id: 'classic' },
+    // FactorPOS: then moved to the compact ORDER NOTE the shop printed before
+    // (FactorPOS migration 2026-11-24-bill-template-compact-default).
+    { source: 'core', id: 'compact' },
     'existing stores receive the classic bill template during upgrade, upgraded to the structured selection identity',
   );
   assert.equal(

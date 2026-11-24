@@ -1,8 +1,9 @@
 import { getDatabase } from '../db';
 import { loadMerchantPrintTemplateRow } from './merchant-print-templates';
 
-export const CORE_BILL_TEMPLATES = ['classic', 'compact'] as const;
-export type CoreBillTemplate = typeof CORE_BILL_TEMPLATES[number];
+// FactorPOS: 'saudi' is the Saudi simplified tax invoice with the ZATCA QR.
+export const CORE_BILL_TEMPLATES = ['classic', 'compact', 'saudi'] as const;
+export type CoreBillTemplate = (typeof CORE_BILL_TEMPLATES)[number];
 
 export interface InstalledPrintTemplate {
   template_id: string;
@@ -88,7 +89,8 @@ export function upgradeBillTemplateValue(rawValue: unknown): string | null {
 
 export function listInstalledPrintTemplates(): InstalledPrintTemplate[] {
   try {
-    return getDatabase().prepare(`
+    return getDatabase()
+      .prepare(`
       SELECT template.*
       FROM installed_print_templates AS template
       JOIN country_pack_versions AS version ON version.id = template.pack_version_id
@@ -96,7 +98,8 @@ export function listInstalledPrintTemplates(): InstalledPrintTemplate[] {
       WHERE version.status NOT IN ('revoked', 'incompatible')
         AND pack.status IN ('active', 'installed')
       ORDER BY template.country, template.display_name, template.template_id
-    `).all() as InstalledPrintTemplate[];
+    `)
+      .all() as InstalledPrintTemplate[];
   } catch {
     return [];
   }
@@ -104,7 +107,8 @@ export function listInstalledPrintTemplates(): InstalledPrintTemplate[] {
 
 export function loadInstalledPrintTemplate(templateId: string): InstalledPrintTemplate | null {
   try {
-    const row = getDatabase().prepare(`
+    const row = getDatabase()
+      .prepare(`
       SELECT template.*
       FROM installed_print_templates AS template
       JOIN country_pack_versions AS version ON version.id = template.pack_version_id
@@ -113,7 +117,8 @@ export function loadInstalledPrintTemplate(templateId: string): InstalledPrintTe
         AND version.status NOT IN ('revoked', 'incompatible')
         AND pack.status IN ('active', 'installed')
       LIMIT 1
-    `).get(templateId) as InstalledPrintTemplate | undefined;
+    `)
+      .get(templateId) as InstalledPrintTemplate | undefined;
     return row || null;
   } catch {
     return null;

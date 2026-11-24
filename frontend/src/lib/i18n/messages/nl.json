@@ -1923,6 +1923,8 @@
     "billTemplateMerchantCreated": "Gemaakt",
     "billTemplateMerchantDesc": "Uw aangepaste bonlay-out.",
     "billTemplateMerchantImported": "Geïmporteerd",
+    "billTemplateSaudiDesc": "Vereenvoudigde Saoedische belastingfactuur met btw-nummer, bedrag excl. btw, 15% btw en ZATCA-QR-code.",
+    "billTemplateSaudiName": "Saoedische belastingfactuur",
     "billTemplateSaved": "Bonsjabloon opgeslagen",
     "billingType": "Afrekenmodel",
     "billingTypePostpaid": "Postpaid – Betalen bij het afrekenen (bestellingen vasthouden)",

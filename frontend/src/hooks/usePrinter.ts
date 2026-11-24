@@ -363,10 +363,31 @@ export const usePrinterStore = create<PrinterState>()(
                   id: billTemplate,
                 });
           const rasterBillTemplate = resolveCoreBillTemplate(billTemplate, billTemplateSource);
+          // FactorPOS: Saudi simplified tax invoice with the ZATCA QR (core 'saudi').
+          const saudiInvoice = billTemplateSource === 'core' && billTemplate === 'saudi';
 
           const executeBrowserPrint = async (): Promise<PrintWarning[]> => {
             const { printWebBill } = await import('@/lib/printer/web-print');
             throwIfTenantChanged();
+            let saudiQrDataUrl: string | null = null;
+            const saudiWarnings: PrintWarning[] = [];
+            if (saudiInvoice) {
+              try {
+                const qr = await api.get<{ qr_data_url: string }>(`/bills/${bill.id}/zatca-qr`);
+                saudiQrDataUrl = qr.data.qr_data_url ?? null;
+              } catch (err: unknown) {
+                const e = err as { response?: { data?: { error?: string } }; message?: string };
+                saudiWarnings.push({
+                  field: 'ZATCA QR',
+                  text: '',
+                  message:
+                    e.response?.data?.error ||
+                    'The ZATCA QR could not be created, so the bill printed without it.',
+                  kind: 'configuration',
+                });
+              }
+              throwIfTenantChanged();
+            }
             const languages = opts?.languages ?? (await resolveReadyBillPrintLanguages());
             throwIfTenantChanged();
             windowTransferred = true;
@@ -375,8 +396,17 @@ export const usePrinterStore = create<PrinterState>()(
               tenant,
               {
                 paperSize: printerPaperSize,
-                // FactorPOS: browser bills print as the compact ORDER NOTE.
-                compactLayout: true,
+                // FactorPOS: the compact template is the token ORDER NOTE; other
+                // templates keep FloCafe's browser bill.
+                compactLayout: rasterBillTemplate === 'compact',
+                ...(saudiInvoice
+                  ? {
+                      saudiInvoice: {
+                        qrDataUrl: saudiQrDataUrl,
+                        vatNumber: billTaxRegistrationNumber || undefined,
+                      },
+                    }
+                  : {}),
                 textSize: activeTextSize,
                 columns: billColumns,
                 languages,
@@ -405,9 +435,8 @@ export const usePrinterStore = create<PrinterState>()(
               },
               reservedWindow,
             );
-            return billTemplateWarning
-              ? [...browserWarnings, billTemplateWarning]
-              : browserWarnings;
+            const allWarnings = [...browserWarnings, ...saudiWarnings];
+            return billTemplateWarning ? [...allWarnings, billTemplateWarning] : allWarnings;
           };
 
           const hw = get().hardwarePrinter;
@@ -459,6 +488,14 @@ export const usePrinterStore = create<PrinterState>()(
             if (!hw && !printerService.isConnected && get().printMethod === 'escpos') {
               toast('No thermal printer configured — printing via system print', { icon: 'ℹ️' });
             }
+            return await executeBrowserPrint();
+          }
+
+          // FactorPOS: the direct-USB byte encoder has no Saudi layout; system print has it.
+          if (saudiInvoice) {
+            toast('Saudi tax invoice prints via system print on direct USB printers', {
+              icon: 'ℹ️',
+            });
             return await executeBrowserPrint();
           }
 

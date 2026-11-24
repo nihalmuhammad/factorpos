@@ -1923,6 +1923,8 @@
     "billTemplateMerchantCreated": "సృష్టించబడింది",
     "billTemplateMerchantDesc": "మీ కస్టమ్ రసీదు లేఅవుట్.",
     "billTemplateMerchantImported": "దిగుమతి చేయబడింది",
+    "billTemplateSaudiDesc": "వ్యాట్ నంబర్, వ్యాట్కు ముందు మొత్తం, 15% వ్యాట్ మరియు ZATCA QR కోడ్తో సౌదీ సరళీకృత పన్ను ఇన్వాయిస్.",
+    "billTemplateSaudiName": "సౌదీ పన్ను ఇన్వాయిస్",
     "billTemplateSaved": "బిల్ టెంప్లేట్ సేవ్ చేయబడింది",
     "billingType": "బిల్లింగ్ రకం",
     "billingTypePostpaid": "పోస్ట్పెయిడ్ – చెక్అవుట్ వద్ద చెల్లించండి (ఆర్డర్లను హోల్డ్ చేయండి)",

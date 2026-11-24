@@ -1923,6 +1923,8 @@
     "billTemplateMerchantCreated": "تم إنشاؤه",
     "billTemplateMerchantDesc": "تصميم الإيصال المخصص الخاص بك.",
     "billTemplateMerchantImported": "مستورد",
+    "billTemplateSaudiDesc": "فاتورة ضريبية مبسطة مع الرقم الضريبي والمبلغ قبل الضريبة وضريبة القيمة المضافة 15% ورمز QR الخاص بهيئة الزكاة والضريبة والجمارك.",
+    "billTemplateSaudiName": "فاتورة ضريبية سعودية",
     "billTemplateSaved": "تم حفظ نموذج الفاتورة",
     "billingType": "نوع الفوترة",
     "billingTypePostpaid": "الدفع الآجل – الدفع عند الاستلام (الطلبات المعلقة)",

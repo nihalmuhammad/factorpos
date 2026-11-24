@@ -1923,6 +1923,8 @@
     "billTemplateMerchantCreated": "Erstellt",
     "billTemplateMerchantDesc": "Ihre eigene Beleggestaltung.",
     "billTemplateMerchantImported": "Importiert",
+    "billTemplateSaudiDesc": "Vereinfachte saudische Steuerrechnung mit USt-Nummer, Nettobetrag, 15 % MwSt. und ZATCA-QR-Code.",
+    "billTemplateSaudiName": "Saudische Steuerrechnung",
     "billTemplateSaved": "Rechnungsvorlage gespeichert",
     "billingType": "Abrechnungstyp",
     "billingTypePostpaid": "Nachträgliche Zahlung – beim Kassenabschluss bezahlen (Bestellungen zurückstellen)",

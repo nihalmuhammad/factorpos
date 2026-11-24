@@ -1923,6 +1923,8 @@
     "billTemplateMerchantCreated": "Created",
     "billTemplateMerchantDesc": "Your custom receipt layout.",
     "billTemplateMerchantImported": "Imported",
+    "billTemplateSaudiDesc": "Saudi simplified tax invoice with the VAT number, amount before VAT, VAT 15% and the ZATCA QR code.",
+    "billTemplateSaudiName": "Saudi Tax Invoice",
     "billTemplateSaved": "Bill template saved",
     "billingType": "Billing Type",
     "billingTypePostpaid": "Postpaid – Pay at checkout (hold orders)",

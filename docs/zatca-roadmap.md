@@ -120,10 +120,13 @@ Details: [monthly VAT invoice report](reference/daily-sales-export.md#monthly-va
 - Alerts before the 24-hour limit (BR-KSA-98); manager screen for warnings and
   rejections.
 
-### 7. Receipt
+### 7. Receipt — first part built on branch `feat/monthly-vat-invoice-report`
 
-- Bilingual Arabic/English simplified invoice with the QR code on the 80 mm
-  printer. FloCafe's printer settings do not yet offer this.
+- Done: "Saudi Tax Invoice" bill format, a bilingual Arabic/English simplified
+  invoice with the QR (tags 1–5) on thermal and browser printing, and the Bill Template
+  setting honoured on every print path.
+- Left: QR tags 6–9 once invoices are signed (phase 4); test prints on the pilot
+  80 mm printer; direct-USB (WebUSB) byte layout.
 
 ### 8. Pilot
 

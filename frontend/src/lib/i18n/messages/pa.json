@@ -1923,6 +1923,8 @@
     "billTemplateMerchantCreated": "ਬਣਾਇਆ ਗਿਆ",
     "billTemplateMerchantDesc": "ਤੁਹਾਡਾ ਕਸਟਮ ਰਸੀਦ ਲੇਆਉਟ।",
     "billTemplateMerchantImported": "ਇੰਪੋਰਟ ਕੀਤਾ ਗਿਆ",
+    "billTemplateSaudiDesc": "ਵੈਟ ਨੰਬਰ, ਵੈਟ ਤੋਂ ਪਹਿਲਾਂ ਦੀ ਰਕਮ, 15% ਵੈਟ ਅਤੇ ZATCA QR ਕੋਡ ਵਾਲਾ ਸਾਊਦੀ ਸਰਲ ਟੈਕਸ ਇਨਵੌਇਸ।",
+    "billTemplateSaudiName": "ਸਾਊਦੀ ਟੈਕਸ ਇਨਵੌਇਸ",
     "billTemplateSaved": "ਬਿੱਲ ਟੈਂਪਲੇਟ ਸੇਵ ਹੋ ਗਿਆ",
     "billingType": "ਬਿਲਿੰਗ ਕਿਸਮ",
     "billingTypePostpaid": "ਪੋਸਟਪੇਡ – ਚੈੱਕਆਉਟ ਉੱਤੇ ਭੁਗਤਾਨ ਕਰੋ (ਆਰਡਰ ਹੋਲਡ ਕਰੋ)",

@@ -1923,6 +1923,8 @@
     "billTemplateMerchantCreated": "สร้างแล้ว",
     "billTemplateMerchantDesc": "รูปแบบใบเสร็จที่คุณกำหนดเอง",
     "billTemplateMerchantImported": "นำเข้าแล้ว",
+    "billTemplateSaudiDesc": "ใบกำกับภาษีอย่างย่อของซาอุดีอาระเบีย พร้อมเลขประจำตัวผู้เสียภาษี ยอดก่อนภาษี ภาษี 15% และ QR โค้ด ZATCA",
+    "billTemplateSaudiName": "ใบกำกับภาษีซาอุฯ",
     "billTemplateSaved": "บันทึกเทมเพลตบิลแล้ว",
     "billingType": "ประเภทการเรียกเก็บเงิน",
     "billingTypePostpaid": "ชำระหลัง - ชำระเมื่อปิดบิล (พักคำสั่งซื้อได้)",

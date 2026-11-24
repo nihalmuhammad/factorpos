@@ -1923,6 +1923,8 @@
     "billTemplateMerchantCreated": "सिर्जना गरियो",
     "billTemplateMerchantDesc": "तपाईंको अनुकूलन रसिद लेआउट।",
     "billTemplateMerchantImported": "आयात गरिएको",
+    "billTemplateSaudiDesc": "भ्याट नम्बर, भ्याटअघिको रकम, १५% भ्याट र ZATCA QR कोडसहितको साउदी सरलीकृत कर बिल।",
+    "billTemplateSaudiName": "साउदी कर बिल",
     "billTemplateSaved": "बिल टेम्प्लेट सुरक्षित गरियो",
     "billingType": "बिलिङ प्रकार",
     "billingTypePostpaid": "पोस्टपेड - चेकआउटमा भुक्तान गर्नुहोस् (अर्डर होल्ड गर्नुहोस्)",

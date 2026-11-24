@@ -1923,6 +1923,8 @@
     "billTemplateMerchantCreated": "생성됨",
     "billTemplateMerchantDesc": "나만의 영수증 레이아웃.",
     "billTemplateMerchantImported": "가져옴",
+    "billTemplateSaudiDesc": "VAT 번호, 세전 금액, VAT 15%, ZATCA QR 코드가 포함된 사우디 간이 세금계산서.",
+    "billTemplateSaudiName": "사우디 세금계산서",
     "billTemplateSaved": "청구서 템플릿 저장됨",
     "billingType": "결제 방식",
     "billingTypePostpaid": "후불 - 계산 시 결제 (주문 보류)",

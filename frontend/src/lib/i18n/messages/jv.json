@@ -1923,6 +1923,8 @@
     "billTemplateMerchantCreated": "Digawe",
     "billTemplateMerchantDesc": "Tata papan struk mirunggan Panjenengan.",
     "billTemplateMerchantImported": "Diimpor",
+    "billTemplateSaudiDesc": "Invois pajek prasaja Saudi kanthi nomer PPN, jumlah sadurunge PPN, PPN 15% lan kode QR ZATCA.",
+    "billTemplateSaudiName": "Invois Pajek Saudi",
     "billTemplateSaved": "Templat tagihan disimpen",
     "billingType": "Jinis Panagihan",
     "billingTypePostpaid": "Mbayar mengko - mbayar nalika pambayaran (tahan pesenan)",

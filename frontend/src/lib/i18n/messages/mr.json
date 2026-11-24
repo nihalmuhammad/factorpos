@@ -1923,6 +1923,8 @@
     "billTemplateMerchantCreated": "तयार केलेले",
     "billTemplateMerchantDesc": "तुमचा सानुकूल पावती लेआउट.",
     "billTemplateMerchantImported": "इम्पोर्ट केलेले",
+    "billTemplateSaudiDesc": "व्हॅट क्रमांक, व्हॅटपूर्वीची रक्कम, १५% व्हॅट आणि ZATCA QR कोडसह सौदी सरलीकृत कर बीजक.",
+    "billTemplateSaudiName": "सौदी कर बीजक",
     "billTemplateSaved": "बिल टेम्पलेट जतन केले गेले",
     "billingType": "बिलिंग प्रकार",
     "billingTypePostpaid": "पोस्टपेड – चेकआउटच्या वेळी पेमेंट करा (ऑर्डर्स होल्ड करा)",

@@ -6,7 +6,8 @@ import type { KotLanguagePolicy, ReceiptLanguagePolicy } from '@print/types';
 
 export type PaperSize = 'thermal58' | 'thermal80';
 export type PrinterPrintMode = 'escpos' | 'browser';
-export type CoreBillTemplate = 'classic' | 'compact';
+// FactorPOS: 'saudi' is the Saudi simplified tax invoice with the ZATCA QR.
+export type CoreBillTemplate = 'classic' | 'compact' | 'saudi';
 export type BillTemplate = CoreBillTemplate | (string & {});
 export type AutoLockMinutes = 0 | 1 | 5 | 15 | 30;
 

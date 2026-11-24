@@ -10419,6 +10419,30 @@ export const FACTORPOS_MIGRATIONS: { id: string; up: () => void }[] = [
       db.exec('CREATE INDEX IF NOT EXISTS idx_orders_token_number ON orders(token_number)');
     },
   },
+  {
+    // Earlier FactorPOS builds printed every browser bill as the compact ORDER NOTE,
+    // whatever bill_template said, so shops kept FloCafe's 'classic' default. Now that
+    // the setting is honoured, move core 'classic' to 'compact' once so shops keep the
+    // bill they know. Pack and merchant selections are left alone.
+    id: '2026-11-24-bill-template-compact-default',
+    up: () => {
+      if (!getTables(db).includes('settings')) return;
+      const row = db.prepare(`SELECT value FROM settings WHERE key = 'bill_template'`).get() as
+        | { value: string }
+        | undefined;
+      const value = row?.value?.trim();
+      const isCoreClassic =
+        value === undefined ||
+        value === '' ||
+        value === 'classic' ||
+        value.replace(/\s/g, '') === '{"source":"core","id":"classic"}';
+      if (!isCoreClassic) return;
+      db.prepare(
+        `INSERT INTO settings (key, value, updated_at) VALUES ('bill_template', ?, ?)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
+      ).run(JSON.stringify({ source: 'core', id: 'compact' }), now());
+    },
+  },
 ];
 
 /**

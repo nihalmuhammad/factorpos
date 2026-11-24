@@ -187,6 +187,29 @@ test('compact receipt stays the FactorPOS order note', () => {
   assert.match(read('shared/print/document.ts'), /readonly tokenNumber: number \| null;/);
 });
 
+test('bill formats follow the printer setting; only compact is the token ORDER NOTE', () => {
+  const usePrinter = read('frontend/src/hooks/usePrinter.ts');
+  assert.match(usePrinter, /compactLayout: rasterBillTemplate === 'compact'/);
+  assert.doesNotMatch(usePrinter, /compactLayout: true/, 'browser bills are not forced compact');
+  assert.match(
+    read('frontend/src/lib/printer/web-print.ts'),
+    /compactLayout && meta\?\.tokenNumber !== null/,
+    'browser token line is compact-only',
+  );
+  assert.match(read('main/db.ts'), /'2026-11-24-bill-template-compact-default'/);
+});
+
+test('Saudi simplified tax invoice with the ZATCA QR is a core bill format', () => {
+  assert.match(
+    read('main/services/print-templates.ts'),
+    /CORE_BILL_TEMPLATES = \['classic', 'compact', 'saudi'\]/,
+  );
+  assert.match(read('main/printers/thermal.ts'), /renderSaudiReceiptViaDocument/);
+  assert.match(read('frontend/src/app/(dashboard)/settings/page.tsx'), /id: 'saudi'/);
+  assert.match(read('frontend/src/hooks/usePrinter.ts'), /\/bills\/\$\{bill\.id\}\/zatca-qr/);
+  assert.match(read('main/routes/bills.ts'), /'\/:id\/zatca-qr'/);
+});
+
 test('orders carry the day token and setup preselects Saudi Arabia', () => {
   const orders = read('main/routes/orders.ts');
   assert.match(
@@ -252,6 +275,7 @@ test('FactorPOS regression suites stay in npm test', () => {
     'test:raster',
     'test:shutdown-lifecycle',
     'test:factorpos-migrations',
+    'test:factorpos-saudi-invoice',
     'test:monthly-vat-export',
     'test:cash-closures',
     'test:country-localization',

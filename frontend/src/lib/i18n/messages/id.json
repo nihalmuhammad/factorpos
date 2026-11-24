@@ -1923,6 +1923,8 @@
     "billTemplateMerchantCreated": "Dibuat",
     "billTemplateMerchantDesc": "Tata letak struk kustom Anda.",
     "billTemplateMerchantImported": "Diimpor",
+    "billTemplateSaudiDesc": "Faktur pajak sederhana Saudi dengan nomor PPN, jumlah sebelum PPN, PPN 15% dan kode QR ZATCA.",
+    "billTemplateSaudiName": "Faktur Pajak Saudi",
     "billTemplateSaved": "Templat tagihan disimpan",
     "billingType": "Jenis Penagihan",
     "billingTypePostpaid": "Bayar nanti - bayar saat pembayaran (tahan pesanan)",

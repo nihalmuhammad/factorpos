@@ -82,7 +82,22 @@ Covered by `npm run test:factorpos-migrations`.
   `nightly-release.yml`) is manual-only in FactorPOS.
 - Customer day token: `generateTokenNumber()` in order creation
   (`main/routes/orders.ts`), reset by the day close (`main/routes/cash-closures.ts`),
-  shown on the dashboard, order cards, the compact ORDER NOTE and browser receipts.
+  shown on the dashboard, order cards and the compact ORDER NOTE (thermal and browser).
+- Bill formats (Settings → Printers → Bill Template) follow the setting on every print
+  path. Compact is the FactorPOS token ORDER NOTE; Classic is FloCafe's bill. Earlier
+  FactorPOS builds forced compact on browser printing, so the FactorPOS migration
+  `2026-11-24-bill-template-compact-default` moves a core `classic` setting to
+  `compact` once (fresh installs default to compact; pack and custom formats are left
+  alone).
+- Saudi Tax Invoice (core template `saudi`): a simplified tax invoice with seller name,
+  VAT number, the Arabic and English title, invoice number and date, items, amount
+  before VAT, VAT and total with VAT, and the ZATCA QR (TLV tags 1–5,
+  `shared/print/zatca-qr.ts`). Thermal: `main/printers/document-saudi.ts` (native
+  ESC/POS QR; Arabic labels print through raster mode or Arabic shaping, and are left
+  out on text-only printers). Browser: `frontend/src/lib/printer/saudi-web-print.ts`,
+  with the QR image from `GET /api/bills/:id/zatca-qr`. Direct-USB (WebUSB) printers
+  use system print for this format. QR tags 6–9 (hash, signature, public key) come
+  with invoice signing (roadmap phase 4).
 - First-run setup preselects Saudi Arabia, SAR and Asia/Riyadh, and lists the selected
   country first (`frontend/src/lib/factorpos-setup.ts`); FloCafe pins India and Argentina
   to the top, which hid the Saudi tick and made India a one-click mistake. FloCafe 3.14 no

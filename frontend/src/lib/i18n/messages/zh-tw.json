@@ -1923,6 +1923,8 @@
     "billTemplateMerchantCreated": "已建立",
     "billTemplateMerchantDesc": "您的自訂收據版式。",
     "billTemplateMerchantImported": "已匯入",
+    "billTemplateSaudiDesc": "沙烏地簡化稅務發票，包含增值稅號、稅前金額、15% 增值稅和 ZATCA QR 碼。",
+    "billTemplateSaudiName": "沙烏地稅務發票",
     "billTemplateSaved": "帳單模板已儲存",
     "billingType": "計費型別",
     "billingTypePostpaid": "後付費 — 結帳時付款（可掛單）",

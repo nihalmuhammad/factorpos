@@ -1923,6 +1923,8 @@
     "billTemplateMerchantCreated": "作成済み",
     "billTemplateMerchantDesc": "カスタムレシートレイアウトです。",
     "billTemplateMerchantImported": "インポート済み",
+    "billTemplateSaudiDesc": "VAT番号、税抜金額、VAT 15%、ZATCA QRコードを記載したサウジの簡易税務請求書。",
+    "billTemplateSaudiName": "サウジ税務請求書",
     "billTemplateSaved": "請求書テンプレートを保存しました",
     "billingType": "請求方式",
     "billingTypePostpaid": "後払い - 会計時に支払い（注文を保留）",

@@ -188,8 +188,10 @@ Pts Balance   210
   123 Main St
   Ph: 98765...`;
 
-const COMPACT_PREVIEW = `  STORE NAME
+// FactorPOS: compact is the token ORDER NOTE.
+const COMPACT_PREVIEW = `  ORDER NOTE
 -----------
+  TOKEN #12
 Bill #1    12:30
 -----------
 Burger           99
@@ -199,6 +201,23 @@ TOTAL            99
 Cash             99
 -----------
   Thank you!`;
+
+// FactorPOS: Saudi simplified tax invoice with the ZATCA QR.
+const SAUDI_PREVIEW = `   STORE NAME
+ VAT No: 3000...
+---------------
+فاتورة ضريبية مبسطة
+SIMPLIFIED TAX INVOICE
+---------------
+Invoice No: B-1
+Date: 01/01 12:30
+---------------
+Burger    1  115
+---------------
+Excl. VAT     100
+VAT 15%        15
+TOTAL incl.   115
+    [ QR ]`;
 
 const TEMPLATE_CARDS: TemplateCard[] = [
   {
@@ -212,6 +231,13 @@ const TEMPLATE_CARDS: TemplateCard[] = [
     id: 'compact',
     nameKey: 'billTemplateCompactName',
     preview: COMPACT_PREVIEW,
+    source: 'core',
+    selectionSource: 'core',
+  },
+  {
+    id: 'saudi',
+    nameKey: 'billTemplateSaudiName',
+    preview: SAUDI_PREVIEW,
     source: 'core',
     selectionSource: 'core',
   },

@@ -196,6 +196,53 @@ function main() {
   );
   closeDatabase();
 
+  // Shops kept FloCafe's 'classic' default while the browser always printed the compact
+  // ORDER NOTE; the setting is now honoured, so 'classic' moves to 'compact' once.
+  const COMPACT = JSON.stringify({ source: 'core', id: 'compact' });
+  const billTemplate = () =>
+    (getDatabase().prepare(`SELECT value FROM settings WHERE key = 'bill_template'`).get() as any)
+      ?.value;
+  freshDir('bill-template-fresh');
+  initDatabase();
+  assert(billTemplate() === COMPACT, 'fresh install defaults to the compact ORDER NOTE');
+  closeDatabase();
+  for (const [label, before, after] of [
+    ['core-classic', JSON.stringify({ source: 'core', id: 'classic' }), COMPACT],
+    ['legacy-classic', 'classic', COMPACT],
+    [
+      'saudi',
+      JSON.stringify({ source: 'core', id: 'saudi' }),
+      JSON.stringify({ source: 'core', id: 'saudi' }),
+    ],
+    [
+      'pack',
+      JSON.stringify({ source: 'pack', id: 'sa.vat.tax-invoice.v1' }),
+      JSON.stringify({ source: 'pack', id: 'sa.vat.tax-invoice.v1' }),
+    ],
+  ]) {
+    freshDir(`bill-template-${label}`);
+    initDatabase();
+    getDatabase().prepare(`UPDATE settings SET value = ? WHERE key = 'bill_template'`).run(before);
+    getDatabase()
+      .prepare(
+        `DELETE FROM _factorpos_migrations WHERE id = '2026-11-24-bill-template-compact-default'`,
+      )
+      .run();
+    closeDatabase();
+    initDatabase();
+    assert(billTemplate() === after, `bill_template ${label}: ${before} → ${after}`);
+    getDatabase()
+      .prepare(`UPDATE settings SET value = ? WHERE key = 'bill_template'`)
+      .run(JSON.stringify({ source: 'core', id: 'classic' }));
+    closeDatabase();
+    initDatabase();
+    assert(
+      billTemplate() === JSON.stringify({ source: 'core', id: 'classic' }),
+      `bill_template ${label}: a later choice of classic is kept`,
+    );
+    closeDatabase();
+  }
+
   // A database newer than this build is still refused, never rewritten.
   freshDir('newer');
   initDatabase();

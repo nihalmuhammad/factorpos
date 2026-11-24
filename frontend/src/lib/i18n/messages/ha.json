@@ -1923,6 +1923,8 @@
     "billTemplateMerchantCreated": "An ƙirƙira",
     "billTemplateMerchantDesc": "Tsarin rasitinka na musamman.",
     "billTemplateMerchantImported": "An shigo da shi",
+    "billTemplateSaudiDesc": "Saukakken rasidin haraji na Saudiyya mai lambar VAT, adadi kafin VAT, VAT 15% da lambar QR ta ZATCA.",
+    "billTemplateSaudiName": "Rasidin Haraji na Saudiyya",
     "billTemplateSaved": "An adana samfurin lissafi",
     "billingType": "Nau'in Biyan Lissafi",
     "billingTypePostpaid": "Biyan Daga Baya – Biya a wurin fita (riƙe ododi)",

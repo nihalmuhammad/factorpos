@@ -355,9 +355,11 @@ console.log('\n▶ Migration v72: fresh install');
   ok('table schema matches the ideal fresh-install shape (both paths share MIGRATIONS)');
 
   const stored = db.prepare(`SELECT value FROM settings WHERE key='bill_template'`).get() as any;
+  // FactorPOS: the structured 'classic' default then moves to the compact ORDER NOTE
+  // (FactorPOS migration 2026-11-24-bill-template-compact-default).
   assert.deepEqual(
     JSON.parse(stored.value),
-    { source: 'core', id: 'classic' },
+    { source: 'core', id: 'compact' },
     'seeded legacy bill_template value upgraded to the structured selection',
   );
   ok('bill_template setting upgraded to structured JSON on fresh installs');

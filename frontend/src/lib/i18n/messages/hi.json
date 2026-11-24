@@ -1923,6 +1923,8 @@
     "billTemplateMerchantCreated": "बनाया गया",
     "billTemplateMerchantDesc": "आपका कस्टम बिल लेआउट।",
     "billTemplateMerchantImported": "आयातित",
+    "billTemplateSaudiDesc": "वैट नंबर, वैट से पहले की राशि, 15% वैट और ZATCA QR कोड के साथ सऊदी सरलीकृत टैक्स इनवॉइस।",
+    "billTemplateSaudiName": "सऊदी टैक्स इनवॉइस",
     "billTemplateSaved": "बिल टेम्पलेट सहेजा गया",
     "billingType": "बिलिंग प्रकार",
     "billingTypePostpaid": "पोस्टपेड - चेकआउट पर भुगतान करें (ऑर्डर रोकें)",

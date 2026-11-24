@@ -476,11 +476,8 @@ async function run() {
     const enHtml = generateBillHtml(sampleEnBill, usTenant, { language: 'en', isReprint: true });
     assert('EN receipt has lang="en" and dir="ltr"', enHtml.includes('<html lang="en" dir="ltr">'));
     assert(
-      'EN receipt emphasizes token by 3pt in bold',
-      enHtml.includes('<div class="token-number">TOKEN #42</div>') &&
-        enHtml.includes(
-          '.token-number { text-align: center; font-size: calc(1em + 3pt); font-weight: 700;',
-        ),
+      'EN classic browser receipt has no day token (only the compact ORDER NOTE has it)',
+      !enHtml.includes('<div class="token-number">'),
     );
     assert(
       'EN receipt emphasizes total amount by 3pt in bold',
@@ -1700,6 +1697,13 @@ async function run() {
       'compact receipt labels the final amount as Total',
       compactHtml.includes('<tr class="total-row"><td><strong>TOTAL</strong>') &&
         !compactHtml.includes('<strong>Grand Total</strong>'),
+    );
+    assert(
+      'compact receipt emphasizes the day token by 3pt in bold',
+      compactHtml.includes('<div class="token-number">TOKEN #') &&
+        compactHtml.includes(
+          '.token-number { text-align: center; font-size: calc(1em + 3pt); font-weight: 700;',
+        ),
     );
     assert(
       'compact receipt is titled Order Note',

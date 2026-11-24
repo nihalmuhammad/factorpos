@@ -1923,6 +1923,8 @@
     "billTemplateMerchantCreated": "Đã tạo",
     "billTemplateMerchantDesc": "Bố cục biên nhận tùy chỉnh của bạn.",
     "billTemplateMerchantImported": "Đã nhập",
+    "billTemplateSaudiDesc": "Hóa đơn thuế giản lược của Ả Rập Xê Út có mã số VAT, số tiền trước VAT, VAT 15% và mã QR ZATCA.",
+    "billTemplateSaudiName": "Hóa đơn thuế Ả Rập Xê Út",
     "billTemplateSaved": "Đã lưu mẫu hóa đơn",
     "billingType": "Loại thanh toán",
     "billingTypePostpaid": "Trả sau - thanh toán tại quầy (giữ đơn)",

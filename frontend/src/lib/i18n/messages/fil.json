@@ -1923,6 +1923,8 @@
     "billTemplateMerchantCreated": "Nagawa",
     "billTemplateMerchantDesc": "Ang iyong pasadyang layout ng resibo.",
     "billTemplateMerchantImported": "Na-import",
+    "billTemplateSaudiDesc": "Pinasimpleng Saudi tax invoice na may VAT number, halaga bago ang VAT, 15% VAT at ZATCA QR code.",
+    "billTemplateSaudiName": "Saudi na Tax Invoice",
     "billTemplateSaved": "Nai-save ang template ng bill",
     "billingType": "Uri ng Pagsingil",
     "billingTypePostpaid": "Postpaid – Magbayad sa checkout (mga order sa lamesa)",

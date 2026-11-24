@@ -1923,6 +1923,8 @@
     "billTemplateMerchantCreated": "உருவாக்கப்பட்டது",
     "billTemplateMerchantDesc": "உங்கள் தனிப்பயன் ரசீது வடிவமைப்பு.",
     "billTemplateMerchantImported": "இறக்குமதி செய்யப்பட்டது",
+    "billTemplateSaudiDesc": "வாட் எண், வாட்டுக்கு முந்தைய தொகை, 15% வாட் மற்றும் ZATCA QR குறியீட்டுடன் சவுதி எளிய வரி விலைப்பட்டியல்.",
+    "billTemplateSaudiName": "சவுதி வரி விலைப்பட்டியல்",
     "billTemplateSaved": "பில் படிவம் சேமிக்கப்பட்டது",
     "billingType": "பில்லிங் வகை",
     "billingTypePostpaid": "பின்செலுத்துகை (Postpaid) – சாப்பிட்ட பிறகு பணம் செலுத்துதல் (ஆர்டர்களை நிறுத்தி வைத்தல்)",

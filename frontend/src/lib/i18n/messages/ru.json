@@ -1923,6 +1923,8 @@
     "billTemplateMerchantCreated": "Создано",
     "billTemplateMerchantDesc": "Ваш индивидуальный макет квитанции.",
     "billTemplateMerchantImported": "Импортировано",
+    "billTemplateSaudiDesc": "Упрощённый налоговый счёт Саудовской Аравии с номером НДС, суммой без НДС, НДС 15% и QR-кодом ZATCA.",
+    "billTemplateSaudiName": "Саудовский налоговый счёт",
     "billTemplateSaved": "Шаблон счёта сохранён.",
     "billingType": "Режим оплаты",
     "billingTypePostpaid": "Постоплата - оплата после оформления заказа",

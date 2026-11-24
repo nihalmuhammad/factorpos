@@ -1923,6 +1923,8 @@
     "billTemplateMerchantCreated": "بنایا گیا",
     "billTemplateMerchantDesc": "آپ کا اپنا رسید لے آؤٹ۔",
     "billTemplateMerchantImported": "درآمد شدہ",
+    "billTemplateSaudiDesc": "وی اے ٹی نمبر، وی اے ٹی سے پہلے کی رقم، 15% وی اے ٹی اور ZATCA کیو آر کوڈ کے ساتھ سعودی سادہ ٹیکس انوائس۔",
+    "billTemplateSaudiName": "سعودی ٹیکس انوائس",
     "billTemplateSaved": "بل ٹیمپلیٹ محفوظ ہو گیا",
     "billingType": "بلنگ کی قسم",
     "billingTypePostpaid": "ادائیگی بعد میں - چیک آؤٹ پر ادائیگی (آرڈر روکیں)",

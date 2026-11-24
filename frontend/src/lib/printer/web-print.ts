@@ -25,6 +25,7 @@ import {
   resolveReadyBillPrintLanguages,
 } from './print-document';
 import { RECEIPT_BRANDING_NAME } from './branding';
+import { generateSaudiBillHtml } from './saudi-web-print';
 import { LANGUAGES, type Language } from '@/lib/i18n/languages';
 import {
   getBlock,
@@ -109,6 +110,8 @@ export interface WebPrintOptions {
   language?: Language;
   /** Resolved receipt languages supplied by the caller's print policy. */
   languages?: ResolvedPrintLanguages;
+  /** FactorPOS: print the Saudi simplified tax invoice with this ZATCA QR image. */
+  saudiInvoice?: { qrDataUrl: string | null; vatNumber?: string };
 }
 
 /** Resolve tax-id label printed on receipt (special case for Iranian Economic Code). */
@@ -246,6 +249,21 @@ export function generateBillHtml(
   tenant: ReceiptTenant,
   opts: WebPrintOptions = {},
 ): string {
+  if (opts.saudiInvoice) {
+    return generateSaudiBillHtml(bill, {
+      paperSize: opts.paperSize,
+      businessName:
+        opts.showBusinessName === false ? undefined : opts.businessName || tenant.business_name,
+      address: opts.address,
+      phone: opts.phone,
+      vatNumber: opts.saudiInvoice.vatNumber ?? opts.taxRegistrationNumber,
+      footerNote: opts.footerNote,
+      timezone: tenant.timezone,
+      showTableNumber: opts.showTableNumber,
+      isReprint: opts.isReprint,
+      qrDataUrl: opts.saudiInvoice.qrDataUrl,
+    });
+  }
   const {
     paperSize = 'thermal58',
     compactLayout = false,
@@ -384,7 +402,7 @@ export function generateBillHtml(
     <!-- Bill Details -->
     ${largeOrderNumber ? `<div class="order-number-banner" dir="ltr" style="direction: ltr; unicode-bidi: isolate; font-size: 1.5em; font-weight: 800; text-align: center; border: 2px solid #000; padding: 4px 8px; margin: 6px 0;">#${escapeHtml(largeOrderNumber)}</div>` : ''}
     <div class="bill-details">
-      ${meta?.tokenNumber !== null && meta?.tokenNumber !== undefined ? `<div class="token-number">TOKEN #${escapeHtml(meta.tokenNumber)}</div>` : ''}
+      ${compactLayout && meta?.tokenNumber !== null && meta?.tokenNumber !== undefined ? `<div class="token-number">TOKEN #${escapeHtml(meta.tokenNumber)}</div>` : ''}
       ${
         compactLayout
           ? `

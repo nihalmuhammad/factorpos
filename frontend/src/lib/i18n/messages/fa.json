@@ -1923,6 +1923,8 @@
     "billTemplateMerchantCreated": "ساخته‌شده",
     "billTemplateMerchantDesc": "چیدمان رسید سفارشی شما.",
     "billTemplateMerchantImported": "واردشده",
+    "billTemplateSaudiDesc": "فاکتور مالیاتی ساده عربستان با شماره مالیات بر ارزش افزوده، مبلغ پیش از مالیات، مالیات ۱۵٪ و کد QR سازمان ZATCA.",
+    "billTemplateSaudiName": "فاکتور مالیاتی عربستان",
     "billTemplateSaved": "قالب صورتحساب ذخیره شد",
     "billingType": "نوع صورتحساب",
     "billingTypePostpaid": "پس‌پرداخت – پرداخت هنگام تسویه (نگه‌داشتن سفارش‌ها)",

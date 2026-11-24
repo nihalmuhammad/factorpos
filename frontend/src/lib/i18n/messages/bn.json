@@ -1923,6 +1923,8 @@
     "billTemplateMerchantCreated": "তৈরি হয়েছে",
     "billTemplateMerchantDesc": "আপনার কাস্টম রসিদ বিন্যাস.",
     "billTemplateMerchantImported": "আমদানিকৃত",
+    "billTemplateSaudiDesc": "ভ্যাট নম্বর, ভ্যাটের আগের পরিমাণ, ১৫% ভ্যাট এবং ZATCA QR কোডসহ সৌদি সরলীকৃত ট্যাক্স ইনভয়েস।",
+    "billTemplateSaudiName": "সৌদি ট্যাক্স ইনভয়েস",
     "billTemplateSaved": "বিল টেমপ্লেট সংরক্ষিত",
     "billingType": "বিলিং টাইপ",
     "billingTypePostpaid": "পোস্টপেইড - চেকআউটে অর্থ প্রদান করুন (অর্ডার ধরে রাখুন)",

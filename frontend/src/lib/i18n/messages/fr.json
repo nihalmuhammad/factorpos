@@ -1923,6 +1923,8 @@
     "billTemplateMerchantCreated": "Créé",
     "billTemplateMerchantDesc": "Votre mise en page de reçu personnalisée.",
     "billTemplateMerchantImported": "Importé",
+    "billTemplateSaudiDesc": "Facture fiscale simplifiée saoudienne avec numéro de TVA, montant HT, TVA 15 % et code QR ZATCA.",
+    "billTemplateSaudiName": "Facture fiscale saoudienne",
     "billTemplateSaved": "Modèle de facture enregistré",
     "billingType": "Type de facturation",
     "billingTypePostpaid": "Paiement différé - paiement à l’encaissement (commandes en attente)",

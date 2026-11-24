@@ -1923,6 +1923,8 @@
     "billTemplateMerchantCreated": "已创建",
     "billTemplateMerchantDesc": "您的自定义小票版式。",
     "billTemplateMerchantImported": "已导入",
+    "billTemplateSaudiDesc": "沙特简化税务发票，包含增值税号、税前金额、15% 增值税和 ZATCA 二维码。",
+    "billTemplateSaudiName": "沙特税务发票",
     "billTemplateSaved": "账单模板已保存",
     "billingType": "计费类型",
     "billingTypePostpaid": "后付费 — 结账时付款（可挂单）",

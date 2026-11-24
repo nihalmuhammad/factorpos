@@ -1923,6 +1923,8 @@
     "billTemplateMerchantCreated": "Creada",
     "billTemplateMerchantDesc": "Tu diseño de recibo personalizado.",
     "billTemplateMerchantImported": "Importada",
+    "billTemplateSaudiDesc": "Factura fiscal simplificada saudí con número de IVA, importe sin IVA, IVA del 15 % y código QR de ZATCA.",
+    "billTemplateSaudiName": "Factura fiscal saudí",
     "billTemplateSaved": "Plantilla de factura guardada",
     "billingType": "Tipo de Facturación",
     "billingTypePostpaid": "Postpago – Cobrar al final (pedidos en espera)",

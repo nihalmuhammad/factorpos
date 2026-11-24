@@ -1527,7 +1527,9 @@ export function PrintersSettingsTab({
                       ? card.description
                       : card.id === 'classic'
                         ? t('billTemplateClassicDesc')
-                        : t('billTemplateCompactDesc')}
+                        : card.id === 'saudi'
+                          ? t('billTemplateSaudiDesc')
+                          : t('billTemplateCompactDesc')}
                   </p>
                 </button>
               );

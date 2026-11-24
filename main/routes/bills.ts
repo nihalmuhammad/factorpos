@@ -20,6 +20,7 @@ import {
   withTxn,
 } from '../db';
 import { asyncHandler } from '../middleware/async-handler';
+import { buildBillZatcaQr, zatcaQrDataUrl } from '../services/zatca-qr';
 import { notifyKdsUpdate, notifyOrderUpdated } from '../services/kds';
 import { printReceipt } from '../services/receipt';
 import { cloudSync } from '../services/cloud-sync';
@@ -5211,6 +5212,21 @@ router.get('/:id/print-history', requirePermission('bills.read'), (req: Request,
     res.status(500).json({ error: 'Internal server error' });
   }
 });
+
+// FactorPOS: ZATCA simplified-invoice QR (TLV tags 1–5) for the Saudi bill format.
+router.get(
+  '/:id/zatca-qr',
+  requirePermission('bills.read'),
+  asyncHandler(async (req: Request, res: Response) => {
+    const qr = buildBillZatcaQr(String(req.params.id));
+    if (!qr.ok) return res.status(qr.status).json({ error: qr.error });
+    res.json({
+      payload: qr.payload,
+      fields: qr.fields,
+      qr_data_url: await zatcaQrDataUrl(qr.payload),
+    });
+  }),
+);
 
 function resolveBillBusinessDate(
   db: ReturnType<typeof getDatabase>,

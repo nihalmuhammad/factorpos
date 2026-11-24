@@ -75,7 +75,9 @@ function billTemplateSource(value: unknown): 'core' | 'non-core' {
     const source = (selection as { source?: unknown }).source;
     return source === 'core' ? 'core' : 'non-core';
   }
-  return selection === 'classic' || selection === 'compact' ? 'core' : 'non-core';
+  return selection === 'classic' || selection === 'compact' || selection === 'saudi'
+    ? 'core'
+    : 'non-core';
 }
 
 export { hasFinancialPrintWarning, makeFinancialPrintRefusalMessage } from '@print/warnings';

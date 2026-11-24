@@ -1923,6 +1923,8 @@
     "billTemplateMerchantCreated": "Oluşturuldu",
     "billTemplateMerchantDesc": "Özel fiş düzeniniz.",
     "billTemplateMerchantImported": "İçe aktarıldı",
+    "billTemplateSaudiDesc": "KDV numarası, KDV hariç tutar, %15 KDV ve ZATCA QR koduyla Suudi basitleştirilmiş vergi faturası.",
+    "billTemplateSaudiName": "Suudi vergi faturası",
     "billTemplateSaved": "Fiş şablonu kaydedildi",
     "billingType": "Hesaplaşma Modeli",
     "billingTypePostpaid": "Sonradan Ödemeli – Çıkışta öde (Masa / Adisyon)",

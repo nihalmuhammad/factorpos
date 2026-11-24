@@ -34,6 +34,7 @@ import {
   parseBillTemplateSelection,
 } from '../services/print-templates';
 import { renderMerchantReceiptViaDocument } from './document-merchant';
+import { renderSaudiReceiptViaDocument } from './document-saudi';
 import { correlationId, type FloErrorCode } from '../errors';
 import { cloudSync } from '../services/cloud-sync';
 import { capturePostHogPrintFailure, capturePostHogPrintRecovered } from '../services/posthog';
@@ -2303,6 +2304,17 @@ export function receiptDocumentLines(
       ? 'classic'
       : normalizeReceiptTemplate(selection?.source === 'core' ? selection.id : template);
   const rasterLanguage = selection?.source === 'pack' ? undefined : additionalLanguage;
+  if (normalizedTemplate === 'saudi') {
+    const saudi = renderSaudiReceiptViaDocument(order, bill, rasterBiz, {
+      columns,
+      isReprint,
+      useUnicode,
+      arabicShaping,
+      cutMode,
+      capabilities,
+    });
+    return { lines: saudi.lines, warnings: saudi.warnings, rasterGroups: saudi.rasterGroups };
+  }
   const result =
     normalizedTemplate === 'compact'
       ? renderCompactReceiptViaDocument(order, bill, rasterBiz, {
@@ -2730,6 +2742,18 @@ export function formatReceipt(
 
   try {
     switch (tpl) {
+      case 'saudi': {
+        const saudi = renderSaudiReceiptViaDocument(order, bill, biz, {
+          columns: cols,
+          isReprint,
+          useUnicode,
+          arabicShaping,
+          cutMode,
+          capabilities,
+        });
+        if (warnings && saudi.warnings.length > 0) warnings.push(...saudi.warnings);
+        return saudi.data;
+      }
       case 'classic':
         return formatClassicReceipt(
           order,
@@ -2767,11 +2791,13 @@ export function formatReceipt(
   }
 }
 
-export function normalizeReceiptTemplate(template?: string): 'classic' | 'compact' {
+export function normalizeReceiptTemplate(template?: string): 'classic' | 'compact' | 'saudi' {
   const normalized = String(template || 'classic')
     .toLowerCase()
     .replace(/[^a-z]/g, '');
   if (normalized.includes('compact') || normalized.includes('minimal')) return 'compact';
+  // FactorPOS: Saudi simplified tax invoice with the ZATCA QR.
+  if (normalized === 'saudi') return 'saudi';
   return 'classic';
 }
 

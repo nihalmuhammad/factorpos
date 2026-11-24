@@ -1923,6 +1923,8 @@
     "billTemplateMerchantCreated": "Krijuar",
     "billTemplateMerchantDesc": "Paraqitja juaj e personalizuar e dëftesës.",
     "billTemplateMerchantImported": "I importuar",
+    "billTemplateSaudiDesc": "Faturë tatimore e thjeshtuar saudite me numrin e TVSH-së, shumën pa TVSH, TVSH 15% dhe kodin QR të ZATCA.",
+    "billTemplateSaudiName": "Faturë tatimore saudite",
     "billTemplateSaved": "Shablloni i dëftesës u ruajt",
     "billingType": "Lloji i pagesës",
     "billingTypePostpaid": "Pas pagesës – Paguani në arkë (mbani porositë)",

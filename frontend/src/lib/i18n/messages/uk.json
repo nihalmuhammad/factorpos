@@ -1923,6 +1923,8 @@
     "billTemplateMerchantCreated": "Створено",
     "billTemplateMerchantDesc": "Ваш власний макет чека.",
     "billTemplateMerchantImported": "Імпортовано",
+    "billTemplateSaudiDesc": "Спрощений податковий рахунок Саудівської Аравії з номером ПДВ, сумою без ПДВ, ПДВ 15% і QR-кодом ZATCA.",
+    "billTemplateSaudiName": "Саудівський податковий рахунок",
     "billTemplateSaved": "Шаблон рахунку збережено",
     "billingType": "Тип розрахунку",
     "billingTypePostpaid": "Післяплата — оплата під час розрахунку (відкладені замовлення)",

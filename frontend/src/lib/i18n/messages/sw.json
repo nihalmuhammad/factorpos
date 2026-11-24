@@ -1923,6 +1923,8 @@
     "billTemplateMerchantCreated": "Imeundwa",
     "billTemplateMerchantDesc": "Mpangilio wako maalum wa risiti.",
     "billTemplateMerchantImported": "Imeingizwa",
+    "billTemplateSaudiDesc": "Ankara rahisi ya kodi ya Saudia yenye nambari ya VAT, kiasi kabla ya VAT, VAT 15% na msimbo wa QR wa ZATCA.",
+    "billTemplateSaudiName": "Ankara ya Kodi ya Saudia",
     "billTemplateSaved": "Kiolezo cha bili kimehifadhiwa",
     "billingType": "Aina ya Utozaji Bili",
     "billingTypePostpaid": "Lipa Baadaye – Lipa wakati wa kuondoka (shikilia oda)",
