@@ -480,6 +480,10 @@ async function run() {
       !enHtml.includes('<div class="token-number">'),
     );
     assert(
+      'EN classic header date may wrap, so the bill number keeps its width',
+      !/<td class="text-end receipt-date"><strong>Date<\/strong>/.test(enHtml),
+    );
+    assert(
       'EN receipt emphasizes total amount by 3pt in bold',
       enHtml.includes('class="text-end num total-amount"') &&
         enHtml.includes('.total-amount { font-size: calc(1em + 3pt); font-weight: 700;'),
